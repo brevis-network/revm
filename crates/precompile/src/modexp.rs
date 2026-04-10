@@ -150,7 +150,7 @@ fn modexp_u256_syscall(base: &[u8], exponent: &[u8], modulus: &[u8]) -> Vec<u8> 
 }
 
 /// Convert big-endian bytes (≤ 32) to 4 little-endian u64 limbs.
-#[cfg(target_os = "zkvm")]
+#[cfg(any(target_os = "zkvm", test))]
 fn be_bytes_to_u64x4(bytes: &[u8]) -> [u64; 4] {
     let mut padded = [0u8; 32];
     let len = bytes.len().min(32);
@@ -173,7 +173,7 @@ fn be_bytes_to_u64x4(bytes: &[u8]) -> [u64; 4] {
 }
 
 /// Convert 4 little-endian u64 limbs to `out_len` big-endian bytes (left-padded).
-#[cfg(target_os = "zkvm")]
+#[cfg(any(target_os = "zkvm", test))]
 fn u64x4_to_be_bytes(limbs: &[u64; 4], out_len: usize) -> Vec<u8> {
     let mut full = [0u8; 32];
     for i in 0..4 {
@@ -949,5 +949,265 @@ mod tests {
             matches!(res, Err(PrecompileError::OutOfGas)),
             "Should return OutOfGas error with insufficient gas"
         );
+    }
+
+    // ---- Tests for Option A: u256 syscall algorithm correctness ----
+
+    /// Software mulmod for u64x4 limbs (pure Rust, no syscall).
+    /// Mirrors what `syscall_uint256_mulmod` does: result = (x * y) % modulus.
+    fn soft_u256_mulmod(x: &mut [u64; 4], y_and_mod: &[u64; 8]) {
+        // Reconstruct 256-bit values from little-endian u64 limbs
+        let a = limbs_to_u256(x);
+        let b = limbs_to_u256(&[y_and_mod[0], y_and_mod[1], y_and_mod[2], y_and_mod[3]]);
+        let m = limbs_to_u256(&[y_and_mod[4], y_and_mod[5], y_and_mod[6], y_and_mod[7]]);
+        let result = a.mul_mod(b, m);
+        let limbs = u256_to_limbs(result);
+        x.copy_from_slice(&limbs);
+    }
+
+    fn limbs_to_u256(limbs: &[u64; 4]) -> U256 {
+        U256::from_limbs(limbs.clone())
+    }
+
+    fn u256_to_limbs(v: U256) -> [u64; 4] {
+        v.into_limbs()
+    }
+
+    /// Replicates `modexp_u256_syscall` algorithm using software mulmod.
+    /// This is the function under test — if it matches `aurora_engine_modexp::modexp`,
+    /// the algorithm and byte conversions are correct.
+    fn modexp_u256_soft(base: &[u8], exponent: &[u8], modulus: &[u8]) -> Vec<u8> {
+        let out_len = modulus.len();
+        if out_len == 0 {
+            return Vec::new();
+        }
+
+        let mod_limbs = be_bytes_to_u64x4(modulus);
+        if mod_limbs == [0u64; 4] {
+            return std::vec![0u8; out_len];
+        }
+        if mod_limbs == [1, 0, 0, 0] {
+            return std::vec![0u8; out_len];
+        }
+
+        let base_limbs = be_bytes_to_u64x4(base);
+        let mut result = [0u64; 4];
+        let mut started = false;
+
+        for &byte in exponent {
+            for bit in (0..8).rev() {
+                if started {
+                    let mut buf = [0u64; 8];
+                    buf[..4].copy_from_slice(&result);
+                    buf[4..].copy_from_slice(&mod_limbs);
+                    soft_u256_mulmod(&mut result, &buf);
+                }
+                if (byte >> bit) & 1 == 1 {
+                    if started {
+                        let mut buf = [0u64; 8];
+                        buf[..4].copy_from_slice(&base_limbs);
+                        buf[4..].copy_from_slice(&mod_limbs);
+                        soft_u256_mulmod(&mut result, &buf);
+                    } else {
+                        result = base_limbs;
+                        let mut buf = [0u64; 8];
+                        buf[..4].copy_from_slice(&[1u64, 0, 0, 0]);
+                        buf[4..].copy_from_slice(&mod_limbs);
+                        soft_u256_mulmod(&mut result, &buf);
+                        started = true;
+                    }
+                }
+            }
+        }
+
+        if !started {
+            result = [1, 0, 0, 0];
+        }
+        u64x4_to_be_bytes(&result, out_len)
+    }
+
+    /// Helper: compare our algorithm against aurora_engine_modexp for given inputs.
+    /// Both results are left-padded to `modulus.len()` to normalize output length,
+    /// matching how the precompile caller (`run_inner`) uses the result.
+    fn assert_modexp_matches(base: &[u8], exponent: &[u8], modulus: &[u8]) {
+        let expected_raw = aurora_engine_modexp::modexp(base, exponent, modulus);
+        let actual = modexp_u256_soft(base, exponent, modulus);
+        let mod_len = modulus.len();
+        let expected = left_pad_vec(&expected_raw, mod_len).into_owned();
+        assert_eq!(
+            actual, expected,
+            "mismatch for base={}, exp={}, mod={}\n  expected: {}\n  actual:   {}",
+            hex::encode(base),
+            hex::encode(exponent),
+            hex::encode(modulus),
+            hex::encode(&expected),
+            hex::encode(&actual),
+        );
+    }
+
+    #[test]
+    fn test_u256_byte_conversion_roundtrip() {
+        // Zero
+        let limbs = be_bytes_to_u64x4(&[0u8; 32]);
+        assert_eq!(limbs, [0u64; 4]);
+        let bytes = u64x4_to_be_bytes(&limbs, 32);
+        assert_eq!(bytes, vec![0u8; 32]);
+
+        // One
+        let limbs = be_bytes_to_u64x4(&[1]);
+        assert_eq!(limbs, [1, 0, 0, 0]);
+        let bytes = u64x4_to_be_bytes(&limbs, 1);
+        assert_eq!(bytes, vec![1]);
+
+        // Max u256
+        let limbs = be_bytes_to_u64x4(&[0xFF; 32]);
+        assert_eq!(limbs, [u64::MAX; 4]);
+        let bytes = u64x4_to_be_bytes(&limbs, 32);
+        assert_eq!(bytes, vec![0xFF; 32]);
+
+        // Known value: 0x0102030405060708 in the most-significant limb
+        let mut input = [0u8; 32];
+        input[0] = 0x01;
+        input[1] = 0x02;
+        input[2] = 0x03;
+        input[3] = 0x04;
+        input[4] = 0x05;
+        input[5] = 0x06;
+        input[6] = 0x07;
+        input[7] = 0x08;
+        let limbs = be_bytes_to_u64x4(&input);
+        assert_eq!(limbs[3], 0x0102030405060708);
+        assert_eq!(limbs[2], 0);
+        assert_eq!(limbs[1], 0);
+        assert_eq!(limbs[0], 0);
+        let rt = u64x4_to_be_bytes(&limbs, 32);
+        assert_eq!(rt, input.to_vec());
+    }
+
+    #[test]
+    fn test_u256_byte_conversion_short_input() {
+        // 3 bytes → left-padded to 32, then to limbs
+        let limbs = be_bytes_to_u64x4(&[0xAB, 0xCD, 0xEF]);
+        assert_eq!(limbs[0], 0xABCDEF);
+        assert_eq!(limbs[1], 0);
+
+        // Output shorter than 32 bytes → truncated from MSB side
+        let bytes = u64x4_to_be_bytes(&limbs, 3);
+        assert_eq!(bytes, vec![0xAB, 0xCD, 0xEF]);
+
+        // Output longer than 32 bytes → zero-padded on MSB side
+        let bytes = u64x4_to_be_bytes(&[1, 0, 0, 0], 34);
+        assert_eq!(bytes.len(), 34);
+        assert_eq!(bytes[33], 1);
+        assert_eq!(bytes[..33], vec![0u8; 33]);
+    }
+
+    #[test]
+    fn test_modexp_u256_basic() {
+        // 2^10 mod 1000 = 1024 mod 1000 = 24
+        assert_modexp_matches(&[2], &[10], &[0x03, 0xE8]);
+        // 3^0 mod 7 = 1
+        assert_modexp_matches(&[3], &[0], &[7]);
+        // 0^5 mod 7 = 0
+        assert_modexp_matches(&[0], &[5], &[7]);
+        // 5^1 mod 13 = 5
+        assert_modexp_matches(&[5], &[1], &[13]);
+        // 2^255 mod (2^256-1) — large exponent, max modulus
+        assert_modexp_matches(&[2], &[255], &[0xFF; 32]);
+    }
+
+    #[test]
+    fn test_modexp_u256_edge_cases() {
+        // modulus = 0 → result should be all zeros (matching modulus byte length)
+        let result = modexp_u256_soft(&[5], &[3], &[0]);
+        assert_eq!(result, vec![0u8; 1]);
+
+        // modulus = 1 → everything mod 1 is 0
+        assert_modexp_matches(&[123], &[45], &[1]);
+
+        // base > modulus
+        assert_modexp_matches(&[0xFF], &[3], &[7]);
+
+        // exponent = 0, modulus > 1 → result = 1
+        assert_modexp_matches(&[99], &[0], &[17]);
+
+        // base = 0, exponent = 0 → 0^0 mod m = 1 (by convention, matching aurora)
+        assert_modexp_matches(&[0], &[0], &[5]);
+
+        // modulus = 2 (parity test): 7^4 mod 2 = 2401 mod 2 = 1
+        assert_modexp_matches(&[7], &[4], &[2]);
+    }
+
+    #[test]
+    fn test_modexp_u256_256bit_values() {
+        // Full 256-bit base, exponent, modulus
+        let base = hex::decode(
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F",
+        )
+        .unwrap(); // secp256k1 p
+        let exp = hex::decode(
+            "0000000000000000000000000000000000000000000000000000000000000011",
+        )
+        .unwrap(); // 17
+        let modulus = hex::decode(
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141",
+        )
+        .unwrap(); // secp256k1 n
+
+        assert_modexp_matches(&base, &exp, &modulus);
+    }
+
+    #[test]
+    fn test_modexp_u256_fermat_little_theorem() {
+        // For prime p=17: a^(p-1) mod p = 1 for any a not divisible by p
+        for a in 1u8..17 {
+            assert_modexp_matches(&[a], &[16], &[17]);
+        }
+    }
+
+    #[test]
+    fn test_modexp_u256_large_exponent() {
+        // 256-bit exponent (all 0xFF) — tests that we handle all exponent bits
+        let base = &[3u8];
+        let exp = [0xFF; 32];
+        let modulus = hex::decode(
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141",
+        )
+        .unwrap();
+        assert_modexp_matches(base, &exp, &modulus);
+    }
+
+    #[test]
+    fn test_modexp_u256_matches_eip198_vectors() {
+        // Use a subset of the existing EIP-198 test vectors that have ≤256-bit
+        // base and modulus (the cases that would hit our fast path).
+        // Test vector: base=2, exp=large, mod=large (from TESTS[1])
+        let base = hex::decode("03").unwrap();
+        let exp = hex::decode(
+            "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2e",
+        )
+        .unwrap();
+        let modulus = hex::decode(
+            "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
+        )
+        .unwrap();
+        assert_modexp_matches(&base, &exp, &modulus);
+    }
+
+    #[test]
+    fn test_modexp_u256_power_of_two_modulus() {
+        // 7^100 mod 256
+        assert_modexp_matches(&[7], &[100], &[0, 1]); // 256 in big-endian
+        // 7^100 mod 65536
+        assert_modexp_matches(&[7], &[100], &[0, 0, 1, 0, 0]); // 65536
+    }
+
+    #[test]
+    fn test_modexp_u256_consecutive_powers() {
+        // Verify consistency: base^1, base^2, ..., base^20 mod m
+        let modulus = &[0xFD]; // 253, a prime
+        for e in 1u8..=20 {
+            assert_modexp_matches(&[7], &[e], modulus);
+        }
     }
 }
