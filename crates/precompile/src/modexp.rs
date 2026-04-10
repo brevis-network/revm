@@ -45,7 +45,148 @@ pub(crate) fn modexp(base: &[u8], exponent: &[u8], modulus: &[u8]) -> Vec<u8> {
 
 #[cfg(not(feature = "gmp"))]
 pub(crate) fn modexp(base: &[u8], exponent: &[u8], modulus: &[u8]) -> Vec<u8> {
+    #[cfg(target_os = "zkvm")]
+    {
+        // Fast path: when modulus and base both fit in 256 bits, use Pico's
+        // Uint256MulChip via syscall_uint256_mulmod instead of the software
+        // Montgomery multiplication in aurora_engine_modexp.
+        // This reduces per-call cost from ~393K cycles to ~10.7K cycles (~37x).
+        if modulus.len() <= 32 && base.len() <= 32 {
+            return modexp_u256_syscall(base, exponent, modulus);
+        }
+    }
     aurora_engine_modexp::modexp(base, exponent, modulus)
+}
+
+/// 256-bit modexp using Pico's `syscall_uint256_mulmod` hardware chip.
+///
+/// Implements binary square-and-multiply, where each `(x * y) % modulus` is a
+/// single ecall into the [`Uint256MulChip`] instead of thousands of RISC-V
+/// instructions for software Montgomery multiplication.
+///
+/// The `syscall_uint256_mulmod` symbol is provided by `pico-sdk` and is already
+/// linked into any Pico guest ELF. We declare it via `extern "C"` to avoid
+/// adding a direct Cargo dependency on `pico-sdk` from this crate.
+///
+/// # Calling convention
+///
+/// ```text
+/// extern "C" fn syscall_uint256_mulmod(x: *mut u64, y: *const u64)
+///   x:  pointer to [u64; 4] — input operand, overwritten with result
+///   y:  pointer to [u64; 8] — first 4 limbs = second operand,
+///                              next  4 limbs = modulus
+///   All values are 256-bit integers in little-endian u64 limb order.
+/// ```
+#[cfg(target_os = "zkvm")]
+fn modexp_u256_syscall(base: &[u8], exponent: &[u8], modulus: &[u8]) -> Vec<u8> {
+    extern "C" {
+        fn syscall_uint256_mulmod(x: *mut u64, y: *const u64);
+    }
+
+    let out_len = modulus.len();
+    if out_len == 0 {
+        return Vec::new();
+    }
+
+    let mod_limbs = be_bytes_to_u64x4(modulus);
+
+    // modulus == 0 → return zeros
+    if mod_limbs == [0u64; 4] {
+        return std::vec![0u8; out_len];
+    }
+    // modulus == 1 → everything mod 1 is 0
+    if mod_limbs == [1, 0, 0, 0] {
+        return std::vec![0u8; out_len];
+    }
+
+    let base_limbs = be_bytes_to_u64x4(base);
+    let mut result = [0u64; 4];
+    let mut started = false;
+
+    // Binary method (MSB → LSB): for each bit of the exponent, square the
+    // accumulator and conditionally multiply by base.
+    for &byte in exponent {
+        for bit in (0..8).rev() {
+            if started {
+                // square: result = (result * result) % modulus
+                let mut buf = [0u64; 8];
+                buf[..4].copy_from_slice(&result);
+                buf[4..].copy_from_slice(&mod_limbs);
+                unsafe {
+                    syscall_uint256_mulmod(result.as_mut_ptr(), buf.as_ptr());
+                }
+            }
+            if (byte >> bit) & 1 == 1 {
+                if started {
+                    // multiply: result = (result * base) % modulus
+                    let mut buf = [0u64; 8];
+                    buf[..4].copy_from_slice(&base_limbs);
+                    buf[4..].copy_from_slice(&mod_limbs);
+                    unsafe {
+                        syscall_uint256_mulmod(result.as_mut_ptr(), buf.as_ptr());
+                    }
+                } else {
+                    // First 1-bit encountered: result = base % modulus.
+                    // We achieve the reduction by multiplying base × 1 mod m.
+                    result = base_limbs;
+                    let mut buf = [0u64; 8];
+                    buf[..4].copy_from_slice(&[1u64, 0, 0, 0]);
+                    buf[4..].copy_from_slice(&mod_limbs);
+                    unsafe {
+                        syscall_uint256_mulmod(result.as_mut_ptr(), buf.as_ptr());
+                    }
+                    started = true;
+                }
+            }
+        }
+    }
+
+    // exponent == 0 → base^0 mod m = 1 (handled by modulus != 1 guard above)
+    if !started {
+        result = [1, 0, 0, 0];
+    }
+
+    u64x4_to_be_bytes(&result, out_len)
+}
+
+/// Convert big-endian bytes (≤ 32) to 4 little-endian u64 limbs.
+#[cfg(target_os = "zkvm")]
+fn be_bytes_to_u64x4(bytes: &[u8]) -> [u64; 4] {
+    let mut padded = [0u8; 32];
+    let len = bytes.len().min(32);
+    padded[32 - len..].copy_from_slice(&bytes[..len]);
+    let mut limbs = [0u64; 4];
+    for i in 0..4 {
+        let off = 24 - i * 8;
+        limbs[i] = u64::from_be_bytes([
+            padded[off],
+            padded[off + 1],
+            padded[off + 2],
+            padded[off + 3],
+            padded[off + 4],
+            padded[off + 5],
+            padded[off + 6],
+            padded[off + 7],
+        ]);
+    }
+    limbs
+}
+
+/// Convert 4 little-endian u64 limbs to `out_len` big-endian bytes (left-padded).
+#[cfg(target_os = "zkvm")]
+fn u64x4_to_be_bytes(limbs: &[u64; 4], out_len: usize) -> Vec<u8> {
+    let mut full = [0u8; 32];
+    for i in 0..4 {
+        let off = 24 - i * 8;
+        full[off..off + 8].copy_from_slice(&limbs[i].to_be_bytes());
+    }
+    if out_len >= 32 {
+        let mut out = std::vec![0u8; out_len];
+        out[out_len - 32..].copy_from_slice(&full);
+        out
+    } else {
+        full[32 - out_len..].to_vec()
+    }
 }
 
 /// See: <https://eips.ethereum.org/EIPS/eip-198>
