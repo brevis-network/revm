@@ -2,6 +2,8 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(not(feature = "std"), no_std)]
 
+mod fast_hasher;
+pub use fast_hasher::{FastBuildHasher, FastHasher};
 mod account_info;
 mod types;
 pub use bytecode;
