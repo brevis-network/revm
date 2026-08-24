@@ -8,6 +8,17 @@ use core::{
 use primitives::{hex, B256, U256};
 use std::{rc::Rc, vec::Vec};
 
+/// Byte-reverses a `u64`.
+///
+/// `u64::swap_bytes` expands to roughly 22 and/or/shift instructions on the pico RV64 guest
+/// target, which has no Zbb. That cost is why this is a named function: emitting Zbb's `rev8`
+/// here instead is worth ~42 M retired instructions on block 24006677, but it needs the VM to
+/// decode and prove that encoding, so it is kept out of this change.
+#[inline(always)]
+fn bswap64(x: u64) -> u64 {
+    x.swap_bytes()
+}
+
 trait RefcellExt<T> {
     fn dbg_borrow(&self) -> Ref<'_, T>;
     fn dbg_borrow_mut(&self) -> RefMut<'_, T>;
@@ -73,6 +84,16 @@ impl MemoryTr for SharedMemory {
 
     fn set(&mut self, memory_offset: usize, data: &[u8]) {
         self.set(memory_offset, data);
+    }
+
+    #[inline]
+    fn get_u256(&self, offset: usize) -> U256 {
+        SharedMemory::get_u256(self, offset)
+    }
+
+    #[inline]
+    fn set_u256(&mut self, offset: usize, value: U256) {
+        SharedMemory::set_u256(self, offset, value)
     }
 
     fn size(&self) -> usize {
@@ -383,7 +404,29 @@ impl SharedMemory {
     /// Panics on out of bounds.
     #[inline]
     pub fn get_u256(&self, offset: usize) -> U256 {
-        self.get_word(offset).into()
+        let slice = self.slice_len(offset, 32);
+        let ptr = slice.as_ptr();
+        // Fast path: EVM memory is a `Vec<u8>`, so a byte-slice conversion has alignment 1, and
+        // on a target without misaligned scalar memory access (the pico RV64 zkVM guest) LLVM
+        // assembles the word with 32 `lbu` and a shift/or chain — measured at 236 instructions
+        // per `MLOAD` on block 24006677. Solidity keeps memory 32-byte aligned, so the region
+        // is normally 8-byte aligned too: read four `u64`s and byte-swap them instead.
+        if ptr as usize % core::mem::align_of::<u64>() == 0 {
+            // SAFETY: `slice_len` bounds-checked the 32-byte region and the pointer is
+            // 8-byte aligned, so the four reads are in bounds and well aligned.
+            let (w0, w1, w2, w3) = unsafe {
+                let q = ptr.cast::<u64>();
+                (
+                    bswap64(q.read()),
+                    bswap64(q.add(1).read()),
+                    bswap64(q.add(2).read()),
+                    bswap64(q.add(3).read()),
+                )
+            };
+            // Memory is big-endian and `U256`'s limbs are little-endian ordered.
+            return U256::from_limbs([w3, w2, w1, w0]);
+        }
+        U256::try_from_be_slice(&slice).unwrap()
     }
 
     /// Sets the `byte` at the given `index`.
@@ -416,7 +459,24 @@ impl SharedMemory {
     #[inline]
     #[cfg_attr(debug_assertions, track_caller)]
     pub fn set_u256(&mut self, offset: usize, value: U256) {
-        self.set(offset, &value.to_be_bytes::<32>());
+        let mut slice = self.slice_mut(offset, 32);
+        let ptr = slice.as_mut_ptr();
+        // The mirror of `get_u256`'s fast path: without it the 32 bytes reach the buffer as
+        // 32 `sb`, because the destination slice has alignment 1.
+        if ptr as usize % core::mem::align_of::<u64>() == 0 {
+            let limbs = value.as_limbs();
+            // SAFETY: `slice_mut` bounds-checked the 32-byte region and the pointer is
+            // 8-byte aligned, so the four writes are in bounds and well aligned.
+            unsafe {
+                let q = ptr.cast::<u64>();
+                q.write(bswap64(limbs[3]));
+                q.add(1).write(bswap64(limbs[2]));
+                q.add(2).write(bswap64(limbs[1]));
+                q.add(3).write(bswap64(limbs[0]));
+            }
+            return;
+        }
+        slice.copy_from_slice(&value.to_be_bytes::<32>());
     }
 
     /// Set memory region at given `offset`.
