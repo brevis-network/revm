@@ -287,12 +287,19 @@ impl Stack {
         }
         // SAFETY: `n` and `n_m` are checked to be within bounds, and they don't overlap.
         unsafe {
-            // Note: `ptr::swap_nonoverlapping` is more efficient than `slice::swap` or `ptr::swap`
-            // because it operates under the assumption that the pointers do not overlap,
-            // eliminating an intermediate copy,
-            // which is a condition we know to be true in this context.
             let top = self.data.as_mut_ptr().add(len - 1);
-            core::ptr::swap_nonoverlapping(top.sub(n), top.sub(n_m_index), 1);
+            let (p1, p2) = (top.sub(n), top.sub(n_m_index));
+            // Three typed moves, not `ptr::swap_nonoverlapping`: that swaps through
+            // `*mut u8`, which loses `U256`'s 8-byte alignment. On a target without
+            // misaligned scalar memory access (pico's `riscv64im-pico-zkvm-elf`) LLVM then
+            // expands the 32-byte swap into 64 `lbu` + 64 `sb`. Measured on block 24006677,
+            // that made this function 140.3 M of 1018.2 M retired instructions, 91 % of them
+            // byte loads/stores. Reading and writing `U256` keeps the alignment, so the same
+            // swap is 4 `ld` + 4 `sd`. The pointers are known not to overlap, so the single
+            // temporary is the whole cost.
+            let tmp = core::ptr::read(p1);
+            core::ptr::write(p1, core::ptr::read(p2));
+            core::ptr::write(p2, tmp);
         }
         true
     }

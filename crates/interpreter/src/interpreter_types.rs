@@ -140,6 +140,22 @@ pub trait MemoryTr {
         self.slice(offset..offset + len)
     }
 
+    /// Reads a 32-byte big-endian word from memory.
+    ///
+    /// Implementations that own their buffer should override this: assembling the word from a
+    /// byte slice is what the default does, and on a target without misaligned scalar memory
+    /// access that is 32 `lbu` plus a shift/or chain per word.
+    fn get_u256(&self, offset: usize) -> U256 {
+        U256::try_from_be_slice(&self.slice_len(offset, 32)).unwrap()
+    }
+
+    /// Writes a 32-byte big-endian word to memory.
+    ///
+    /// See [`get_u256`][MemoryTr::get_u256] for why an owner of the buffer should override this.
+    fn set_u256(&mut self, offset: usize, value: U256) {
+        self.set(offset, &value.to_be_bytes::<32>());
+    }
+
     /// Resizes memory to new size
     ///
     /// # Note
