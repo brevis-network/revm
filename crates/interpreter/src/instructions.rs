@@ -28,6 +28,7 @@ pub mod tx_info;
 pub mod utility;
 
 use crate::{interpreter_types::InterpreterTypes, Host, InstructionContext};
+use primitives::U256;
 
 /// EVM opcode function signature.
 #[derive(Debug)]
@@ -247,6 +248,26 @@ const fn instruction_table_impl<WIRE: InterpreterTypes, H: Host>() -> [Instructi
     table[INVALID as usize] = Instruction::new(control::invalid, 0);
     table[SELFDESTRUCT as usize] = Instruction::new(host::selfdestruct, 0); // dynamic
     table
+}
+
+/// Whether a `U256` is zero, without going through `memcmp`.
+///
+/// `U256`'s `is_zero`/`PartialEq` are derived from `[u64; 4]` comparison, which LLVM lowers
+/// to a `memcmp` libcall on the zkVM guest target: memcmp expansion is gated on
+/// `enableUnalignedScalarMem` and this target has no misaligned scalar access. That turns a
+/// four-word check into a call costing tens of instructions, and ISZERO/JUMPI/EQ run it
+/// millions of times per block. OR-ing the limbs keeps it at a handful of instructions.
+#[inline(always)]
+pub(crate) fn u256_is_zero(value: &U256) -> bool {
+    let limbs = value.as_limbs();
+    (limbs[0] | limbs[1] | limbs[2] | limbs[3]) == 0
+}
+
+/// Whether two `U256` are equal, without going through `memcmp`. See [`u256_is_zero`].
+#[inline(always)]
+pub(crate) fn u256_eq(a: &U256, b: &U256) -> bool {
+    let (a, b) = (a.as_limbs(), b.as_limbs());
+    ((a[0] ^ b[0]) | (a[1] ^ b[1]) | (a[2] ^ b[2]) | (a[3] ^ b[3])) == 0
 }
 
 #[cfg(test)]
