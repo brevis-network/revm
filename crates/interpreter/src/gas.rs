@@ -24,6 +24,16 @@ impl Gas {
     /// Creates a new `Gas` struct with the given gas limit.
     #[inline]
     pub const fn new(limit: u64) -> Self {
+        // `record_cost_unsafe` decides out-of-gas from the sign bit of the wrapped
+        // difference, which needs `remaining < 2^63`; `u64::MAX` is reserved as the poison
+        // marker. Every real gas limit is many orders of magnitude below the cap, so this
+        // only bites callers passing an "unlimited" limit, who would otherwise see every
+        // opcode report out-of-gas.
+        let limit = if limit > i64::MAX as u64 {
+            i64::MAX as u64
+        } else {
+            limit
+        };
         Self {
             limit,
             remaining: limit,
@@ -155,13 +165,42 @@ impl Gas {
 
     /// Records an explicit cost. In case of underflow the gas will wrap around cost.
     ///
-    /// Returns `true` if the gas limit is exceeded.
+    /// Returns `true` if the gas limit is exceeded, **or** if the counter has been
+    /// poisoned by [`Gas::poison`].
+    ///
+    /// The test is done on the sign bit of the wrapped difference instead of an
+    /// unsigned compare. That is equivalent to `remaining < cost` as long as both
+    /// operands stay below `2^63`, which holds for every real gas limit (a block
+    /// gas limit is many orders of magnitude smaller) and for every `static_gas`
+    /// entry of the instruction table (max 32000). Using the sign bit is what lets
+    /// a poisoned counter (`u64::MAX`) trip this branch for *any* cost, including
+    /// `cost == 0`, which is how the interpreter loop gets a single exit edge.
     #[inline(always)]
     #[must_use = "In case of not enough gas, the interpreter should halt with an out-of-gas error"]
     pub fn record_cost_unsafe(&mut self, cost: u64) -> bool {
-        let oog = self.remaining < cost;
-        self.remaining = self.remaining.wrapping_sub(cost);
-        oog
+        debug_assert!(self.remaining <= i64::MAX as u64 || self.remaining == u64::MAX);
+        let new_remaining = self.remaining.wrapping_sub(cost);
+        self.remaining = new_remaining;
+        (new_remaining as i64) < 0
+    }
+
+    /// Poisons the gas counter so that the next [`Gas::record_cost_unsafe`] reports
+    /// "stop" no matter the cost, and returns the value the caller has to keep in
+    /// order to [`Gas::unpoison`] later.
+    ///
+    /// Used by `Interpreter::set_action` so that the interpreter loop does not need a
+    /// separate `continue_execution` test on the hot path. The backup deliberately
+    /// lives outside of `Gas`: `Gas` is `Copy` and is copied into every
+    /// `InterpreterAction`/`FrameResult`, so growing it is not free.
+    #[inline]
+    pub fn poison(&mut self) -> u64 {
+        core::mem::replace(&mut self.remaining, u64::MAX)
+    }
+
+    /// Restores the value returned by [`Gas::poison`].
+    #[inline]
+    pub fn unpoison(&mut self, stash: u64) {
+        self.remaining = stash;
     }
 }
 
@@ -185,18 +224,13 @@ pub enum MemoryExtensionResult {
 pub struct MemoryGas {
     /// Current memory length
     pub words_num: usize,
-    /// Current memory expansion cost
-    pub expansion_cost: u64,
 }
 
 impl MemoryGas {
     /// Creates a new `MemoryGas` instance with zero memory allocation.
     #[inline]
     pub const fn new() -> Self {
-        Self {
-            words_num: 0,
-            expansion_cost: 0,
-        }
+        Self { words_num: 0 }
     }
 
     /// Records a new memory length and calculates additional cost if memory is expanded.
@@ -206,11 +240,14 @@ impl MemoryGas {
         if new_num <= self.words_num {
             return None;
         }
+        // The cost of the current length used to be memoised in an `expansion_cost`
+        // field. It is a pure function of `words_num`, and keeping it made `Gas` 8 bytes
+        // wider, which is paid on every `InterpreterAction` / `FrameResult` move rather
+        // than only here. Recomputing it costs a handful of instructions on the (rare)
+        // expansion path and is a measurable net win.
+        let old_cost = crate::gas::calc::memory_gas(self.words_num);
         self.words_num = new_num;
-        let mut cost = crate::gas::calc::memory_gas(new_num);
-        core::mem::swap(&mut self.expansion_cost, &mut cost);
-        // Safe to subtract because we know that new_len > length
-        // Notice the swap above.
-        Some(self.expansion_cost - cost)
+        // Safe to subtract because `memory_gas` is monotonic and `new_num > words_num`.
+        Some(crate::gas::calc::memory_gas(new_num) - old_cost)
     }
 }

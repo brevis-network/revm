@@ -20,7 +20,7 @@ pub use stack::{Stack, STACK_LIMIT};
 // imports
 use crate::{
     host::DummyHost, instruction_context::InstructionContext, interpreter_types::*, Gas, Host,
-    InstructionResult, InstructionTable, InterpreterAction,
+    Instruction, InstructionResult, InstructionTable, InterpreterAction,
 };
 use bytecode::Bytecode;
 use primitives::{hardfork::SpecId, Bytes};
@@ -45,6 +45,12 @@ pub struct Interpreter<WIRE: InterpreterTypes = EthInterpreter> {
     pub runtime_flag: WIRE::RuntimeFlag,
     /// Extended functionality and customizations.
     pub extend: WIRE::Extend,
+    /// Backup of `gas.remaining` while the gas counter is poisoned by
+    /// [`Interpreter::set_action`], or `u64::MAX` when it is not poisoned.
+    ///
+    /// `u64::MAX` doubles as the "nothing to restore" marker: a `remaining` that really is
+    /// `u64::MAX` needs no restoring, because that is exactly what poisoning writes.
+    gas_stash: u64,
 }
 
 impl<EXT: Default> Interpreter<EthInterpreter<EXT>> {
@@ -109,6 +115,7 @@ impl<EXT: Default> Interpreter<EthInterpreter<EXT>> {
             input,
             runtime_flag: RuntimeFlags { is_static, spec_id },
             extend: Default::default(),
+            gas_stash: u64::MAX,
         }
     }
 
@@ -132,6 +139,7 @@ impl<EXT: Default> Interpreter<EthInterpreter<EXT>> {
             input: input_ref,
             runtime_flag,
             extend,
+            gas_stash,
         } = self;
         *bytecode_ref = bytecode;
         *gas = Gas::new(gas_limit);
@@ -145,6 +153,7 @@ impl<EXT: Default> Interpreter<EthInterpreter<EXT>> {
         *input_ref = input;
         *runtime_flag = RuntimeFlags { spec_id, is_static };
         *extend = EXT::default();
+        *gas_stash = u64::MAX;
     }
 
     /// Sets the bytecode that is going to be executed
@@ -194,9 +203,32 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
     #[inline]
     pub fn take_next_action(&mut self) -> InterpreterAction {
         self.bytecode.reset_action();
+        self.unpoison_gas();
         // Return next action if it is some.
         let action = core::mem::take(self.bytecode.action()).expect("Interpreter to set action");
         action
+    }
+
+    /// Sets the next interpreter action and stops the dispatch loop.
+    ///
+    /// Besides handing the action to the bytecode control, this poisons the gas counter
+    /// so that [`Interpreter::run_plain`] can use its out-of-gas branch as the single
+    /// loop exit. The real gas value is restored by [`Interpreter::take_next_action`].
+    #[inline]
+    pub fn set_action(&mut self, action: InterpreterAction) {
+        self.bytecode.set_action(action);
+        self.gas_stash = self.gas.poison();
+    }
+
+    /// Undoes [`Interpreter::set_action`]'s poisoning of the gas counter. No-op if the
+    /// counter is not poisoned, so it is safe to call from every path that can observe an
+    /// interpreter which has just set its action.
+    #[inline]
+    fn unpoison_gas(&mut self) {
+        if self.gas_stash != u64::MAX {
+            self.gas.unpoison(self.gas_stash);
+            self.gas_stash = u64::MAX;
+        }
     }
 
     /// Halt the interpreter with the given result.
@@ -205,8 +237,7 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
     #[cold]
     #[inline(never)]
     pub fn halt(&mut self, result: InstructionResult) {
-        self.bytecode
-            .set_action(InterpreterAction::new_halt(result, self.gas));
+        self.set_action(InterpreterAction::new_halt(result, self.gas));
     }
 
     /// Halt the interpreter with the given result.
@@ -215,7 +246,7 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
     #[cold]
     #[inline(never)]
     pub fn halt_fatal(&mut self) {
-        self.bytecode.set_action(InterpreterAction::new_halt(
+        self.set_action(InterpreterAction::new_halt(
             InstructionResult::FatalExternalError,
             self.gas,
         ));
@@ -268,7 +299,7 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
     ///
     /// This will set the action to [`InterpreterAction::Return`] and set the gas to the current gas.
     pub fn return_with_output(&mut self, output: Bytes) {
-        self.bytecode.set_action(InterpreterAction::new_return(
+        self.set_action(InterpreterAction::new_return(
             InstructionResult::Return,
             output,
             self.gas,
@@ -284,24 +315,24 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
         instruction_table: &InstructionTable<IW, H>,
         host: &mut H,
     ) {
-        // Get current opcode.
-        let opcode = self.bytecode.opcode();
-
-        // SAFETY: In analysis we are doing padding of bytecode so that we are sure that last
-        // byte instruction is STOP so we are safe to just increment program_counter bcs on last instruction
-        // it will do noop and just stop execution of this contract
-        self.bytecode.relative_jump(1);
-
-        let instruction = unsafe { instruction_table.get_unchecked(opcode as usize) };
+        let instruction = self.fetch(instruction_table);
 
         if self.gas.record_cost_unsafe(instruction.static_gas()) {
-            return self.halt_oog();
+            self.halt_oog();
+        } else {
+            let context = InstructionContext {
+                interpreter: self,
+                host,
+            };
+            instruction.execute(context);
         }
-        let context = InstructionContext {
-            interpreter: self,
-            host,
-        };
-        instruction.execute(context);
+
+        // `run_plain` leaves the gas counter poisoned until `take_next_action`, because
+        // nothing can observe it in between. The single-step API is different: callers
+        // (inspectors) read `gas` right after every step, so the poison has to go here.
+        if self.bytecode.is_end() {
+            self.unpoison_gas();
+        }
     }
 
     /// Executes the instruction at the current instruction pointer.
@@ -315,16 +346,92 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
     }
 
     /// Executes the interpreter until it returns or stops.
+    ///
+    /// This is a hand-fused copy of [`Interpreter::step`] rather than a
+    /// `while is_not_end() { step() }` loop. Both exits of that shape (out-of-gas, and
+    /// "an instruction set an action") are merged into the single gas branch: setting
+    /// an action poisons the gas counter (see [`Interpreter::set_action`]), so the very
+    /// next gas charge fails. That leaves the loop with one exit edge, which removes the
+    /// per-opcode `continue_execution` load and its branch from the dispatch sequence.
+    ///
+    /// Cost: after an action is set, one extra opcode *fetch* happens (a byte read, a
+    /// pointer bump and a table lookup) before the loop notices. The instruction is
+    /// never executed, and `end_dispatch` undoes the pointer bump so that a resumed
+    /// `CALL`/`CREATE` frame restarts at the right place.
     #[inline]
     pub fn run_plain<H: Host + ?Sized>(
         &mut self,
         instruction_table: &InstructionTable<IW, H>,
         host: &mut H,
     ) -> InterpreterAction {
-        while self.bytecode.is_not_end() {
-            self.step(instruction_table, host);
+        // The body is repeated so that the loop's unconditional back edge is amortised
+        // over eight opcodes instead of being paid on every single one. The backend keeps
+        // the gas branch in the middle of the body and jumps back from the bottom, and no
+        // source-level rotation persuades it otherwise. Unrolling is close to free here:
+        // the zkVM cost model counts retired instructions, so a larger loop body has no
+        // instruction-cache price.
+        macro_rules! dispatch_one {
+            () => {{
+                let instruction = self.fetch(instruction_table);
+                if self.gas.record_cost_unsafe(instruction.static_gas()) {
+                    break;
+                }
+                let context = InstructionContext {
+                    interpreter: self,
+                    host,
+                };
+                instruction.execute(context);
+            }};
         }
+        loop {
+            dispatch_one!();
+            dispatch_one!();
+            dispatch_one!();
+            dispatch_one!();
+            dispatch_one!();
+            dispatch_one!();
+            dispatch_one!();
+            dispatch_one!();
+        }
+        self.end_dispatch();
         self.take_next_action()
+    }
+
+    /// Reads the opcode under the instruction pointer, advances it by one and returns the
+    /// matching instruction-table entry.
+    #[inline(always)]
+    fn fetch<H: Host + ?Sized>(
+        &mut self,
+        instruction_table: &InstructionTable<IW, H>,
+    ) -> Instruction<IW, H> {
+        // Get current opcode.
+        let opcode = self.bytecode.opcode();
+
+        // SAFETY: In analysis we are doing padding of bytecode so that we are sure that last
+        // byte instruction is STOP so we are safe to just increment program_counter bcs on
+        // last instruction it will do noop and just stop execution of this contract
+        self.bytecode.relative_jump(1);
+
+        // SAFETY: `opcode` is a `u8` and the table has exactly 256 entries.
+        unsafe { *instruction_table.get_unchecked(opcode as usize) }
+    }
+
+    /// Cold tail of the single loop exit of [`Interpreter::run_plain`].
+    ///
+    /// Two cases reach it:
+    /// * The gas counter was poisoned by [`Interpreter::set_action`], i.e. the previous
+    ///   instruction already decided where to go. The speculative fetch of this iteration
+    ///   has to be rolled back; the poisoned charge is discarded by
+    ///   [`Interpreter::take_next_action`].
+    /// * A genuine out of gas on the instruction that was just fetched.
+    #[cold]
+    #[inline(never)]
+    fn end_dispatch(&mut self) {
+        if self.bytecode.is_not_end() {
+            self.halt_oog();
+        } else {
+            self.bytecode.relative_jump(-1);
+        }
     }
 }
 
