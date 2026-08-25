@@ -23,7 +23,7 @@ pub fn jumpi<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, 
     //gas!(context.interpreter, gas::HIGH);
     popn!([target, cond], context.interpreter);
 
-    if !cond.is_zero() {
+    if !super::u256_is_zero(&cond) {
         jump_inner(context.interpreter, target);
     }
 }
