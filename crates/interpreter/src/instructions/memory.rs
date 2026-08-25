@@ -10,23 +10,52 @@ use crate::InstructionContext;
 /// Implements the MLOAD instruction.
 ///
 /// Loads a 32-byte word from memory.
+///
+/// The word is written straight into the stack slot it replaces, one limb at a time; see
+/// [`MemoryTr::get_u256_to`] for why the pointer form matters on this target.
 pub fn mload<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, WIRE>) {
     //gas!(context.interpreter, gas::VERYLOW);
-    popn_top!([], top, context.interpreter);
-    let offset = as_usize_or_fail!(context.interpreter, top);
+    let len = context.interpreter.stack.len();
+    if len < 1 {
+        context.interpreter.halt_underflow();
+        return;
+    }
+    // SAFETY: length checked above.
+    let word = *unsafe { context.interpreter.stack.data().get_unchecked(len - 1) };
+    let offset = as_usize_or_fail!(context.interpreter, word);
     resize_memory!(context.interpreter, offset, 32);
-    *top = context.interpreter.memory.get_u256(offset)
+    // SAFETY: length checked above; `resize_memory!` does not touch the stack.
+    let (_, top) = unsafe { context.interpreter.stack.popn_top::<0>().unwrap_unchecked() };
+    let dst = (top as *mut U256).cast::<u64>();
+    // SAFETY: `dst` is the four limbs of a live stack word, and memory now covers
+    // `offset + 32`.
+    unsafe { context.interpreter.memory.get_u256_to(offset, dst) };
 }
 
 /// Implements the MSTORE instruction.
 ///
 /// Stores a 32-byte word to memory.
+///
+/// The value is read out of its stack slot one limb at a time rather than popped into
+/// registers first; see [`MemoryTr::set_u256_ptr`].
 pub fn mstore<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, WIRE>) {
     //gas!(context.interpreter, gas::VERYLOW);
-    popn!([offset, value], context.interpreter);
-    let offset = as_usize_or_fail!(context.interpreter, offset);
+    let len = context.interpreter.stack.len();
+    if len < 2 {
+        context.interpreter.halt_underflow();
+        return;
+    }
+    // SAFETY: length checked above.
+    let word = *unsafe { context.interpreter.stack.data().get_unchecked(len - 1) };
+    let offset = as_usize_or_fail!(context.interpreter, word);
     resize_memory!(context.interpreter, offset, 32);
-    context.interpreter.memory.set_u256(offset, value);
+    // SAFETY: length checked above; `resize_memory!` does not touch the stack. The stack
+    // buffer and the memory buffer are distinct allocations, so the write cannot disturb
+    // the limbs still to be read.
+    let src = unsafe { context.interpreter.stack.data().as_ptr().add(len - 2) }.cast::<u64>();
+    unsafe { context.interpreter.memory.set_u256_ptr(offset, src) };
+    // The two operands are gone; the loads `popn` would do are dead and get removed.
+    let _ = unsafe { context.interpreter.stack.popn::<2>().unwrap_unchecked() };
 }
 
 /// Implements the MSTORE8 instruction.
