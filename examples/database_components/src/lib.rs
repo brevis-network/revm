@@ -10,8 +10,8 @@ pub use state::{State, StateRef};
 
 use revm::{
     database_interface::{DBErrorMarker, Database, DatabaseCommit, DatabaseRef},
-    primitives::{Address, HashMap, StorageKey, StorageValue, B256},
-    state::{Account, AccountInfo, Bytecode},
+    primitives::{Address, StorageKey, StorageValue, B256},
+    state::{AccountInfo, Bytecode, EvmState},
 };
 
 /// A database implementation that separates state and block hash components.
@@ -100,7 +100,7 @@ impl<S: StateRef, BH: BlockHashRef> DatabaseRef for DatabaseComponents<S, BH> {
 }
 
 impl<S: DatabaseCommit, BH: BlockHashRef> DatabaseCommit for DatabaseComponents<S, BH> {
-    fn commit(&mut self, changes: HashMap<Address, Account>) {
+    fn commit(&mut self, changes: EvmState) {
         self.state.commit(changes);
     }
 }

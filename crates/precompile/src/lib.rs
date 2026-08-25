@@ -54,7 +54,8 @@ use aurora_engine_modexp as _;
 
 use core::hash::Hash;
 use primitives::{
-    hardfork::SpecId, short_address, Address, HashMap, HashSet, OnceLock, SHORT_ADDRESS_CAP,
+    hardfork::SpecId, map::AddressHashMap, map::AddressHashSet, short_address, Address, HashMap,
+    HashSet, OnceLock, SHORT_ADDRESS_CAP,
 };
 use std::vec::Vec;
 
@@ -67,9 +68,9 @@ pub fn calc_linear_cost_u32(len: usize, base: u64, word: u64) -> u64 {
 #[derive(Clone, Debug)]
 pub struct Precompiles {
     /// Precompiles
-    inner: HashMap<Address, Precompile>,
+    inner: AddressHashMap<Precompile>,
     /// Addresses of precompiles.
-    addresses: HashSet<Address>,
+    addresses: AddressHashSet,
     /// Optimized addresses filter.
     optimized_access: Vec<Option<Precompile>>,
     /// `true` if all precompiles are short addresses.
@@ -117,7 +118,7 @@ impl Precompiles {
     }
 
     /// Returns inner HashMap of precompiles.
-    pub fn inner(&self) -> &HashMap<Address, Precompile> {
+    pub fn inner(&self) -> &AddressHashMap<Precompile> {
         &self.inner
     }
 
@@ -254,7 +255,7 @@ impl Precompiles {
     }
 
     /// Returns the precompiles addresses as a set.
-    pub fn addresses_set(&self) -> &HashSet<Address> {
+    pub fn addresses_set(&self) -> &AddressHashSet {
         &self.addresses
     }
 
