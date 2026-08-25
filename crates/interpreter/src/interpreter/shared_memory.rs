@@ -8,15 +8,106 @@ use core::{
 use primitives::{hex, B256, U256};
 use std::{rc::Rc, vec::Vec};
 
-/// Byte-reverses a `u64`.
+/// Masks for the three-stage byte reversal.
 ///
-/// `u64::swap_bytes` expands to roughly 22 and/or/shift instructions on the pico RV64 guest
-/// target, which has no Zbb. That cost is why this is a named function: emitting Zbb's `rev8`
-/// here instead is worth ~42 M retired instructions on block 24006677, but it needs the VM to
-/// decode and prove that encoding, so it is kept out of this change.
+/// Read with `read_volatile` so they reach a register as `lui` + `ld` from `.rodata` (2
+/// instructions each) instead of the `lui`/`addiw`/`slli` chain LLVM emits to materialise a
+/// 64-bit constant (8 instructions for the pair, measured). This is only about how the
+/// constant is loaded - correctness and the instruction count of the swap itself do not
+/// depend on it, so if the volatile load ever stops being opaque the worst case is falling
+/// back to materialisation.
+static BSWAP_M8: u64 = 0x00FF_00FF_00FF_00FF;
+static BSWAP_M16: u64 = 0x0000_FFFF_0000_FFFF;
+
+/// Loads the two masks once, to be shared by the four limbs of a 256-bit word.
 #[inline(always)]
+fn bswap_masks() -> (u64, u64) {
+    // SAFETY: volatile reads of initialised `static u64`s.
+    unsafe {
+        (
+            core::ptr::read_volatile(&BSWAP_M8),
+            core::ptr::read_volatile(&BSWAP_M16),
+        )
+    }
+}
+
+/// Byte-reverses a `u64` given masks from [`bswap_masks`].
+///
+/// LLVM lowers `bswap.i64` on a RV64 target without Zbb with the naive 8-term or-tree, which
+/// is 21-23 instructions. The classic 3-stage mask/swap is 13, but writing it in Rust does
+/// not survive: LLVM's `recognizeBSwapOrBitReverseIdiom` folds it straight back into
+/// `bswap.i64`. Hiding the masks behind a volatile load happens to defeat the matcher too,
+/// but that is a property of the matcher, not a guarantee - so emit the sequence instead and
+/// keep the volatile load only for how the masks are materialised.
+#[inline(always)]
+fn bswap64_masked(x: u64, _m1: u64, _m2: u64) -> u64 {
+    #[cfg(all(target_arch = "riscv64", not(target_feature = "zbb")))]
+    {
+        let out: u64;
+        // SAFETY: pure register arithmetic; no memory, no stack, no flags.
+        unsafe {
+            core::arch::asm!(
+                "srli {t0}, {x}, 8",
+                "and  {t0}, {t0}, {m1}",
+                "and  {t1}, {x}, {m1}",
+                "slli {t1}, {t1}, 8",
+                "or   {y}, {t0}, {t1}",
+                "srli {t0}, {y}, 16",
+                "and  {t0}, {t0}, {m2}",
+                "and  {t1}, {y}, {m2}",
+                "slli {t1}, {t1}, 16",
+                "or   {y}, {t0}, {t1}",
+                "srli {t0}, {y}, 32",
+                "slli {t1}, {y}, 32",
+                "or   {y}, {t0}, {t1}",
+                x = in(reg) x,
+                m1 = in(reg) _m1,
+                m2 = in(reg) _m2,
+                t0 = out(reg) _,
+                t1 = out(reg) _,
+                y = out(reg) out,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+        }
+        return out;
+    }
+    #[cfg(not(all(target_arch = "riscv64", not(target_feature = "zbb"))))]
+    {
+        x.swap_bytes()
+    }
+}
+
+/// Byte-reverses a single `u64`. Prefer [`bswap64_masked`] when several limbs can share one
+/// mask load.
+#[inline(always)]
+#[allow(dead_code)]
 fn bswap64(x: u64) -> u64 {
-    x.swap_bytes()
+    let (m1, m2) = bswap_masks();
+    bswap64_masked(x, m1, m2)
+}
+
+/// Reads the 32-byte big-endian word at `p` into a `U256`.
+///
+/// The four limb loads are plain `ld`, which is only possible when the caller can prove the
+/// pointer is 8-aligned; on a target without misaligned scalar access an `align(1)` `[u8; 32]`
+/// costs 32 `lbu` plus a shift/or chain instead.
+///
+/// # Safety
+///
+/// `p` must point at 32 readable bytes and be aligned to 8.
+#[inline(always)]
+pub(crate) unsafe fn u256_from_be_aligned(p: *const u8) -> U256 {
+    let (m1, m2) = bswap_masks();
+    // SAFETY: caller guarantees 32 readable, 8-aligned bytes.
+    unsafe {
+        let q = p.cast::<u64>();
+        U256::from_limbs([
+            bswap64_masked(q.add(3).read(), m1, m2),
+            bswap64_masked(q.add(2).read(), m1, m2),
+            bswap64_masked(q.add(1).read(), m1, m2),
+            bswap64_masked(q.read(), m1, m2),
+        ])
+    }
 }
 
 trait RefcellExt<T> {
@@ -94,6 +185,18 @@ impl MemoryTr for SharedMemory {
     #[inline]
     fn set_u256(&mut self, offset: usize, value: U256) {
         SharedMemory::set_u256(self, offset, value)
+    }
+
+    #[inline]
+    unsafe fn set_u256_ptr(&mut self, offset: usize, src: *const u64) {
+        // SAFETY: forwarded from the caller.
+        unsafe { SharedMemory::set_u256_ptr(self, offset, src) }
+    }
+
+    #[inline]
+    unsafe fn get_u256_to(&self, offset: usize, dst: *mut u64) {
+        // SAFETY: forwarded from the caller.
+        unsafe { SharedMemory::get_u256_to(self, offset, dst) }
     }
 
     fn size(&self) -> usize {
@@ -293,11 +396,52 @@ impl SharedMemory {
     }
 
     /// Resizes the memory in-place so that `len` is equal to `new_len`.
+    ///
+    /// `Vec::resize` zeroes the new tail with a runtime-length `memset`, which is a libcall
+    /// here: measured at 76.9 retired instructions to zero the 32 bytes of one EVM word,
+    /// and 36 % of all `MSTORE`s take this path. The fast path below zeroes with 64-bit
+    /// volatile stores instead - volatile so that LLVM's loop-idiom pass cannot turn them
+    /// back into `memset`.
     #[inline]
     pub fn resize(&mut self, new_size: usize) {
-        self.buffer()
-            .dbg_borrow_mut()
-            .resize(self.my_checkpoint + new_size, 0);
+        let new_len = self.my_checkpoint + new_size;
+        // SAFETY: the guest is single threaded and no other borrow of the shared buffer is
+        // live while an instruction executes, so going through `RefCell::as_ptr` gives the
+        // same access as `dbg_borrow_mut`, without the borrow-flag bookkeeping.
+        let buf = unsafe { &mut *self.buffer().as_ptr() };
+        let old_len = buf.len();
+        if new_len > old_len && new_len <= buf.capacity() {
+            let n = new_len - old_len;
+            // SAFETY: `old_len + n == new_len <= capacity`, so the tail is in the allocation.
+            unsafe {
+                let p = buf.as_mut_ptr().add(old_len);
+                if n == 32 && p as usize % core::mem::align_of::<u64>() == 0 {
+                    // The overwhelmingly common case: memory grew by one EVM word.
+                    let q = p.cast::<u64>();
+                    q.write_volatile(0);
+                    q.add(1).write_volatile(0);
+                    q.add(2).write_volatile(0);
+                    q.add(3).write_volatile(0);
+                } else if n % 8 == 0 && p as usize % core::mem::align_of::<u64>() == 0 {
+                    let mut q = p.cast::<u64>();
+                    let mut left = n / 8;
+                    while left != 0 {
+                        q.write_volatile(0);
+                        q = q.add(1);
+                        left -= 1;
+                    }
+                } else {
+                    let mut k = 0;
+                    while k < n {
+                        p.add(k).write_volatile(0);
+                        k += 1;
+                    }
+                }
+                buf.set_len(new_len);
+            }
+            return;
+        }
+        buf.resize(new_len, 0);
     }
 
     /// Returns a byte slice of the memory region at the given offset.
@@ -404,29 +548,117 @@ impl SharedMemory {
     /// Panics on out of bounds.
     #[inline]
     pub fn get_u256(&self, offset: usize) -> U256 {
-        let slice = self.slice_len(offset, 32);
-        let ptr = slice.as_ptr();
-        // Fast path: EVM memory is a `Vec<u8>`, so a byte-slice conversion has alignment 1, and
-        // on a target without misaligned scalar memory access (the pico RV64 zkVM guest) LLVM
-        // assembles the word with 32 `lbu` and a shift/or chain — measured at 236 instructions
-        // per `MLOAD` on block 24006677. Solidity keeps memory 32-byte aligned, so the region
+        // SAFETY: the guest is single threaded and no other borrow of the shared buffer is
+        // live while an instruction executes, so `RefCell::as_ptr` is the same access
+        // `borrow()` would give, without the borrow-flag bookkeeping. The caller has
+        // already grown memory to cover `offset + 32` through `resize_memory!`.
+        let buf = unsafe { &*self.buffer().as_ptr() };
+        let base = self.my_checkpoint + offset;
+        debug_assert!(base + 32 <= buf.len(), "get_u256 OOB");
+        // SAFETY: bounds established by the caller's `resize_memory!`, asserted above in
+        // debug builds.
+        let ptr = unsafe { buf.as_ptr().add(base) };
+        // EVM memory is a `Vec<u8>`, so a byte-slice conversion has alignment 1, and on a
+        // target without misaligned scalar memory access LLVM assembles the word with 32
+        // `lbu` and a shift/or chain. Solidity keeps memory 32-byte aligned, so the region
         // is normally 8-byte aligned too: read four `u64`s and byte-swap them instead.
         if ptr as usize % core::mem::align_of::<u64>() == 0 {
-            // SAFETY: `slice_len` bounds-checked the 32-byte region and the pointer is
-            // 8-byte aligned, so the four reads are in bounds and well aligned.
-            let (w0, w1, w2, w3) = unsafe {
-                let q = ptr.cast::<u64>();
-                (
-                    bswap64(q.read()),
-                    bswap64(q.add(1).read()),
-                    bswap64(q.add(2).read()),
-                    bswap64(q.add(3).read()),
-                )
-            };
-            // Memory is big-endian and `U256`'s limbs are little-endian ordered.
-            return U256::from_limbs([w3, w2, w1, w0]);
+            // SAFETY: in bounds (above) and 8-byte aligned (just checked).
+            return unsafe { u256_from_be_aligned(ptr) };
         }
-        U256::try_from_be_slice(&slice).unwrap()
+        // Misaligned offsets do occur (ABI encoders write at `p + 4`): assemble by byte.
+        let mut limbs = [0u64; 4];
+        let mut i = 0;
+        while i < 4 {
+            let mut v = 0u64;
+            let mut j = 0;
+            while j < 8 {
+                // SAFETY: `i * 8 + j < 32`, inside the region bounded above.
+                v = (v << 8) | unsafe { *ptr.add(i * 8 + j) } as u64;
+                j += 1;
+            }
+            limbs[3 - i] = v;
+            i += 1;
+        }
+        U256::from_limbs(limbs)
+    }
+
+    /// Writes the 32-byte big-endian word at `offset` from the four little-endian limbs at
+    /// `src`. See [`MemoryTr::set_u256_ptr`](super::MemoryTr::set_u256_ptr).
+    ///
+    /// # Safety
+    ///
+    /// `src` must point at four readable `u64`s and `offset + 32` must be in bounds.
+    #[inline]
+    pub unsafe fn set_u256_ptr(&mut self, offset: usize, src: *const u64) {
+        // SAFETY: see `get_u256` - single-threaded guest, no live borrow, bounds already
+        // established by the caller's `resize_memory!`.
+        let buf = unsafe { &mut *self.buffer().as_ptr() };
+        let base = self.my_checkpoint + offset;
+        debug_assert!(base + 32 <= buf.len(), "set_u256_ptr OOB");
+        // SAFETY: bounds as above.
+        let ptr = unsafe { buf.as_mut_ptr().add(base) };
+        let mut i = 0;
+        while i < 4 {
+            // SAFETY: `src` has four readable limbs; `i * 8 + 7 < 32`.
+            unsafe {
+                let w = *src.add(3 - i);
+                let b = ptr.add(i * 8);
+                b.write((w >> 56) as u8);
+                b.add(1).write((w >> 48) as u8);
+                b.add(2).write((w >> 40) as u8);
+                b.add(3).write((w >> 32) as u8);
+                b.add(4).write((w >> 24) as u8);
+                b.add(5).write((w >> 16) as u8);
+                b.add(6).write((w >> 8) as u8);
+                b.add(7).write(w as u8);
+            }
+            i += 1;
+        }
+    }
+
+    /// Reads the 32-byte big-endian word at `offset` into the four little-endian limbs at
+    /// `dst`. See [`MemoryTr::get_u256_to`](super::MemoryTr::get_u256_to).
+    ///
+    /// # Safety
+    ///
+    /// `dst` must point at four writable `u64`s and `offset + 32` must be in bounds.
+    #[inline]
+    pub unsafe fn get_u256_to(&self, offset: usize, dst: *mut u64) {
+        // SAFETY: as in `get_u256`.
+        let buf = unsafe { &*self.buffer().as_ptr() };
+        let base = self.my_checkpoint + offset;
+        debug_assert!(base + 32 <= buf.len(), "get_u256_to OOB");
+        // SAFETY: bounds as above.
+        let ptr = unsafe { buf.as_ptr().add(base) };
+        if ptr as usize % core::mem::align_of::<u64>() == 0 {
+            // Storing each limb between the loads is what keeps one limb live at a time; the
+            // byte reversal itself is the shared `bswap64_masked`, with one mask load for
+            // all four limbs.
+            let (m1, m2) = bswap_masks();
+            let q = ptr.cast::<u64>();
+            let mut i = 0;
+            while i < 4 {
+                // SAFETY: in bounds and 8-byte aligned. Memory is big-endian and `U256`'s
+                // limbs are little-endian ordered.
+                unsafe { dst.add(3 - i).write(bswap64_masked(q.add(i).read(), m1, m2)) };
+                i += 1;
+            }
+            return;
+        }
+        let mut i = 0;
+        while i < 4 {
+            let mut v = 0u64;
+            let mut j = 0;
+            while j < 8 {
+                // SAFETY: `i * 8 + j < 32`, inside the region bounded above.
+                v = (v << 8) | unsafe { *ptr.add(i * 8 + j) } as u64;
+                j += 1;
+            }
+            // SAFETY: `3 - i < 4`.
+            unsafe { dst.add(3 - i).write(v) };
+            i += 1;
+        }
     }
 
     /// Sets the `byte` at the given `index`.
@@ -459,24 +691,35 @@ impl SharedMemory {
     #[inline]
     #[cfg_attr(debug_assertions, track_caller)]
     pub fn set_u256(&mut self, offset: usize, value: U256) {
-        let mut slice = self.slice_mut(offset, 32);
-        let ptr = slice.as_mut_ptr();
-        // The mirror of `get_u256`'s fast path: without it the 32 bytes reach the buffer as
-        // 32 `sb`, because the destination slice has alignment 1.
-        if ptr as usize % core::mem::align_of::<u64>() == 0 {
-            let limbs = value.as_limbs();
-            // SAFETY: `slice_mut` bounds-checked the 32-byte region and the pointer is
-            // 8-byte aligned, so the four writes are in bounds and well aligned.
+        // SAFETY: see `get_u256` - single-threaded guest, no live borrow, bounds already
+        // established by the caller's `resize_memory!`.
+        let buf = unsafe { &mut *self.buffer().as_ptr() };
+        let base = self.my_checkpoint + offset;
+        debug_assert!(base + 32 <= buf.len(), "set_u256 OOB");
+        // SAFETY: bounds as above.
+        let ptr = unsafe { buf.as_mut_ptr().add(base) };
+        let limbs = value.as_limbs();
+        // Scattering the 32 bytes costs 7 shifts + 8 `sb` per limb = 60 instructions, and
+        // needs no alignment. Byte-swapping into four `sd` costs the same on the aligned
+        // path but needs a second, slower path for the ~10 % of `MSTORE`s whose offset is
+        // not 8-byte aligned, so the branch is not worth keeping.
+        let mut i = 0;
+        while i < 4 {
+            let w = limbs[3 - i];
+            // SAFETY: `i * 8 + 7 < 32`, inside the region bounded above.
             unsafe {
-                let q = ptr.cast::<u64>();
-                q.write(bswap64(limbs[3]));
-                q.add(1).write(bswap64(limbs[2]));
-                q.add(2).write(bswap64(limbs[1]));
-                q.add(3).write(bswap64(limbs[0]));
+                let b = ptr.add(i * 8);
+                b.write((w >> 56) as u8);
+                b.add(1).write((w >> 48) as u8);
+                b.add(2).write((w >> 40) as u8);
+                b.add(3).write((w >> 32) as u8);
+                b.add(4).write((w >> 24) as u8);
+                b.add(5).write((w >> 16) as u8);
+                b.add(6).write((w >> 8) as u8);
+                b.add(7).write(w as u8);
             }
-            return;
+            i += 1;
         }
-        slice.copy_from_slice(&value.to_be_bytes::<32>());
     }
 
     /// Set memory region at given `offset`.

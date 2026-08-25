@@ -156,6 +156,47 @@ pub trait MemoryTr {
         self.set(offset, &value.to_be_bytes::<32>());
     }
 
+    /// Writes the 32-byte big-endian word at `offset` from the four little-endian limbs at
+    /// `src`.
+    ///
+    /// The pointer form exists for register pressure, not convenience. Passing a `U256` by
+    /// value keeps all four limbs live from the pop to the last byte store, and on RV64
+    /// that pushed the allocator into 13 callee-saved registers, whose save/restore ran on
+    /// every `MSTORE`. Reading a limb through a pointer that may alias the destination
+    /// stops LLVM hoisting the next load above the previous stores, so only one limb is
+    /// live at a time.
+    ///
+    /// # Safety
+    ///
+    /// `src` must point at four readable `u64`s, and `offset + 32` must be within the
+    /// current memory.
+    #[inline]
+    unsafe fn set_u256_ptr(&mut self, offset: usize, src: *const u64) {
+        // SAFETY: the caller guarantees four readable limbs.
+        let limbs = unsafe { [*src, *src.add(1), *src.add(2), *src.add(3)] };
+        self.set_u256(offset, U256::from_limbs(limbs));
+    }
+
+    /// Reads the 32-byte big-endian word at `offset` into the four little-endian limbs at
+    /// `dst`. See [`MemoryTr::set_u256_ptr`] for why this takes a pointer.
+    ///
+    /// # Safety
+    ///
+    /// `dst` must point at four writable `u64`s, and `offset + 32` must be within the
+    /// current memory.
+    #[inline]
+    unsafe fn get_u256_to(&self, offset: usize, dst: *mut u64) {
+        let limbs = *self.get_u256(offset).as_limbs();
+        // SAFETY: the caller guarantees four writable limbs.
+        unsafe {
+            let mut i = 0;
+            while i < 4 {
+                dst.add(i).write(limbs[i]);
+                i += 1;
+            }
+        }
+    }
+
     /// Resizes memory to new size
     ///
     /// # Note

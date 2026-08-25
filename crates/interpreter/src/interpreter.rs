@@ -15,6 +15,7 @@ pub use input::InputsImpl;
 pub use return_data::ReturnDataImpl;
 pub use runtime_flags::RuntimeFlags;
 pub use shared_memory::{num_words, resize_memory, SharedMemory};
+pub(crate) use shared_memory::u256_from_be_aligned;
 pub use stack::{Stack, STACK_LIMIT};
 
 // imports
