@@ -9,7 +9,7 @@ pub use bytecode;
 pub use account_info::AccountInfo;
 pub use bytecode::Bytecode;
 pub use primitives;
-pub use types::{EvmState, EvmStorage, TransientStorage};
+pub use types::{EvmState, EvmStorage, StorageKeyHasher, TransientStorage};
 
 use bitflags::bitflags;
 use primitives::hardfork::SpecId;
