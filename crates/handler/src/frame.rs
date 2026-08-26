@@ -40,6 +40,7 @@ use std::boxed::Box;
     <IW as InterpreterTypes>::RuntimeFlag,
     <IW as InterpreterTypes>::Extend,
 )]
+#[repr(C)]
 pub struct EthFrame<IW: InterpreterTypes = EthInterpreter> {
     /// Frame-specific data (Call, Create, or EOFCreate).
     pub data: FrameData,
@@ -49,11 +50,15 @@ pub struct EthFrame<IW: InterpreterTypes = EthInterpreter> {
     pub depth: usize,
     /// Journal checkpoint for state reversion.
     pub checkpoint: JournalCheckpoint,
-    /// Interpreter instance for executing bytecode.
-    pub interpreter: Interpreter<IW>,
     /// Whether the frame has been finished its execution.
     /// Frame is considered finished if it has been called and returned a result.
     pub is_finished: bool,
+    /// Interpreter instance for executing bytecode.
+    ///
+    /// Last field, and the struct is `repr(C)`, for the same reason `Interpreter` puts its
+    /// stack last: the interpreter carries the EVM stack's 32 KiB inline, and the fields
+    /// above it have to stay reachable at a small displacement.
+    pub interpreter: Interpreter<IW>,
 }
 
 impl<IT: InterpreterTypes> FrameTr for EthFrame<IT> {

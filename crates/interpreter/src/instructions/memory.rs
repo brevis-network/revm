@@ -55,7 +55,9 @@ pub fn mstore<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_,
     let src = unsafe { context.interpreter.stack.data().as_ptr().add(len - 2) }.cast::<u64>();
     unsafe { context.interpreter.memory.set_u256_ptr(offset, src) };
     // The two operands are gone; the loads `popn` would do are dead and get removed.
-    let _ = unsafe { context.interpreter.stack.popn::<2>().unwrap_unchecked() };
+    // SAFETY: `len` was read at the top of this function and checked to be at least 2, and
+    // nothing since has pushed or popped.
+    unsafe { context.interpreter.stack.popn_discard::<2>(len) };
 }
 
 /// Implements the MSTORE8 instruction.
