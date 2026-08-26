@@ -179,12 +179,28 @@ impl EthFrame<EthInterpreter> {
             }
         }
 
-        let interpreter_input = InputsImpl {
-            target_address: inputs.target_address,
-            caller_address: inputs.caller,
-            bytecode_address: Some(inputs.bytecode_address),
-            input: inputs.input.clone(),
-            call_value: inputs.value.get(),
+        // Field by field rather than a struct literal, so that each address goes through
+        // `copy_address_bytes` instead of a `memcpy` libcall (see there).
+        // SAFETY: every field is initialized exactly once below, so `assume_init` sees a
+        // fully initialized `InputsImpl`.
+        let interpreter_input = unsafe {
+            let mut ii = core::mem::MaybeUninit::<InputsImpl>::uninit();
+            let p = ii.as_mut_ptr();
+            primitives::copy_address_bytes(
+                core::ptr::addr_of_mut!((*p).target_address).cast::<u8>(),
+                core::ptr::addr_of!(inputs.target_address).cast::<u8>(),
+            );
+            primitives::copy_address_bytes(
+                core::ptr::addr_of_mut!((*p).caller_address).cast::<u8>(),
+                core::ptr::addr_of!(inputs.caller).cast::<u8>(),
+            );
+            primitives::write_some_address(
+                core::ptr::addr_of_mut!((*p).bytecode_address),
+                core::ptr::addr_of!(inputs.bytecode_address).cast::<u8>(),
+            );
+            core::ptr::addr_of_mut!((*p).input).write(inputs.input.clone());
+            core::ptr::addr_of_mut!((*p).call_value).write(inputs.value.get());
+            ii.assume_init()
         };
         let is_static = inputs.is_static;
         let gas_limit = inputs.gas_limit;
