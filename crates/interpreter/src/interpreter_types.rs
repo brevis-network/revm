@@ -69,6 +69,14 @@ pub trait Jumps {
     /// Absolute jumps require checking for overflow and if target is a jump destination
     /// from jump table.
     fn absolute_jump(&mut self, offset: usize);
+
+    /// The instruction pointer that [`Jumps::absolute_jump`] would install, without
+    /// installing it.
+    ///
+    /// The switch dispatch of `Interpreter::run_plain` keeps the instruction pointer in a
+    /// local; letting `JUMP`/`JUMPI` hand back the new one directly saves the store, the
+    /// reload and the second store that going through the field costs.
+    fn absolute_ip(&self, offset: usize) -> *const u8;
     /// Check legacy jump destination from jump table.
     fn is_valid_legacy_jump(&mut self, offset: usize) -> bool;
     /// Returns current program counter.

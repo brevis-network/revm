@@ -218,6 +218,9 @@ pub fn blockhash<WIRE: InterpreterTypes, H: Host + ?Sized>(
 /// Implements the SLOAD instruction.
 ///
 /// Loads a word from storage.
+/// Inlined into the dispatch loop: out of line the prologue, epilogue and call cost more
+/// than a dozen instructions on every SLOAD.
+#[inline(always)]
 pub fn sload<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContext<'_, H, WIRE>) {
     popn_top!([], index, context.interpreter);
     let spec_id = context.interpreter.runtime_flag.spec_id();

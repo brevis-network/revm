@@ -13,6 +13,10 @@ use crate::InstructionContext;
 ///
 /// The word is written straight into the stack slot it replaces, one limb at a time; see
 /// [`MemoryTr::get_u256_to`] for why the pointer form matters on this target.
+///
+/// Inlined into the dispatch loop: out of line it spends 6 instructions on a prologue and 7
+/// on an epilogue, plus the call and return, for a body of about 70.
+#[inline(always)]
 pub fn mload<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, WIRE>) {
     //gas!(context.interpreter, gas::VERYLOW);
     let len = context.interpreter.stack.len();
@@ -37,7 +41,9 @@ pub fn mload<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, 
 /// Stores a 32-byte word to memory.
 ///
 /// The value is read out of its stack slot one limb at a time rather than popped into
-/// registers first; see [`MemoryTr::set_u256_ptr`].
+/// registers first; see [`MemoryTr::set_u256_ptr`]. Inlined into the dispatch loop for the
+/// same reason as [`mload`].
+#[inline(always)]
 pub fn mstore<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, WIRE>) {
     //gas!(context.interpreter, gas::VERYLOW);
     let len = context.interpreter.stack.len();
@@ -62,7 +68,8 @@ pub fn mstore<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_,
 
 /// Implements the MSTORE8 instruction.
 ///
-/// Stores a single byte to memory.
+/// Stores a single byte to memory. Inlined into the dispatch loop like [`mstore`].
+#[inline(always)]
 pub fn mstore8<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, WIRE>) {
     //gas!(context.interpreter, gas::VERYLOW);
     popn!([offset, value], context.interpreter);

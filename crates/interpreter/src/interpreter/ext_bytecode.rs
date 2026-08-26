@@ -168,6 +168,11 @@ impl Jumps for ExtBytecode {
     }
 
     #[inline]
+    fn absolute_ip(&self, offset: usize) -> *const u8 {
+        unsafe { self.base.bytes_ref().as_ptr().add(offset) }
+    }
+
+    #[inline]
     fn is_valid_legacy_jump(&mut self, offset: usize) -> bool {
         self.base
             .legacy_jump_table()
