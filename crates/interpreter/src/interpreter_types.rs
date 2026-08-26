@@ -75,6 +75,17 @@ pub trait Jumps {
     fn pc(&self) -> usize;
     /// Returns instruction opcode.
     fn opcode(&self) -> u8;
+    /// Returns the raw instruction pointer.
+    ///
+    /// `Interpreter::run_plain` keeps the instruction pointer in a local across the dispatch
+    /// loop and only hands it back through [`Jumps::set_ip`] for the few opcodes that look at
+    /// it, so that the common opcode does not pay a reload the backend cannot remove.
+    fn ip(&self) -> *const u8;
+    /// Sets the raw instruction pointer.
+    ///
+    /// The pointer must be one that came out of [`Jumps::ip`] on the same bytecode, possibly
+    /// moved by the jump methods, i.e. it has to stay inside the (padded) bytecode.
+    fn set_ip(&mut self, ip: *const u8);
 }
 
 /// Trait for Interpreter memory operations.
