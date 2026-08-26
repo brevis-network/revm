@@ -442,15 +442,43 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
                                 execute!($moves_ip, $f);
                             }
                         )*
-                        // Every remaining `u8` is spelled out rather than left to a `_` arm,
-                        // so the match is exhaustive over the whole range.
-                        0x0c..=0x0f
-                        | 0x1f
-                        | 0x21..=0x2f
-                        | 0x4b..=0x4f
-                        | 0xa5..=0xef
-                        | 0xf6..=0xf9
-                        | 0xfb..=0xfc => {
+                        // Every remaining `u8` is spelled out as a *literal*, rather than as
+                        // the ranges that cover the same values or as a `_` arm. It has to be
+                        // literals: with ranges, rustc lowers the tail of the match to
+                        // comparison chains hanging off the `SwitchInt`'s `otherwise` edge, so
+                        // LLVM sees a switch whose default block is reachable and emits the
+                        // jump table's range check -- one that constant-folds to a compare of
+                        // `zero` against itself and is then never removed, and which branch
+                        // relaxation turns into a taken conditional over a jump, because the
+                        // default block sits further away than a conditional branch reaches.
+                        // That is one retired instruction on every dispatched opcode.
+                        //
+                        // Written as 256 literal cases the default is `unreachable`, the range
+                        // check is not emitted at all, and the dispatch block gets small enough
+                        // for LLVM to tail-duplicate it into the ~150 arms, which also removes
+                        // the jump back to the loop header. Measured on block 24006677: -14.6 M
+                        // retired instructions, 8.1 M of it the branch and 6.6 M the
+                        // duplication.
+                        //
+                        // (An earlier form of this gave every invalid opcode its own arm with a
+                        // `black_box` of its own value, to stop the blocks being merged. That
+                        // works too and measured the same, but it is ~850 lines instead of 14:
+                        // what matters is that the *patterns* are literals, not that the
+                        // destinations are distinct.)
+                        0x0c | 0x0d | 0x0e | 0x0f | 0x1f | 0x21 | 0x22 | 0x23 |
+                        0x24 | 0x25 | 0x26 | 0x27 | 0x28 | 0x29 | 0x2a | 0x2b |
+                        0x2c | 0x2d | 0x2e | 0x2f | 0x4b | 0x4c | 0x4d | 0x4e |
+                        0x4f | 0xa5 | 0xa6 | 0xa7 | 0xa8 | 0xa9 | 0xaa | 0xab |
+                        0xac | 0xad | 0xae | 0xaf | 0xb0 | 0xb1 | 0xb2 | 0xb3 |
+                        0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8 | 0xb9 | 0xba | 0xbb |
+                        0xbc | 0xbd | 0xbe | 0xbf | 0xc0 | 0xc1 | 0xc2 | 0xc3 |
+                        0xc4 | 0xc5 | 0xc6 | 0xc7 | 0xc8 | 0xc9 | 0xca | 0xcb |
+                        0xcc | 0xcd | 0xce | 0xcf | 0xd0 | 0xd1 | 0xd2 | 0xd3 |
+                        0xd4 | 0xd5 | 0xd6 | 0xd7 | 0xd8 | 0xd9 | 0xda | 0xdb |
+                        0xdc | 0xdd | 0xde | 0xdf | 0xe0 | 0xe1 | 0xe2 | 0xe3 |
+                        0xe4 | 0xe5 | 0xe6 | 0xe7 | 0xe8 | 0xe9 | 0xea | 0xeb |
+                        0xec | 0xed | 0xee | 0xef | 0xf6 | 0xf7 | 0xf8 | 0xf9 |
+                        0xfb | 0xfc => {
                             if self.gas.record_cost_unsafe(0) {
                                 self.bytecode.set_ip(unsafe { ip.add(1) });
                                 break;
