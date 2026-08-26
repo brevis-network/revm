@@ -106,6 +106,169 @@ pub(crate) unsafe fn u256_from_be_aligned(p: *const u8) -> U256 {
     }
 }
 
+/// Writes the four little-endian limbs at `src` as one 32-byte big-endian word at the
+/// 8-aligned `q`.
+///
+/// The byte reversal is 13 instructions per limb without Zbb, so a limb that is *zero* is
+/// worth a branch: `bswap(0) == 0`, and `sd x0` is one instruction. Two shapes dominate the
+/// values EVM code stores - anything below `2^64` (lengths, offsets, booleans, small
+/// integers, zero) leaves the top three limbs zero, and anything below `2^192` (addresses)
+/// leaves the top one zero - so the ladder below is tested most-common-first. Every arm
+/// writes the same 32 bytes as the fully general one.
+///
+/// # Safety
+///
+/// `q` must point at four writable `u64`s and be 8-aligned; `src` at four readable `u64`s.
+#[inline(always)]
+unsafe fn store_be_word_aligned(q: *mut u64, src: *const u64) {
+    let (m1, m2) = bswap_masks();
+    // SAFETY: four readable limbs, four writable 8-aligned words.
+    unsafe {
+        let l0 = *src;
+        let l1 = *src.add(1);
+        let l2 = *src.add(2);
+        let l3 = *src.add(3);
+        if (l3 | l2 | l1) == 0 {
+            if l0 == 0 {
+                q.write(0);
+                q.add(1).write(0);
+                q.add(2).write(0);
+                q.add(3).write(0);
+                return;
+            }
+            q.write(0);
+            q.add(1).write(0);
+            q.add(2).write(0);
+        } else if l3 == 0 {
+            q.write(0);
+            q.add(1).write(bswap64_masked(l2, m1, m2));
+            q.add(2).write(bswap64_masked(l1, m1, m2));
+        } else {
+            q.write(bswap64_masked(l3, m1, m2));
+            q.add(1).write(bswap64_masked(l2, m1, m2));
+            q.add(2).write(bswap64_masked(l1, m1, m2));
+        }
+        q.add(3).write(bswap64_masked(l0, m1, m2));
+    }
+}
+
+/// Scatters the four little-endian limbs at `src` as a 32-byte big-endian word at `p`, one
+/// byte at a time. Needs no alignment; used for the offsets that are not 8-aligned.
+///
+/// # Safety
+///
+/// `p` must point at 32 writable bytes and `src` at four readable `u64`s.
+#[inline(always)]
+unsafe fn store_be_word_bytes(p: *mut u8, src: *const u64) {
+    // SAFETY: four readable limbs; the first 24 bytes are inside the 32 writable ones.
+    unsafe {
+        let l1 = *src.add(1);
+        let l2 = *src.add(2);
+        let l3 = *src.add(3);
+        if (l3 | l2 | l1) == 0 {
+            // Same ladder as the aligned path: a value below `2^64` leaves the top 24 bytes
+            // zero, and a zero byte needs no shift to produce.
+            let mut j = 0;
+            while j < 24 {
+                p.add(j).write(0);
+                j += 1;
+            }
+            store_be_limb_bytes(p.add(24), *src);
+            return;
+        }
+    }
+    let mut i = 0;
+    while i < 4 {
+        // SAFETY: `src` has four readable limbs; `i * 8 + 7 < 32`.
+        unsafe {
+            let w = *src.add(3 - i);
+            let b = p.add(i * 8);
+            b.write((w >> 56) as u8);
+            b.add(1).write((w >> 48) as u8);
+            b.add(2).write((w >> 40) as u8);
+            b.add(3).write((w >> 32) as u8);
+            b.add(4).write((w >> 24) as u8);
+            b.add(5).write((w >> 16) as u8);
+            b.add(6).write((w >> 8) as u8);
+            b.add(7).write(w as u8);
+        }
+        i += 1;
+    }
+}
+
+/// Scatters one limb as 8 big-endian bytes at `b`.
+///
+/// # Safety
+///
+/// `b` must point at 8 writable bytes.
+#[inline(always)]
+unsafe fn store_be_limb_bytes(b: *mut u8, w: u64) {
+    // SAFETY: eight writable bytes.
+    unsafe {
+        b.write((w >> 56) as u8);
+        b.add(1).write((w >> 48) as u8);
+        b.add(2).write((w >> 40) as u8);
+        b.add(3).write((w >> 32) as u8);
+        b.add(4).write((w >> 24) as u8);
+        b.add(5).write((w >> 16) as u8);
+        b.add(6).write((w >> 8) as u8);
+        b.add(7).write(w as u8);
+    }
+}
+
+/// Reads the 32-byte big-endian word at the 8-aligned `q` into the four little-endian limbs
+/// at `dst`. The mirror image of [`store_be_word_aligned`], with the same zero ladder: the
+/// high 24 bytes of memory are the top three limbs, and they are zero for every value below
+/// `2^64`.
+///
+/// # Safety
+///
+/// `q` must point at four readable `u64`s and be 8-aligned; `dst` at four writable `u64`s.
+#[inline(always)]
+unsafe fn load_be_word_aligned(q: *const u64, dst: *mut u64) {
+    let (m1, m2) = bswap_masks();
+    // SAFETY: four readable 8-aligned words, four writable limbs.
+    unsafe {
+        let x0 = q.read();
+        let x1 = q.add(1).read();
+        let x2 = q.add(2).read();
+        let x3 = q.add(3).read();
+        if (x0 | x1 | x2) == 0 {
+            if x3 == 0 {
+                dst.write(0);
+                dst.add(1).write(0);
+                dst.add(2).write(0);
+                dst.add(3).write(0);
+                return;
+            }
+            dst.add(3).write(0);
+            dst.add(2).write(0);
+            dst.add(1).write(0);
+        } else if x0 == 0 {
+            dst.add(3).write(0);
+            dst.add(2).write(bswap64_masked(x1, m1, m2));
+            dst.add(1).write(bswap64_masked(x2, m1, m2));
+        } else {
+            dst.add(3).write(bswap64_masked(x0, m1, m2));
+            dst.add(2).write(bswap64_masked(x1, m1, m2));
+            dst.add(1).write(bswap64_masked(x2, m1, m2));
+        }
+        dst.write(bswap64_masked(x3, m1, m2));
+    }
+}
+
+/// The two masks, for callers outside this module that reverse several words in a row.
+#[inline(always)]
+pub(crate) fn bswap_masks_shared() -> (u64, u64) {
+    bswap_masks()
+}
+
+/// [`bswap64_masked`] for callers outside this module.
+#[inline(always)]
+pub(crate) fn bswap64_shared(x: u64, m1: u64, m2: u64) -> u64 {
+    bswap64_masked(x, m1, m2)
+}
+
 trait RefcellExt<T> {
     fn dbg_borrow(&self) -> Ref<'_, T>;
     fn dbg_borrow_mut(&self) -> RefMut<'_, T>;
@@ -183,13 +346,13 @@ impl MemoryTr for SharedMemory {
         SharedMemory::set_u256(self, offset, value)
     }
 
-    #[inline]
+    #[inline(always)]
     unsafe fn set_u256_ptr(&mut self, offset: usize, src: *const u64) {
         // SAFETY: forwarded from the caller.
         unsafe { SharedMemory::set_u256_ptr(self, offset, src) }
     }
 
-    #[inline]
+    #[inline(always)]
     unsafe fn get_u256_to(&self, offset: usize, dst: *mut u64) {
         // SAFETY: forwarded from the caller.
         unsafe { SharedMemory::get_u256_to(self, offset, dst) }
@@ -591,7 +754,7 @@ impl SharedMemory {
     /// # Safety
     ///
     /// `src` must point at four readable `u64`s and `offset + 32` must be in bounds.
-    #[inline]
+    #[inline(always)]
     pub unsafe fn set_u256_ptr(&mut self, offset: usize, src: *const u64) {
         // SAFETY: see `get_u256` - single-threaded guest, no live borrow, bounds already
         // established by the caller's `resize_memory!`.
@@ -600,23 +763,17 @@ impl SharedMemory {
         debug_assert!(base + 32 <= buf.len(), "set_u256_ptr OOB");
         // SAFETY: bounds as above.
         let ptr = unsafe { buf.as_mut_ptr().add(base) };
-        let mut i = 0;
-        while i < 4 {
-            // SAFETY: `src` has four readable limbs; `i * 8 + 7 < 32`.
-            unsafe {
-                let w = *src.add(3 - i);
-                let b = ptr.add(i * 8);
-                b.write((w >> 56) as u8);
-                b.add(1).write((w >> 48) as u8);
-                b.add(2).write((w >> 40) as u8);
-                b.add(3).write((w >> 32) as u8);
-                b.add(4).write((w >> 24) as u8);
-                b.add(5).write((w >> 16) as u8);
-                b.add(6).write((w >> 8) as u8);
-                b.add(7).write(w as u8);
-            }
-            i += 1;
+        // EVM memory is a `Vec<u8>`, so nothing here is aligned as far as the compiler is
+        // concerned, but the offsets Solidity uses almost always are: measured at 99.3 % of
+        // `MLOAD`s on a mainnet block. Taking the aligned path lets a zero limb cost one
+        // `sd x0` instead of the 15 instructions the byte scatter spends on it.
+        if (ptr as usize).is_multiple_of(core::mem::align_of::<u64>()) {
+            // SAFETY: in bounds (above) and 8-byte aligned (just checked).
+            unsafe { store_be_word_aligned(ptr.cast::<u64>(), src) };
+            return;
         }
+        // SAFETY: in bounds; needs no alignment.
+        unsafe { store_be_word_bytes(ptr, src) };
     }
 
     /// Reads the 32-byte big-endian word at `offset` into the four little-endian limbs at
@@ -625,7 +782,7 @@ impl SharedMemory {
     /// # Safety
     ///
     /// `dst` must point at four writable `u64`s and `offset + 32` must be in bounds.
-    #[inline]
+    #[inline(always)]
     pub unsafe fn get_u256_to(&self, offset: usize, dst: *mut u64) {
         // SAFETY: as in `get_u256`.
         let buf = unsafe { &*self.buffer().as_ptr() };
@@ -634,21 +791,9 @@ impl SharedMemory {
         // SAFETY: bounds as above.
         let ptr = unsafe { buf.as_ptr().add(base) };
         if (ptr as usize).is_multiple_of(core::mem::align_of::<u64>()) {
-            // Storing each limb between the loads is what keeps one limb live at a time; the
-            // byte reversal itself is the shared `bswap64_masked`, with one mask load for
-            // all four limbs.
-            let (m1, m2) = bswap_masks();
-            let q = ptr.cast::<u64>();
-            let mut i = 0;
-            while i < 4 {
-                // SAFETY: in bounds and 8-byte aligned. Memory is big-endian and `U256`'s
-                // limbs are little-endian ordered.
-                unsafe {
-                    dst.add(3 - i)
-                        .write(bswap64_masked(q.add(i).read(), m1, m2))
-                };
-                i += 1;
-            }
+            // SAFETY: in bounds and 8-byte aligned. Memory is big-endian and `U256`'s limbs
+            // are little-endian ordered.
+            unsafe { load_be_word_aligned(ptr.cast::<u64>(), dst) };
             return;
         }
         let mut i = 0;
@@ -917,8 +1062,10 @@ fn grow_zeroed(buf: &mut Vec<u8>, new_len: usize) {
     buf.resize(new_len, 0);
 }
 
-#[cold]
-#[inline(never)]
+/// Inlined: 37 % of `MSTORE`s reach it, and out of line it pays a call, a return and a
+/// prologue that saves five callee-saved registers - 17 instructions of the 68 it retires.
+/// `grow_zeroed` and `zero_tail` stay outlined, so this is still branch-light.
+#[inline(always)]
 fn resize_memory_cold<Memory: MemoryTr>(
     gas: &mut crate::Gas,
     memory: &mut Memory,
