@@ -23,10 +23,12 @@ pub mod eip7702;
 pub mod eip7823;
 pub mod eip7825;
 pub mod eip7907;
+pub mod fixed_key_hash;
 pub mod hardfork;
 mod once_lock;
 
 pub use constants::*;
+pub use fixed_key_hash::{AddressMap, AddressSet, B256Map, FixedKeyBuildHasher, FixedKeyHasher};
 pub use once_lock::OnceLock;
 
 // Reexport alloy primitives.
