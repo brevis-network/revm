@@ -348,52 +348,113 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
 
     /// Executes the interpreter until it returns or stops.
     ///
-    /// This is a hand-fused copy of [`Interpreter::step`] rather than a
-    /// `while is_not_end() { step() }` loop. Both exits of that shape (out-of-gas, and
-    /// "an instruction set an action") are merged into the single gas branch: setting
-    /// an action poisons the gas counter (see [`Interpreter::set_action`]), so the very
-    /// next gas charge fails. That leaves the loop with one exit edge, which removes the
-    /// per-opcode `continue_execution` load and its branch from the dispatch sequence.
+    /// This is a switch dispatch over the opcode rather than a `while is_not_end() { step() }`
+    /// loop over the instruction table, for two reasons:
     ///
-    /// Cost: after an action is set, one extra opcode *fetch* happens (a byte read, a
-    /// pointer bump and a table lookup) before the loop notices. The instruction is
-    /// never executed, and `end_dispatch` undoes the pointer bump so that a resumed
-    /// `CALL`/`CREATE` frame restarts at the right place.
+    /// * The static gas cost becomes a per-arm *immediate*, so the table load that fetched it
+    ///   disappears and the charge is a single `addi`.
+    /// * The call is direct instead of through a function pointer, so the backend can inline
+    ///   the cheap opcode bodies straight into the loop. That removes the argument shuffle,
+    ///   the call and the return, and lets the body reuse the instruction pointer the loop
+    ///   already has in a register. The zkVM cost model counts retired instructions, so the
+    ///   extra code size is free.
+    ///
+    /// Both exits of the natural shape (out-of-gas, and "an instruction set an action") are
+    /// merged into the single gas branch: setting an action poisons the gas counter (see
+    /// [`Interpreter::set_action`]), so the very next gas charge fails. That leaves the loop
+    /// with one exit edge, which removes the per-opcode `continue_execution` load and its
+    /// branch from the dispatch sequence.
+    ///
+    /// Cost: after an action is set, one extra opcode *fetch* happens (a byte read and a
+    /// pointer bump) before the loop notices. The instruction is never executed, and
+    /// `end_dispatch` undoes the pointer bump so that a resumed `CALL`/`CREATE` frame
+    /// restarts at the right place.
+    ///
+    /// # Instruction table
+    ///
+    /// `instruction_table` is **ignored**: the arms are generated from
+    /// [`for_each_builtin_instruction`], i.e. from the same list that builds
+    /// [`instruction_table`](crate::instructions::instruction_table), so a default table
+    /// behaves identically. A table customised through
+    /// `EthInstructions::insert_instruction` is *not* honoured here; such a caller has to
+    /// drive the interpreter through [`Interpreter::step`], which still goes through the
+    /// table.
     #[inline]
     pub fn run_plain<H: Host + ?Sized>(
         &mut self,
         instruction_table: &InstructionTable<IW, H>,
         host: &mut H,
     ) -> InterpreterAction {
-        // The body is repeated so that the loop's unconditional back edge is amortised
-        // over eight opcodes instead of being paid on every single one. The backend keeps
-        // the gas branch in the middle of the body and jumps back from the bottom, and no
-        // source-level rotation persuades it otherwise. Unrolling is close to free here:
-        // the zkVM cost model counts retired instructions, so a larger loop body has no
-        // instruction-cache price.
-        macro_rules! dispatch_one {
-            () => {{
-                let instruction = self.fetch(instruction_table);
-                if self.gas.record_cost_unsafe(instruction.static_gas()) {
-                    break;
-                }
-                let context = InstructionContext {
+        let _ = instruction_table;
+        // The instruction pointer lives in a local for the whole loop. Reading it back out of
+        // `self.bytecode` after every opcode costs a load that the backend cannot remove: the
+        // interpreter stack writes go through a heap pointer, and nothing tells LLVM that it
+        // cannot alias the pointer field. Only `PUSH1..PUSH32`, `PC`, `JUMP` and `JUMPI` touch
+        // the instruction pointer at all (their arms are tagged `1` in
+        // `for_each_builtin_instruction`), so only those hand it over and take it back; the
+        // single loop exit stores it (bumped past the opcode it speculatively fetched) so
+        // that `end_dispatch` and a resumed frame see the right value.
+        let mut ip = self.bytecode.ip();
+        // The bump of `ip` lives in the arms, past the opcode read, rather than in the loop
+        // header. In the header the backend schedules the `addi` ahead of the `lbu` and has to
+        // copy the pre-bump pointer into a second register; from the arm it is an in-place
+        // increment of the loop-carried register.
+        macro_rules! execute {
+            (0, $f:expr) => {{
+                ip = unsafe { ip.add(1) };
+                $f(InstructionContext {
                     interpreter: self,
                     host,
-                };
-                instruction.execute(context);
+                });
+            }};
+            (1, $f:expr) => {{
+                ip = unsafe { ip.add(1) };
+                self.bytecode.set_ip(ip);
+                $f(InstructionContext {
+                    interpreter: self,
+                    host,
+                });
+                ip = self.bytecode.ip();
             }};
         }
-        loop {
-            dispatch_one!();
-            dispatch_one!();
-            dispatch_one!();
-            dispatch_one!();
-            dispatch_one!();
-            dispatch_one!();
-            dispatch_one!();
-            dispatch_one!();
+        macro_rules! dispatch_switch {
+            ($($op:ident => $f:expr, $g:expr, $moves_ip:tt;)*) => {
+                loop {
+                    // SAFETY: same invariant as `ExtBytecode::opcode`. The analysis pads the
+                    // bytecode so that the last opcode is a STOP, so the pointer never walks
+                    // off the end: STOP sets an action, which poisons the gas counter and
+                    // ends the loop on the next charge.
+                    let opcode = unsafe { *ip };
+                    match opcode {
+                        $(
+                            $crate::instructions::opcode_consts::$op => {
+                                if self.gas.record_cost_unsafe($g) {
+                                    self.bytecode.set_ip(unsafe { ip.add(1) });
+                                    break;
+                                }
+                                execute!($moves_ip, $f);
+                            }
+                        )*
+                        // Every remaining `u8` is spelled out rather than left to a `_` arm,
+                        // so the match is exhaustive over the whole range.
+                        0x0c..=0x0f
+                        | 0x1f
+                        | 0x21..=0x2f
+                        | 0x4b..=0x4f
+                        | 0xa5..=0xef
+                        | 0xf6..=0xf9
+                        | 0xfb..=0xfc => {
+                            if self.gas.record_cost_unsafe(0) {
+                                self.bytecode.set_ip(unsafe { ip.add(1) });
+                                break;
+                            }
+                            execute!(0, $crate::instructions::control::unknown);
+                        }
+                    }
+                }
+            };
         }
+        crate::for_each_builtin_instruction!(dispatch_switch, true);
         self.end_dispatch();
         self.take_next_action()
     }

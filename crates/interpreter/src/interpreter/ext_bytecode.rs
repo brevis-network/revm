@@ -153,6 +153,16 @@ impl Jumps for ExtBytecode {
     }
 
     #[inline]
+    fn ip(&self) -> *const u8 {
+        self.instruction_pointer
+    }
+
+    #[inline]
+    fn set_ip(&mut self, ip: *const u8) {
+        self.instruction_pointer = ip;
+    }
+
+    #[inline]
     fn pc(&self) -> usize {
         // SAFETY: `instruction_pointer` should be at an offset from the start of the bytes.
         // In practice this is always true unless a caller modifies the `instruction_pointer` field manually.
