@@ -9,7 +9,7 @@ use crate::{
     gas,
     instructions::utility::IntoAddress,
     interpreter_action::FrameInput,
-    interpreter_types::{InputsTr, InterpreterTypes, LoopControl, MemoryTr, RuntimeFlag, StackTr},
+    interpreter_types::{InputsTr, InterpreterTypes, MemoryTr, RuntimeFlag, StackTr},
     CallInput, CallInputs, CallScheme, CallValue, CreateInputs, Host, InstructionResult,
     InterpreterAction,
 };
@@ -93,7 +93,6 @@ pub fn create<WIRE: InterpreterTypes, const IS_CREATE2: bool, H: Host + ?Sized>(
     // Call host to interact with target contract
     context
         .interpreter
-        .bytecode
         .set_action(InterpreterAction::NewFrame(FrameInput::Create(Box::new(
             CreateInputs {
                 caller: context.interpreter.input.target_address(),
@@ -136,7 +135,6 @@ pub fn call<WIRE: InterpreterTypes, H: Host + ?Sized>(
     // Call host to interact with target contract
     context
         .interpreter
-        .bytecode
         .set_action(InterpreterAction::NewFrame(FrameInput::Call(Box::new(
             CallInputs {
                 input: CallInput::SharedBuffer(input),
@@ -179,7 +177,6 @@ pub fn call_code<WIRE: InterpreterTypes, H: Host + ?Sized>(
     // Call host to interact with target contract
     context
         .interpreter
-        .bytecode
         .set_action(InterpreterAction::NewFrame(FrameInput::Call(Box::new(
             CallInputs {
                 input: CallInput::SharedBuffer(input),
@@ -222,7 +219,6 @@ pub fn delegate_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
     // Call host to interact with target contract
     context
         .interpreter
-        .bytecode
         .set_action(InterpreterAction::NewFrame(FrameInput::Call(Box::new(
             CallInputs {
                 input: CallInput::SharedBuffer(input),
@@ -265,7 +261,6 @@ pub fn static_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
     // Call host to interact with target contract
     context
         .interpreter
-        .bytecode
         .set_action(InterpreterAction::NewFrame(FrameInput::Call(Box::new(
             CallInputs {
                 input: CallInput::SharedBuffer(input),

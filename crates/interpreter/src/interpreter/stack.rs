@@ -297,9 +297,22 @@ impl Stack {
             // byte loads/stores. Reading and writing `U256` keeps the alignment, so the same
             // swap is 4 `ld` + 4 `sd`. The pointers are known not to overlap, so the single
             // temporary is the whole cost.
-            let tmp = core::ptr::read(p1);
-            core::ptr::write(p1, core::ptr::read(p2));
-            core::ptr::write(p2, tmp);
+            // Swapping through a `U256` temporary makes LLVM reserve a 32-byte frame slot
+            // that it then promotes away, leaving a dead `addi sp` pair (2 of the 25
+            // retired instructions of `SWAP1`). Moving the four limbs by hand keeps the
+            // 8 `ld` + 8 `sd` and drops the frame.
+            let a = p1.cast::<u64>();
+            let b = p2.cast::<u64>();
+            let (a0, a1, a2, a3) = (a.read(), a.add(1).read(), a.add(2).read(), a.add(3).read());
+            let (b0, b1, b2, b3) = (b.read(), b.add(1).read(), b.add(2).read(), b.add(3).read());
+            a.write(b0);
+            a.add(1).write(b1);
+            a.add(2).write(b2);
+            a.add(3).write(b3);
+            b.write(a0);
+            b.add(1).write(a1);
+            b.add(2).write(a2);
+            b.add(3).write(a3);
         }
         true
     }
@@ -320,6 +333,41 @@ impl Stack {
     #[inline]
     fn push_slice_(&mut self, slice: &[u8]) -> bool {
         if slice.is_empty() {
+            return true;
+        }
+
+        // Fast path for `PUSH1`..`PUSH32`, i.e. everything the interpreter actually pushes.
+        // The generic path below reaches the limbs through `u64::from_be_bytes`, and with no
+        // Zbb `rev8` on this target that is a ~19-instruction software byte reversal per
+        // limb on top of the byte loads: `PUSH4` costs 38 retired instructions where the
+        // shift/or chain below needs 4 `lbu` + 3 `slli` + 3 `or`.
+        if slice.len() <= 32 {
+            if self.data.len() == STACK_LIMIT {
+                return false;
+            }
+            let n = slice.len();
+            let src = slice.as_ptr();
+            // SAFETY: capacity is at least `STACK_LIMIT` and the length is below it, so one
+            // more word fits; `n` bytes of `slice` are readable by construction.
+            unsafe {
+                let dst = self.data.as_mut_ptr().add(self.data.len()).cast::<u64>();
+                self.data.set_len(self.data.len() + 1);
+                let mut k = 0;
+                while k < 4 {
+                    // Limb `k` holds bytes `n-1-8k ..= n-8k-8` of the big-endian value.
+                    let mut v = 0u64;
+                    let mut j = 0;
+                    while j < 8 {
+                        let from_end = k * 8 + j;
+                        if from_end < n {
+                            v |= (*src.add(n - 1 - from_end) as u64) << (8 * j);
+                        }
+                        j += 1;
+                    }
+                    dst.add(k).write(v);
+                    k += 1;
+                }
+            }
             return true;
         }
 

@@ -1,6 +1,6 @@
 use crate::{
     interpreter::Interpreter,
-    interpreter_types::{InterpreterTypes, Jumps, LoopControl, MemoryTr, RuntimeFlag, StackTr},
+    interpreter_types::{InterpreterTypes, Jumps, MemoryTr, RuntimeFlag, StackTr},
     InstructionResult, InterpreterAction,
 };
 use primitives::{Bytes, U256};
@@ -23,7 +23,7 @@ pub fn jumpi<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, 
     //gas!(context.interpreter, gas::HIGH);
     popn!([target, cond], context.interpreter);
 
-    if !cond.is_zero() {
+    if !super::u256_is_zero(&cond) {
         jump_inner(context.interpreter, target);
     }
 }
@@ -81,13 +81,11 @@ fn return_inner(
         output = interpreter.memory.slice_len(offset, len).to_vec().into()
     }
 
-    interpreter
-        .bytecode
-        .set_action(InterpreterAction::new_return(
-            instruction_result,
-            output,
-            interpreter.gas,
-        ));
+    interpreter.set_action(InterpreterAction::new_return(
+        instruction_result,
+        output,
+        interpreter.gas,
+    ));
 }
 
 /// Implements the RETURN instruction.

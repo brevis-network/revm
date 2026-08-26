@@ -58,7 +58,7 @@ pub fn eq<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, 
     //gas!(context.interpreter, gas::VERYLOW);
     popn_top!([op1], op2, context.interpreter);
 
-    *op2 = U256::from(op1 == *op2);
+    *op2 = U256::from(super::u256_eq(&op1, op2));
 }
 
 /// Implements the ISZERO instruction.
@@ -67,7 +67,7 @@ pub fn eq<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, 
 pub fn iszero<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, WIRE>) {
     //gas!(context.interpreter, gas::VERYLOW);
     popn_top!([], op1, context.interpreter);
-    *op1 = U256::from(op1.is_zero());
+    *op1 = U256::from(super::u256_is_zero(op1));
 }
 
 /// Implements the AND instruction.
