@@ -421,6 +421,9 @@ impl SharedMemory {
                 } else if n.is_multiple_of(8)
                     && (p as usize).is_multiple_of(core::mem::align_of::<u64>())
                 {
+                    // Also common (`CALLDATACOPY` and friends grow by several words at
+                    // once), so it stays inline: it needs two scratch registers and no call,
+                    // which costs `resize_memory_cold` nothing in its prologue.
                     let mut q = p.cast::<u64>();
                     let mut left = n / 8;
                     while left != 0 {
@@ -429,17 +432,13 @@ impl SharedMemory {
                         left -= 1;
                     }
                 } else {
-                    let mut k = 0;
-                    while k < n {
-                        p.add(k).write_volatile(0);
-                        k += 1;
-                    }
+                    zero_tail(p, n);
                 }
                 buf.set_len(new_len);
             }
             return;
         }
-        buf.resize(new_len, 0);
+        grow_zeroed(buf, new_len);
     }
 
     /// Returns a byte slice of the memory region at the given offset.
@@ -887,6 +886,35 @@ pub fn resize_memory<Memory: MemoryTr>(
     } else {
         true
     }
+}
+
+/// Zeroes a tail that is not a whole number of aligned words. Genuinely rare: EVM memory only
+/// ever grows to a multiple of 32 bytes from a 32-byte-aligned base.
+///
+/// Outlined together with [`grow_zeroed`] to keep `resize_memory_cold`'s prologue small - with
+/// `Vec::resize`'s `memset` and `RawVec` growth inlined it saved and restored seven
+/// callee-saved registers, 18 of its 74 retired instructions, on *every* call.
+///
+/// # Safety
+/// `p` must point at `n` writable bytes.
+#[cold]
+#[inline(never)]
+unsafe fn zero_tail(p: *mut u8, n: usize) {
+    // Volatile so that LLVM's loop-idiom pass cannot turn these back into a `memset` libcall.
+    unsafe {
+        let mut k = 0;
+        while k < n {
+            p.add(k).write_volatile(0);
+            k += 1;
+        }
+    }
+}
+
+/// Grows the shared buffer past its capacity. See [`zero_tail`] for why this is outlined.
+#[cold]
+#[inline(never)]
+fn grow_zeroed(buf: &mut Vec<u8>, new_len: usize) {
+    buf.resize(new_len, 0);
 }
 
 #[cold]

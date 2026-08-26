@@ -813,11 +813,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // new value is same as present, we don't need to do anything
         if present.data == new {
             return Ok(StateLoad::new(
-                SStoreResult {
-                    original_value: slot.original_value(),
-                    present_value: present.data,
-                    new_value: new,
-                },
+                sstore_result(slot.original_value(), present.data, new),
                 present.is_cold,
             ));
         }
@@ -827,11 +823,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // insert value into present state.
         slot.present_value = new;
         Ok(StateLoad::new(
-            SStoreResult {
-                original_value: slot.original_value(),
-                present_value: present.data,
-                new_value: new,
-            },
+            sstore_result(slot.original_value(), present.data, new),
             present.is_cold,
         ))
     }
@@ -931,5 +923,32 @@ mod tests {
         let state_load = result.unwrap();
         assert!(!state_load.is_cold); // Should be warm
         assert_eq!(state_load.data, U256::ZERO); // Empty slot
+    }
+}
+
+
+/// Builds an [`SStoreResult`] limb by limb.
+///
+/// The struct is three `U256`s, and the plain literal is a 96-byte copy that LLVM lowers to a
+/// `memcpy` libcall (~74 retired instructions) rather than the twelve `ld`/`sd` pairs it
+/// actually is. `SSTORE` runs ~15 K times per mainnet block.
+#[inline(always)]
+fn sstore_result(
+    original_value: StorageValue,
+    present_value: StorageValue,
+    new_value: StorageValue,
+) -> SStoreResult {
+    // SAFETY: all three fields are initialized exactly once below, and each is a `U256` at an
+    // 8-aligned offset of an 8-aligned struct.
+    unsafe {
+        let mut r = core::mem::MaybeUninit::<SStoreResult>::uninit();
+        let p = r.as_mut_ptr();
+        primitives::copy_u256(
+            core::ptr::addr_of_mut!((*p).original_value),
+            &original_value,
+        );
+        primitives::copy_u256(core::ptr::addr_of_mut!((*p).present_value), &present_value);
+        primitives::copy_u256(core::ptr::addr_of_mut!((*p).new_value), &new_value);
+        r.assume_init()
     }
 }
