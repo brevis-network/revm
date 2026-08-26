@@ -27,15 +27,22 @@ use bytecode::Bytecode;
 use primitives::{hardfork::SpecId, Bytes};
 
 /// Main interpreter structure that contains all components defined in [`InterpreterTypes`].
+///
+/// `repr(C)` with [`Interpreter::stack`] **last**, on purpose. The EVM stack keeps its
+/// 1024 words inline (see `Stack`), which is 32 KiB; laid out anywhere but at the end it
+/// would push the other fields past the 12-bit displacement a RISC-V load or store can
+/// encode, and every access to the gas counter or the instruction pointer would grow an
+/// address computation. Last, the fields the dispatch loop touches stay within a few
+/// hundred bytes of the base and the stack words are reached as `base + byte_len` with the
+/// field offset folded into the displacement.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[repr(C)]
 pub struct Interpreter<WIRE: InterpreterTypes = EthInterpreter> {
     /// Bytecode being executed.
     pub bytecode: WIRE::Bytecode,
     /// Gas tracking for execution costs.
     pub gas: Gas,
-    /// EVM stack for computation.
-    pub stack: WIRE::Stack,
     /// Buffer for return data from calls.
     pub return_data: WIRE::ReturnData,
     /// EVM memory for data storage.
@@ -46,6 +53,10 @@ pub struct Interpreter<WIRE: InterpreterTypes = EthInterpreter> {
     pub runtime_flag: WIRE::RuntimeFlag,
     /// Extended functionality and customizations.
     pub extend: WIRE::Extend,
+    /// EVM stack for computation.
+    ///
+    /// Last field; see the note on the struct.
+    pub stack: WIRE::Stack,
     /// Backup of `gas.remaining` while the gas counter is poisoned by
     /// [`Interpreter::set_action`], or `u64::MAX` when it is not poisoned.
     ///
@@ -144,7 +155,7 @@ impl<EXT: Default> Interpreter<EthInterpreter<EXT>> {
         } = self;
         *bytecode_ref = bytecode;
         *gas = Gas::new(gas_limit);
-        if stack.data().capacity() == 0 {
+        if !stack.is_allocated() {
             *stack = Stack::new();
         } else {
             stack.clear();
