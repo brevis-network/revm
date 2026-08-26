@@ -79,10 +79,19 @@ pub type InstructionTable<W, H> = [Instruction<W, H>; 256];
 /// The built-in instruction set, one `OPCODE => implementation, static_gas, moves_ip;`
 /// per opcode.
 ///
-/// `moves_ip` is `1` for the handful of opcodes whose implementation reads or writes the
-/// instruction pointer (`PUSH1..PUSH32`, `PC`, `JUMP`, `JUMPI`) and `0` for every other one.
-/// `Interpreter::run_plain` uses it to decide which arms have to sync the pointer it keeps in
-/// a local; see the dispatch loop there.
+/// The last column says how the arm has to treat the instruction pointer that
+/// `Interpreter::run_plain` keeps in a local; see the `execute!` rules in the dispatch loop
+/// there.
+///
+/// * `0` -- the implementation never touches the instruction pointer. Most opcodes.
+/// * `1` -- it reads or writes it, so the arm stores the local before the call and reloads
+///   it after (`PC`, `JUMP`, `JUMPI`).
+/// * `(2, N)` -- `PUSH1`..`PUSH32`: the arm reads the `N` immediate bytes straight off the
+///   local and advances it by `1 + N` itself, instead of paying a store, a load and a
+///   second store to hand the pointer to `stack::push::<N>`.
+/// * `(3, f)` -- `JUMP`/`JUMPI`: `f` returns the new instruction pointer rather than
+///   storing it. Depends on `-tail-dup-size=12` being set; the dispatch loop has the
+///   numbers.
 ///
 /// Both the instruction *table* ([`instruction_table`]) and the switch dispatch in
 /// [`Interpreter::run_plain`](crate::Interpreter::run_plain) are generated from this single
@@ -154,8 +163,10 @@ macro_rules! for_each_builtin_instruction {
             MSTORE8 => $crate::instructions::memory::mstore8, 3, 0;
             SLOAD => $crate::instructions::host::sload, 0, 0;
             SSTORE => $crate::instructions::host::sstore, 0, 0;
-            JUMP => $crate::instructions::control::jump::<$fuse, _, _>, 8, 1;
-            JUMPI => $crate::instructions::control::jumpi::<$fuse, _, _>, 10, 1;
+            JUMP => $crate::instructions::control::jump::<$fuse, _, _>, 8,
+                (3, $crate::instructions::control::jump_at::<$fuse, _, _>);
+            JUMPI => $crate::instructions::control::jumpi::<$fuse, _, _>, 10,
+                (3, $crate::instructions::control::jumpi_at::<$fuse, _, _>);
             PC => $crate::instructions::control::pc, 2, 1;
             MSIZE => $crate::instructions::memory::msize, 2, 0;
             GAS => $crate::instructions::system::gas, 2, 0;
@@ -164,38 +175,38 @@ macro_rules! for_each_builtin_instruction {
             TSTORE => $crate::instructions::host::tstore, 100, 0;
             MCOPY => $crate::instructions::memory::mcopy, 0, 0;
             PUSH0 => $crate::instructions::stack::push0, 2, 0;
-            PUSH1 => $crate::instructions::stack::push::<1, _, _>, 3, 1;
-            PUSH2 => $crate::instructions::stack::push::<2, _, _>, 3, 1;
-            PUSH3 => $crate::instructions::stack::push::<3, _, _>, 3, 1;
-            PUSH4 => $crate::instructions::stack::push::<4, _, _>, 3, 1;
-            PUSH5 => $crate::instructions::stack::push::<5, _, _>, 3, 1;
-            PUSH6 => $crate::instructions::stack::push::<6, _, _>, 3, 1;
-            PUSH7 => $crate::instructions::stack::push::<7, _, _>, 3, 1;
-            PUSH8 => $crate::instructions::stack::push::<8, _, _>, 3, 1;
-            PUSH9 => $crate::instructions::stack::push::<9, _, _>, 3, 1;
-            PUSH10 => $crate::instructions::stack::push::<10, _, _>, 3, 1;
-            PUSH11 => $crate::instructions::stack::push::<11, _, _>, 3, 1;
-            PUSH12 => $crate::instructions::stack::push::<12, _, _>, 3, 1;
-            PUSH13 => $crate::instructions::stack::push::<13, _, _>, 3, 1;
-            PUSH14 => $crate::instructions::stack::push::<14, _, _>, 3, 1;
-            PUSH15 => $crate::instructions::stack::push::<15, _, _>, 3, 1;
-            PUSH16 => $crate::instructions::stack::push::<16, _, _>, 3, 1;
-            PUSH17 => $crate::instructions::stack::push::<17, _, _>, 3, 1;
-            PUSH18 => $crate::instructions::stack::push::<18, _, _>, 3, 1;
-            PUSH19 => $crate::instructions::stack::push::<19, _, _>, 3, 1;
-            PUSH20 => $crate::instructions::stack::push::<20, _, _>, 3, 1;
-            PUSH21 => $crate::instructions::stack::push::<21, _, _>, 3, 1;
-            PUSH22 => $crate::instructions::stack::push::<22, _, _>, 3, 1;
-            PUSH23 => $crate::instructions::stack::push::<23, _, _>, 3, 1;
-            PUSH24 => $crate::instructions::stack::push::<24, _, _>, 3, 1;
-            PUSH25 => $crate::instructions::stack::push::<25, _, _>, 3, 1;
-            PUSH26 => $crate::instructions::stack::push::<26, _, _>, 3, 1;
-            PUSH27 => $crate::instructions::stack::push::<27, _, _>, 3, 1;
-            PUSH28 => $crate::instructions::stack::push::<28, _, _>, 3, 1;
-            PUSH29 => $crate::instructions::stack::push::<29, _, _>, 3, 1;
-            PUSH30 => $crate::instructions::stack::push::<30, _, _>, 3, 1;
-            PUSH31 => $crate::instructions::stack::push::<31, _, _>, 3, 1;
-            PUSH32 => $crate::instructions::stack::push::<32, _, _>, 3, 1;
+            PUSH1 => $crate::instructions::stack::push::<1, _, _>, 3, (2, 1);
+            PUSH2 => $crate::instructions::stack::push::<2, _, _>, 3, (2, 2);
+            PUSH3 => $crate::instructions::stack::push::<3, _, _>, 3, (2, 3);
+            PUSH4 => $crate::instructions::stack::push::<4, _, _>, 3, (2, 4);
+            PUSH5 => $crate::instructions::stack::push::<5, _, _>, 3, (2, 5);
+            PUSH6 => $crate::instructions::stack::push::<6, _, _>, 3, (2, 6);
+            PUSH7 => $crate::instructions::stack::push::<7, _, _>, 3, (2, 7);
+            PUSH8 => $crate::instructions::stack::push::<8, _, _>, 3, (2, 8);
+            PUSH9 => $crate::instructions::stack::push::<9, _, _>, 3, (2, 9);
+            PUSH10 => $crate::instructions::stack::push::<10, _, _>, 3, (2, 10);
+            PUSH11 => $crate::instructions::stack::push::<11, _, _>, 3, (2, 11);
+            PUSH12 => $crate::instructions::stack::push::<12, _, _>, 3, (2, 12);
+            PUSH13 => $crate::instructions::stack::push::<13, _, _>, 3, (2, 13);
+            PUSH14 => $crate::instructions::stack::push::<14, _, _>, 3, (2, 14);
+            PUSH15 => $crate::instructions::stack::push::<15, _, _>, 3, (2, 15);
+            PUSH16 => $crate::instructions::stack::push::<16, _, _>, 3, (2, 16);
+            PUSH17 => $crate::instructions::stack::push::<17, _, _>, 3, (2, 17);
+            PUSH18 => $crate::instructions::stack::push::<18, _, _>, 3, (2, 18);
+            PUSH19 => $crate::instructions::stack::push::<19, _, _>, 3, (2, 19);
+            PUSH20 => $crate::instructions::stack::push::<20, _, _>, 3, (2, 20);
+            PUSH21 => $crate::instructions::stack::push::<21, _, _>, 3, (2, 21);
+            PUSH22 => $crate::instructions::stack::push::<22, _, _>, 3, (2, 22);
+            PUSH23 => $crate::instructions::stack::push::<23, _, _>, 3, (2, 23);
+            PUSH24 => $crate::instructions::stack::push::<24, _, _>, 3, (2, 24);
+            PUSH25 => $crate::instructions::stack::push::<25, _, _>, 3, (2, 25);
+            PUSH26 => $crate::instructions::stack::push::<26, _, _>, 3, (2, 26);
+            PUSH27 => $crate::instructions::stack::push::<27, _, _>, 3, (2, 27);
+            PUSH28 => $crate::instructions::stack::push::<28, _, _>, 3, (2, 28);
+            PUSH29 => $crate::instructions::stack::push::<29, _, _>, 3, (2, 29);
+            PUSH30 => $crate::instructions::stack::push::<30, _, _>, 3, (2, 30);
+            PUSH31 => $crate::instructions::stack::push::<31, _, _>, 3, (2, 31);
+            PUSH32 => $crate::instructions::stack::push::<32, _, _>, 3, (2, 32);
             DUP1 => $crate::instructions::stack::dup::<1, _, _>, 3, 0;
             DUP2 => $crate::instructions::stack::dup::<2, _, _>, 3, 0;
             DUP3 => $crate::instructions::stack::dup::<3, _, _>, 3, 0;

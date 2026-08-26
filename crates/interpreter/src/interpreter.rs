@@ -427,6 +427,62 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
                 });
                 ip = self.bytecode.ip();
             }};
+            // `PUSH1`..`PUSH32`. Tagged `(2, N)` rather than `1` so that the immediate is read
+            // straight from the loop-local instruction pointer. Going through
+            // `stack::push::<N>` costs four instructions per `PUSH` that have nothing to do
+            // with the push itself: `execute!(1, ..)` has to store `ip` for
+            // `Bytecode::read_slice`, and `Jumps::relative_jump` then loads the same field
+            // back, bumps it and stores it again. `PUSH1`/`PUSH2` alone are 24 % of all
+            // dispatched opcodes, so that is ~9 M retired instructions on block 24006677.
+            //
+            // The immediate is at `ip + 1`, i.e. `ip` is *not* bumped past the opcode first;
+            // that keeps the byte loads at a constant displacement off the loop-carried
+            // register.
+            // `(3, f)`: `f` is a variant of the instruction that *returns* the instruction
+            // pointer to continue at instead of storing it into `ExtBytecode`, so the loop
+            // can keep it in its local. Used by `JUMP`/`JUMPI`, where the round trip through
+            // the field is a store before the call (for the not-taken `JUMPI`, which leaves
+            // the pointer alone) plus a store and a reload after it: 2.1 M retired
+            // instructions on block 24006677.
+            //
+            // This only pays with `-tail-dup-size=12` (see `build-guest.sh`), and the
+            // interaction is larger than the effect itself. Reshaping these two arms is
+            // enough to push the dispatch block out of LLVM's default tail-duplication
+            // budget, and the whole loop then falls back to one shared indirect branch
+            // reached by a jump from every arm. Measured on block 24006677, as a 2x2:
+            //
+            //                    no flag      -tail-dup-size=12
+            //     no threading   481.48 M     478.86 M
+            //     threading      487.55 M     477.15 M
+            //
+            // i.e. threading is +6.07 M without the flag and -1.70 M with it, and the flag
+            // is worth -2.62 M without threading and -10.39 M with it. Turning one on
+            // without the other is the worst cell of the four. If the flag ever goes away,
+            // tag these two back to `1`.
+            ((3, $g:expr), $_f:expr) => {{
+                ip = unsafe { ip.add(1) };
+                ip = $g(
+                    InstructionContext {
+                        interpreter: self,
+                        host,
+                    },
+                    ip,
+                );
+            }};
+            ((2, $n:literal), $_f:expr) => {{
+                // SAFETY: same padding invariant `ExtBytecode::read_slice` relies on: the
+                // analysis pads the bytecode past the last opcode, so the $n immediate bytes
+                // of a trailing `PUSH` are readable.
+                if unsafe { self.stack.push_slice_const::<$n>(ip.add(1)) } {
+                    ip = unsafe { ip.add(1 + $n) };
+                } else {
+                    // `push` leaves the instruction pointer just past the opcode on
+                    // overflow, and the halt is what ends the loop.
+                    ip = unsafe { ip.add(1) };
+                    self.bytecode.set_ip(ip);
+                    self.halt_overflow();
+                }
+            }};
         }
         macro_rules! dispatch_switch {
             ($($op:ident => $f:expr, $g:expr, $moves_ip:tt;)*) => {

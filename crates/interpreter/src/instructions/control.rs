@@ -14,9 +14,33 @@ use crate::InstructionContext;
 pub fn jump<const FUSE_JUMPDEST: bool, ITy: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, ITy>,
 ) {
+    let InstructionContext { interpreter, host } = context;
+    let ip = interpreter.bytecode.ip();
+    // `jump_at` returns `ip` unchanged when it did not jump.
+    let next = jump_at::<FUSE_JUMPDEST, _, _>(
+        InstructionContext {
+            interpreter: &mut *interpreter,
+            host,
+        },
+        ip,
+    );
+    interpreter.bytecode.set_ip(next);
+}
+
+/// [`jump`], but returning the instruction pointer to continue at instead of storing it.
+///
+/// `ip` is the pointer just past the `JUMP` opcode, and is what comes back when the jump is
+/// not taken or the interpreter halted. The switch dispatch of `Interpreter::run_plain` keeps
+/// the instruction pointer in a local, so this form saves it a store before the call, and a
+/// store plus a reload after it.
+#[inline(always)]
+pub fn jump_at<const FUSE_JUMPDEST: bool, ITy: InterpreterTypes, H: ?Sized>(
+    context: InstructionContext<'_, H, ITy>,
+    ip: *const u8,
+) -> *const u8 {
     //gas!(context.interpreter, gas::MID);
-    popn!([target], context.interpreter);
-    jump_inner::<FUSE_JUMPDEST, _>(context.interpreter, target);
+    popn!([target], context.interpreter, ip);
+    jump_inner::<FUSE_JUMPDEST, _>(context.interpreter, target, ip)
 }
 
 /// Implements the JUMPI instruction.
@@ -26,12 +50,31 @@ pub fn jump<const FUSE_JUMPDEST: bool, ITy: InterpreterTypes, H: ?Sized>(
 pub fn jumpi<const FUSE_JUMPDEST: bool, WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
 ) {
-    //gas!(context.interpreter, gas::HIGH);
-    popn!([target, cond], context.interpreter);
+    let InstructionContext { interpreter, host } = context;
+    let ip = interpreter.bytecode.ip();
+    let next = jumpi_at::<FUSE_JUMPDEST, _, _>(
+        InstructionContext {
+            interpreter: &mut *interpreter,
+            host,
+        },
+        ip,
+    );
+    interpreter.bytecode.set_ip(next);
+}
 
-    if !super::u256_is_zero(&cond) {
-        jump_inner::<FUSE_JUMPDEST, _>(context.interpreter, target);
+/// [`jumpi`], but returning the instruction pointer to continue at. See [`jump_at`].
+#[inline(always)]
+pub fn jumpi_at<const FUSE_JUMPDEST: bool, WIRE: InterpreterTypes, H: ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+    ip: *const u8,
+) -> *const u8 {
+    //gas!(context.interpreter, gas::HIGH);
+    popn!([target, cond], context.interpreter, ip);
+
+    if super::u256_is_zero(&cond) {
+        return ip;
     }
+    jump_inner::<FUSE_JUMPDEST, _>(context.interpreter, target, ip)
 }
 
 /// Internal helper function for jump operations.
@@ -41,11 +84,13 @@ pub fn jumpi<const FUSE_JUMPDEST: bool, WIRE: InterpreterTypes, H: ?Sized>(
 fn jump_inner<const FUSE_JUMPDEST: bool, WIRE: InterpreterTypes>(
     interpreter: &mut Interpreter<WIRE>,
     target: U256,
-) {
-    let target = as_usize_or_fail!(interpreter, target, InstructionResult::InvalidJump);
+    ip: *const u8,
+) -> *const u8 {
+    let target =
+        as_usize_or_fail_ret!(interpreter, target, InstructionResult::InvalidJump, ip);
     if !interpreter.bytecode.is_valid_legacy_jump(target) {
         interpreter.halt(InstructionResult::InvalidJump);
-        return;
+        return ip;
     }
     // JUMPDEST elision. `is_valid_legacy_jump` is exactly "the byte at `target` is a
     // JUMPDEST that is not PUSH data", and JUMPDEST is a pure no-op whose only effect is
@@ -67,14 +112,14 @@ fn jump_inner<const FUSE_JUMPDEST: bool, WIRE: InterpreterTypes>(
     if FUSE_JUMPDEST {
         if interpreter.gas.record_cost_unsafe(crate::gas::JUMPDEST) {
             interpreter.halt_oog();
-            return;
+            return ip;
         }
         // SAFETY: `is_valid_jump` ensures that `dest` is in bounds, and the analysis pads
         // the bytecode so that one byte past a trailing JUMPDEST still exists.
-        interpreter.bytecode.absolute_jump(target + 1);
+        interpreter.bytecode.absolute_ip(target + 1)
     } else {
         // SAFETY: `is_valid_jump` ensures that `dest` is in bounds.
-        interpreter.bytecode.absolute_jump(target);
+        interpreter.bytecode.absolute_ip(target)
     }
 }
 
