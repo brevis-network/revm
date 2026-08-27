@@ -65,6 +65,35 @@ pub struct Interpreter<WIRE: InterpreterTypes = EthInterpreter> {
     gas_stash: u64,
 }
 
+/// Everything the dispatch loop touches sits above [`Interpreter::stack`] and is reached at a
+/// constant displacement off the interpreter's base. RISC-V encodes that displacement as a
+/// 12-bit signed immediate, so it has to stay under 2048; past that each access grows an
+/// address computation and the layout note on the struct stops paying for itself.
+///
+/// The constraint is RISC-V's, and these assertions are deliberately *not* gated on the
+/// target. They have to fail when someone edits the struct, not months later the next time
+/// the zkVM guest happens to be built: a layout regression is otherwise silent -- no error,
+/// no failing test, just a slower guest.
+///
+/// Only `EthInterpreter` is checked. The layout depends on `WIRE`, and a downstream
+/// `InterpreterTypes` is free to lay itself out however it likes; this is the instantiation
+/// the guest runs.
+const _: () = assert!(core::mem::offset_of!(Interpreter<EthInterpreter>, stack) < 2048);
+
+/// The other half of the invariant, and the one that catches the likelier mistake. A field
+/// appended *after* `stack` does not move `stack`, so the bounds check above stays true while
+/// the new field sits 32 KiB from the base and every access to it grows an address
+/// computation. Nothing may follow the stack except `gas_stash`, which is 8 bytes and is
+/// touched a few times per frame rather than per opcode.
+///
+/// If this fires, put the new field *before* `stack` rather than after it.
+const _: () = assert!(
+    core::mem::size_of::<Interpreter<EthInterpreter>>()
+        - core::mem::offset_of!(Interpreter<EthInterpreter>, stack)
+        - core::mem::size_of::<Stack>()
+        == core::mem::size_of::<u64>()
+);
+
 impl<EXT: Default> Interpreter<EthInterpreter<EXT>> {
     /// Create new interpreter
     pub fn new(
