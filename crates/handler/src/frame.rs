@@ -61,6 +61,17 @@ pub struct EthFrame<IW: InterpreterTypes = EthInterpreter> {
     pub interpreter: Interpreter<IW>,
 }
 
+/// The same 12-bit displacement constraint as the one on `Interpreter`, for the same reason:
+/// `interpreter` carries the EVM stack's 32 KiB inline, so the fields above it have to stay
+/// within 2048 bytes of the frame's base and nothing may follow it. If either fires, put the
+/// new field before `interpreter`.
+const _: () = assert!(core::mem::offset_of!(EthFrame<EthInterpreter>, interpreter) < 2048);
+const _: () = assert!(
+    core::mem::size_of::<EthFrame<EthInterpreter>>()
+        == core::mem::offset_of!(EthFrame<EthInterpreter>, interpreter)
+            + core::mem::size_of::<Interpreter<EthInterpreter>>()
+);
+
 impl<IT: InterpreterTypes> FrameTr for EthFrame<IT> {
     type FrameResult = FrameResult;
     type FrameInit = FrameInit;
