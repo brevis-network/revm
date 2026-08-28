@@ -734,6 +734,72 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         Ok(load.map(|i| JournaledAccount::new(address, i, &mut self.journal)))
     }
 
+    /// Resolves a storage slot to a mutable reference, warming it and journaling the warm
+    /// load if it was cold.
+    ///
+    /// Takes the journal's fields apart rather than `&mut self` so that the caller keeps
+    /// access to [`Self::journal`] while holding the returned slot: that is what lets
+    /// [`Self::sstore`] write through the reference [`Self::sload`] already paid for,
+    /// instead of repeating the account and slot lookups.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the account is not present in the state.
+    #[inline]
+    fn sload_slot<'a, DB: Database>(
+        state: &'a mut EvmState,
+        warm_addresses: &WarmAddresses,
+        journal: &mut Vec<ENTRY>,
+        transaction_id: usize,
+        db: &mut DB,
+        address: Address,
+        key: StorageKey,
+        skip_cold_load: bool,
+    ) -> Result<StateLoad<&'a mut EvmStorageSlot>, JournalLoadError<DB::Error>> {
+        // assume acc is warm
+        let account = state.get_mut(&address).unwrap();
+
+        let is_newly_created = account.is_created();
+        let (slot, is_cold) = match account.storage.entry(key) {
+            Entry::Occupied(occ) => {
+                let slot = occ.into_mut();
+                // skip load if account is cold.
+                let is_cold = slot.is_cold_transaction_id(transaction_id);
+                if skip_cold_load && is_cold {
+                    return Err(JournalLoadError::ColdLoadSkipped);
+                }
+                slot.mark_warm_with_transaction_id(transaction_id);
+                (slot, is_cold)
+            }
+            Entry::Vacant(vac) => {
+                // is storage cold
+                let is_cold = !warm_addresses.is_storage_warm(&address, &key);
+
+                if is_cold && skip_cold_load {
+                    return Err(JournalLoadError::ColdLoadSkipped);
+                }
+                // if storage was cleared, we don't need to ping db.
+                let value = if is_newly_created {
+                    StorageValue::ZERO
+                } else {
+                    db.storage(address, key)?
+                };
+
+                (
+                    vac.insert(EvmStorageSlot::new(value, transaction_id)),
+                    is_cold,
+                )
+            }
+        };
+
+        if is_cold {
+            // add it to journal as cold loaded.
+            journal.push(ENTRY::storage_warmed(address, key));
+        }
+
+        Ok(StateLoad::new(slot, is_cold))
+    }
+
     /// Loads storage slot.
     ///
     /// # Panics
@@ -747,46 +813,24 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         key: StorageKey,
         skip_cold_load: bool,
     ) -> Result<StateLoad<StorageValue>, JournalLoadError<DB::Error>> {
-        // assume acc is warm
-        let account = self.state.get_mut(&address).unwrap();
-
-        let is_newly_created = account.is_created();
-        let (value, is_cold) = match account.storage.entry(key) {
-            Entry::Occupied(occ) => {
-                let slot = occ.into_mut();
-                // skip load if account is cold.
-                let is_cold = slot.is_cold_transaction_id(self.transaction_id);
-                if skip_cold_load && is_cold {
-                    return Err(JournalLoadError::ColdLoadSkipped);
-                }
-                slot.mark_warm_with_transaction_id(self.transaction_id);
-                (slot.present_value, is_cold)
-            }
-            Entry::Vacant(vac) => {
-                // is storage cold
-                let is_cold = !self.warm_addresses.is_storage_warm(&address, &key);
-
-                if is_cold && skip_cold_load {
-                    return Err(JournalLoadError::ColdLoadSkipped);
-                }
-                // if storage was cleared, we don't need to ping db.
-                let value = if is_newly_created {
-                    StorageValue::ZERO
-                } else {
-                    db.storage(address, key)?
-                };
-                vac.insert(EvmStorageSlot::new(value, self.transaction_id));
-
-                (value, is_cold)
-            }
-        };
-
-        if is_cold {
-            // add it to journal as cold loaded.
-            self.journal.push(ENTRY::storage_warmed(address, key));
-        }
-
-        Ok(StateLoad::new(value, is_cold))
+        let Self {
+            state,
+            warm_addresses,
+            journal,
+            transaction_id,
+            ..
+        } = self;
+        let load = Self::sload_slot(
+            state,
+            warm_addresses,
+            journal,
+            *transaction_id,
+            db,
+            address,
+            key,
+            skip_cold_load,
+        )?;
+        Ok(StateLoad::new(load.data.present_value, load.is_cold))
     }
 
     /// Stores storage slot.
@@ -803,36 +847,39 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         new: StorageValue,
         skip_cold_load: bool,
     ) -> Result<StateLoad<SStoreResult>, JournalLoadError<DB::Error>> {
-        // assume that acc exists and load the slot.
-        let present = self.sload(db, address, key, skip_cold_load)?;
-        let acc = self.state.get_mut(&address).unwrap();
-
-        // if there is no original value in dirty return present value, that is our original.
-        let slot = acc.storage.get_mut(&key).unwrap();
+        let Self {
+            state,
+            warm_addresses,
+            journal,
+            transaction_id,
+            ..
+        } = self;
+        // assume that acc exists and load the slot. The slot reference is kept alive across
+        // the journal push below, so neither the account nor the slot is looked up twice.
+        let load = Self::sload_slot(
+            state,
+            warm_addresses,
+            journal,
+            *transaction_id,
+            db,
+            address,
+            key,
+            skip_cold_load,
+        )?;
+        let is_cold = load.is_cold;
+        let slot = load.data;
+        let present = slot.present_value;
 
         // new value is same as present, we don't need to do anything
-        if present.data == new {
-            return Ok(StateLoad::new(
-                SStoreResult {
-                    original_value: slot.original_value(),
-                    present_value: present.data,
-                    new_value: new,
-                },
-                present.is_cold,
-            ));
+        if present != new {
+            journal.push(ENTRY::storage_changed(address, key, present));
+            // insert value into present state.
+            slot.present_value = new;
         }
 
-        self.journal
-            .push(ENTRY::storage_changed(address, key, present.data));
-        // insert value into present state.
-        slot.present_value = new;
         Ok(StateLoad::new(
-            SStoreResult {
-                original_value: slot.original_value(),
-                present_value: present.data,
-                new_value: new,
-            },
-            present.is_cold,
+            sstore_result(slot.original_value(), present, new),
+            is_cold,
         ))
     }
 
@@ -931,5 +978,31 @@ mod tests {
         let state_load = result.unwrap();
         assert!(!state_load.is_cold); // Should be warm
         assert_eq!(state_load.data, U256::ZERO); // Empty slot
+    }
+}
+
+/// Builds an [`SStoreResult`] limb by limb.
+///
+/// The struct is three `U256`s, and the plain literal is a 96-byte copy that LLVM lowers to a
+/// `memcpy` libcall (~74 retired instructions) rather than the twelve `ld`/`sd` pairs it
+/// actually is. `SSTORE` runs ~15 K times per mainnet block.
+#[inline(always)]
+fn sstore_result(
+    original_value: StorageValue,
+    present_value: StorageValue,
+    new_value: StorageValue,
+) -> SStoreResult {
+    // SAFETY: all three fields are initialized exactly once below, and each is a `U256` at an
+    // 8-aligned offset of an 8-aligned struct.
+    unsafe {
+        let mut r = core::mem::MaybeUninit::<SStoreResult>::uninit();
+        let p = r.as_mut_ptr();
+        primitives::copy_u256(
+            core::ptr::addr_of_mut!((*p).original_value),
+            &original_value,
+        );
+        primitives::copy_u256(core::ptr::addr_of_mut!((*p).present_value), &present_value);
+        primitives::copy_u256(core::ptr::addr_of_mut!((*p).new_value), &new_value);
+        r.assume_init()
     }
 }

@@ -14,7 +14,7 @@ use primitives::{
     hardfork::SpecId, Address, Bytes, HashMap, HashSet, Log, StorageKey, StorageValue, B256, U256,
 };
 use state::{Account, AccountInfo, Bytecode};
-use std::{borrow::Cow, vec::Vec};
+use std::vec::Vec;
 
 /// Trait that contains database and journal of all changes that were made to the state.
 pub trait JournalTr {
@@ -440,11 +440,15 @@ pub struct AccountLoad {
 }
 
 /// Result of the account load from Journal state
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+///
+/// `account` is a plain borrow rather than a `Cow`: nothing ever built this with
+/// `Cow::Owned`, and because a `Cow<AccountInfo>` is as wide as an `AccountInfo` (152 bytes)
+/// every one of these that got returned or moved cost a `memcpy` libcall - twice per
+/// `EXTCODESIZE`, for example, to read one length out of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountInfoLoad<'a> {
     /// Account info
-    pub account: Cow<'a, AccountInfo>,
+    pub account: &'a AccountInfo,
     /// Is account cold loaded
     pub is_cold: bool,
     /// Is account empty, if `true` account is not created
@@ -455,7 +459,7 @@ impl<'a> AccountInfoLoad<'a> {
     /// Creates new [`AccountInfoLoad`] with the given account info, cold load status and empty status.
     pub fn new(account: &'a AccountInfo, is_cold: bool, is_empty: bool) -> Self {
         Self {
-            account: Cow::Borrowed(account),
+            account,
             is_cold,
             is_empty,
         }
@@ -466,7 +470,7 @@ impl<'a> AccountInfoLoad<'a> {
     /// Useful for transforming the account info of the [`AccountInfoLoad`] and preserving the cold load status.
     pub fn into_state_load<F, O>(self, f: F) -> StateLoad<O>
     where
-        F: FnOnce(Cow<'a, AccountInfo>) -> O,
+        F: FnOnce(&'a AccountInfo) -> O,
     {
         StateLoad::new(f(self.account), self.is_cold)
     }
@@ -476,6 +480,6 @@ impl<'a> Deref for AccountInfoLoad<'a> {
     type Target = AccountInfo;
 
     fn deref(&self) -> &Self::Target {
-        &self.account
+        self.account
     }
 }

@@ -14,7 +14,7 @@ pub use ext_bytecode::ExtBytecode;
 pub use input::InputsImpl;
 pub use return_data::ReturnDataImpl;
 pub use runtime_flags::RuntimeFlags;
-pub(crate) use shared_memory::u256_from_be_aligned;
+pub(crate) use shared_memory::{bswap64_shared, bswap_masks_shared, u256_from_be_aligned};
 pub use shared_memory::{num_words, resize_memory, SharedMemory};
 pub use stack::{Stack, STACK_LIMIT};
 
@@ -27,15 +27,22 @@ use bytecode::Bytecode;
 use primitives::{hardfork::SpecId, Bytes};
 
 /// Main interpreter structure that contains all components defined in [`InterpreterTypes`].
+///
+/// `repr(C)` with [`Interpreter::stack`] **last**, on purpose. The EVM stack keeps its
+/// 1024 words inline (see `Stack`), which is 32 KiB; laid out anywhere but at the end it
+/// would push the other fields past the 12-bit displacement a RISC-V load or store can
+/// encode, and every access to the gas counter or the instruction pointer would grow an
+/// address computation. Last, the fields the dispatch loop touches stay within a few
+/// hundred bytes of the base and the stack words are reached as `base + byte_len` with the
+/// field offset folded into the displacement.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[repr(C)]
 pub struct Interpreter<WIRE: InterpreterTypes = EthInterpreter> {
     /// Bytecode being executed.
     pub bytecode: WIRE::Bytecode,
     /// Gas tracking for execution costs.
     pub gas: Gas,
-    /// EVM stack for computation.
-    pub stack: WIRE::Stack,
     /// Buffer for return data from calls.
     pub return_data: WIRE::ReturnData,
     /// EVM memory for data storage.
@@ -46,6 +53,10 @@ pub struct Interpreter<WIRE: InterpreterTypes = EthInterpreter> {
     pub runtime_flag: WIRE::RuntimeFlag,
     /// Extended functionality and customizations.
     pub extend: WIRE::Extend,
+    /// EVM stack for computation.
+    ///
+    /// Last field; see the note on the struct.
+    pub stack: WIRE::Stack,
     /// Backup of `gas.remaining` while the gas counter is poisoned by
     /// [`Interpreter::set_action`], or `u64::MAX` when it is not poisoned.
     ///
@@ -53,6 +64,35 @@ pub struct Interpreter<WIRE: InterpreterTypes = EthInterpreter> {
     /// `u64::MAX` needs no restoring, because that is exactly what poisoning writes.
     gas_stash: u64,
 }
+
+/// Everything the dispatch loop touches sits above [`Interpreter::stack`] and is reached at a
+/// constant displacement off the interpreter's base. RISC-V encodes that displacement as a
+/// 12-bit signed immediate, so it has to stay under 2048; past that each access grows an
+/// address computation and the layout note on the struct stops paying for itself.
+///
+/// The constraint is RISC-V's, and these assertions are deliberately *not* gated on the
+/// target. They have to fail when someone edits the struct, not months later the next time
+/// the zkVM guest happens to be built: a layout regression is otherwise silent -- no error,
+/// no failing test, just a slower guest.
+///
+/// Only `EthInterpreter` is checked. The layout depends on `WIRE`, and a downstream
+/// `InterpreterTypes` is free to lay itself out however it likes; this is the instantiation
+/// the guest runs.
+const _: () = assert!(core::mem::offset_of!(Interpreter<EthInterpreter>, stack) < 2048);
+
+/// The other half of the invariant, and the one that catches the likelier mistake. A field
+/// appended *after* `stack` does not move `stack`, so the bounds check above stays true while
+/// the new field sits 32 KiB from the base and every access to it grows an address
+/// computation. Nothing may follow the stack except `gas_stash`, which is 8 bytes and is
+/// touched a few times per frame rather than per opcode.
+///
+/// If this fires, put the new field *before* `stack` rather than after it.
+const _: () = assert!(
+    core::mem::size_of::<Interpreter<EthInterpreter>>()
+        - core::mem::offset_of!(Interpreter<EthInterpreter>, stack)
+        - core::mem::size_of::<Stack>()
+        == core::mem::size_of::<u64>()
+);
 
 impl<EXT: Default> Interpreter<EthInterpreter<EXT>> {
     /// Create new interpreter
@@ -144,11 +184,7 @@ impl<EXT: Default> Interpreter<EthInterpreter<EXT>> {
         } = self;
         *bytecode_ref = bytecode;
         *gas = Gas::new(gas_limit);
-        if stack.data().capacity() == 0 {
-            *stack = Stack::new();
-        } else {
-            stack.clear();
-        }
+        stack.clear();
         return_data.0.clear();
         *memory_ref = memory;
         *input_ref = input;
@@ -348,52 +384,197 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
 
     /// Executes the interpreter until it returns or stops.
     ///
-    /// This is a hand-fused copy of [`Interpreter::step`] rather than a
-    /// `while is_not_end() { step() }` loop. Both exits of that shape (out-of-gas, and
-    /// "an instruction set an action") are merged into the single gas branch: setting
-    /// an action poisons the gas counter (see [`Interpreter::set_action`]), so the very
-    /// next gas charge fails. That leaves the loop with one exit edge, which removes the
-    /// per-opcode `continue_execution` load and its branch from the dispatch sequence.
+    /// This is a switch dispatch over the opcode rather than a `while is_not_end() { step() }`
+    /// loop over the instruction table, for two reasons:
     ///
-    /// Cost: after an action is set, one extra opcode *fetch* happens (a byte read, a
-    /// pointer bump and a table lookup) before the loop notices. The instruction is
-    /// never executed, and `end_dispatch` undoes the pointer bump so that a resumed
-    /// `CALL`/`CREATE` frame restarts at the right place.
+    /// * The static gas cost becomes a per-arm *immediate*, so the table load that fetched it
+    ///   disappears and the charge is a single `addi`.
+    /// * The call is direct instead of through a function pointer, so the backend can inline
+    ///   the cheap opcode bodies straight into the loop. That removes the argument shuffle,
+    ///   the call and the return, and lets the body reuse the instruction pointer the loop
+    ///   already has in a register. The zkVM cost model counts retired instructions, so the
+    ///   extra code size is free.
+    ///
+    /// Both exits of the natural shape (out-of-gas, and "an instruction set an action") are
+    /// merged into the single gas branch: setting an action poisons the gas counter (see
+    /// [`Interpreter::set_action`]), so the very next gas charge fails. That leaves the loop
+    /// with one exit edge, which removes the per-opcode `continue_execution` load and its
+    /// branch from the dispatch sequence.
+    ///
+    /// Cost: after an action is set, one extra opcode *fetch* happens (a byte read and a
+    /// pointer bump) before the loop notices. The instruction is never executed, and
+    /// `end_dispatch` undoes the pointer bump so that a resumed `CALL`/`CREATE` frame
+    /// restarts at the right place.
+    ///
+    /// # Instruction table
+    ///
+    /// `instruction_table` is **ignored**: the arms are generated from
+    /// [`for_each_builtin_instruction`], i.e. from the same list that builds
+    /// [`instruction_table`](crate::instructions::instruction_table), so a default table
+    /// behaves identically. A table customised through
+    /// `EthInstructions::insert_instruction` is *not* honoured here; such a caller has to
+    /// drive the interpreter through [`Interpreter::step`], which still goes through the
+    /// table.
     #[inline]
     pub fn run_plain<H: Host + ?Sized>(
         &mut self,
         instruction_table: &InstructionTable<IW, H>,
         host: &mut H,
     ) -> InterpreterAction {
-        // The body is repeated so that the loop's unconditional back edge is amortised
-        // over eight opcodes instead of being paid on every single one. The backend keeps
-        // the gas branch in the middle of the body and jumps back from the bottom, and no
-        // source-level rotation persuades it otherwise. Unrolling is close to free here:
-        // the zkVM cost model counts retired instructions, so a larger loop body has no
-        // instruction-cache price.
-        macro_rules! dispatch_one {
-            () => {{
-                let instruction = self.fetch(instruction_table);
-                if self.gas.record_cost_unsafe(instruction.static_gas()) {
-                    break;
-                }
-                let context = InstructionContext {
+        let _ = instruction_table;
+        // The instruction pointer lives in a local for the whole loop. Reading it back out of
+        // `self.bytecode` after every opcode costs a load that the backend cannot remove: the
+        // interpreter stack writes go through a heap pointer, and nothing tells LLVM that it
+        // cannot alias the pointer field. Only `PUSH1..PUSH32`, `PC`, `JUMP` and `JUMPI` touch
+        // the instruction pointer at all (their arms are tagged `1` in
+        // `for_each_builtin_instruction`), so only those hand it over and take it back; the
+        // single loop exit stores it (bumped past the opcode it speculatively fetched) so
+        // that `end_dispatch` and a resumed frame see the right value.
+        let mut ip = self.bytecode.ip();
+        // The bump of `ip` lives in the arms, past the opcode read, rather than in the loop
+        // header. In the header the backend schedules the `addi` ahead of the `lbu` and has to
+        // copy the pre-bump pointer into a second register; from the arm it is an in-place
+        // increment of the loop-carried register.
+        macro_rules! execute {
+            (0, $f:expr) => {{
+                ip = unsafe { ip.add(1) };
+                $f(InstructionContext {
                     interpreter: self,
                     host,
-                };
-                instruction.execute(context);
+                });
+            }};
+            (1, $f:expr) => {{
+                ip = unsafe { ip.add(1) };
+                self.bytecode.set_ip(ip);
+                $f(InstructionContext {
+                    interpreter: self,
+                    host,
+                });
+                ip = self.bytecode.ip();
+            }};
+            // `PUSH1`..`PUSH32`. Tagged `(2, N)` rather than `1` so that the immediate is read
+            // straight from the loop-local instruction pointer. Going through
+            // `stack::push::<N>` costs four instructions per `PUSH` that have nothing to do
+            // with the push itself: `execute!(1, ..)` has to store `ip` for
+            // `Bytecode::read_slice`, and `Jumps::relative_jump` then loads the same field
+            // back, bumps it and stores it again. `PUSH1`/`PUSH2` alone are 24 % of all
+            // dispatched opcodes, so that is ~9 M retired instructions on block 24006677.
+            //
+            // The immediate is at `ip + 1`, i.e. `ip` is *not* bumped past the opcode first;
+            // that keeps the byte loads at a constant displacement off the loop-carried
+            // register.
+            // `(3, f)`: `f` is a variant of the instruction that *returns* the instruction
+            // pointer to continue at instead of storing it into `ExtBytecode`, so the loop
+            // can keep it in its local. Used by `JUMP`/`JUMPI`, where the round trip through
+            // the field is a store before the call (for the not-taken `JUMPI`, which leaves
+            // the pointer alone) plus a store and a reload after it: 2.1 M retired
+            // instructions on block 24006677.
+            //
+            // This only pays with `-tail-dup-size=12` (see `build-guest.sh`), and the
+            // interaction is larger than the effect itself. Reshaping these two arms is
+            // enough to push the dispatch block out of LLVM's default tail-duplication
+            // budget, and the whole loop then falls back to one shared indirect branch
+            // reached by a jump from every arm. Measured on block 24006677, as a 2x2:
+            //
+            //                    no flag      -tail-dup-size=12
+            //     no threading   481.48 M     478.86 M
+            //     threading      487.55 M     477.15 M
+            //
+            // i.e. threading is +6.07 M without the flag and -1.70 M with it, and the flag
+            // is worth -2.62 M without threading and -10.39 M with it. Turning one on
+            // without the other is the worst cell of the four. If the flag ever goes away,
+            // tag these two back to `1`.
+            ((3, $g:expr), $_f:expr) => {{
+                ip = unsafe { ip.add(1) };
+                ip = $g(
+                    InstructionContext {
+                        interpreter: self,
+                        host,
+                    },
+                    ip,
+                );
+            }};
+            ((2, $n:literal), $_f:expr) => {{
+                // SAFETY: same padding invariant `ExtBytecode::read_slice` relies on: the
+                // analysis pads the bytecode past the last opcode, so the $n immediate bytes
+                // of a trailing `PUSH` are readable.
+                if unsafe { self.stack.push_slice_const::<$n>(ip.add(1)) } {
+                    ip = unsafe { ip.add(1 + $n) };
+                } else {
+                    // `push` leaves the instruction pointer just past the opcode on
+                    // overflow, and the halt is what ends the loop.
+                    ip = unsafe { ip.add(1) };
+                    self.bytecode.set_ip(ip);
+                    self.halt_overflow();
+                }
             }};
         }
-        loop {
-            dispatch_one!();
-            dispatch_one!();
-            dispatch_one!();
-            dispatch_one!();
-            dispatch_one!();
-            dispatch_one!();
-            dispatch_one!();
-            dispatch_one!();
+        macro_rules! dispatch_switch {
+            ($($op:ident => $f:expr, $g:expr, $moves_ip:tt;)*) => {
+                loop {
+                    // SAFETY: same invariant as `ExtBytecode::opcode`. The analysis pads the
+                    // bytecode so that the last opcode is a STOP, so the pointer never walks
+                    // off the end: STOP sets an action, which poisons the gas counter and
+                    // ends the loop on the next charge.
+                    let opcode = unsafe { *ip };
+                    match opcode {
+                        $(
+                            $crate::instructions::opcode_consts::$op => {
+                                if self.gas.record_cost_unsafe($g) {
+                                    self.bytecode.set_ip(unsafe { ip.add(1) });
+                                    break;
+                                }
+                                execute!($moves_ip, $f);
+                            }
+                        )*
+                        // Every remaining `u8` is spelled out as a *literal*, rather than as
+                        // the ranges that cover the same values or as a `_` arm. It has to be
+                        // literals: with ranges, rustc lowers the tail of the match to
+                        // comparison chains hanging off the `SwitchInt`'s `otherwise` edge, so
+                        // LLVM sees a switch whose default block is reachable and emits the
+                        // jump table's range check -- one that constant-folds to a compare of
+                        // `zero` against itself and is then never removed, and which branch
+                        // relaxation turns into a taken conditional over a jump, because the
+                        // default block sits further away than a conditional branch reaches.
+                        // That is one retired instruction on every dispatched opcode.
+                        //
+                        // Written as 256 literal cases the default is `unreachable`, the range
+                        // check is not emitted at all, and the dispatch block gets small enough
+                        // for LLVM to tail-duplicate it into the ~150 arms, which also removes
+                        // the jump back to the loop header. Measured on block 24006677: -14.6 M
+                        // retired instructions, 8.1 M of it the branch and 6.6 M the
+                        // duplication.
+                        //
+                        // (An earlier form of this gave every invalid opcode its own arm with a
+                        // `black_box` of its own value, to stop the blocks being merged. That
+                        // works too and measured the same, but it is ~850 lines instead of 14:
+                        // what matters is that the *patterns* are literals, not that the
+                        // destinations are distinct.)
+                        0x0c | 0x0d | 0x0e | 0x0f | 0x1f | 0x21 | 0x22 | 0x23 |
+                        0x24 | 0x25 | 0x26 | 0x27 | 0x28 | 0x29 | 0x2a | 0x2b |
+                        0x2c | 0x2d | 0x2e | 0x2f | 0x4b | 0x4c | 0x4d | 0x4e |
+                        0x4f | 0xa5 | 0xa6 | 0xa7 | 0xa8 | 0xa9 | 0xaa | 0xab |
+                        0xac | 0xad | 0xae | 0xaf | 0xb0 | 0xb1 | 0xb2 | 0xb3 |
+                        0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8 | 0xb9 | 0xba | 0xbb |
+                        0xbc | 0xbd | 0xbe | 0xbf | 0xc0 | 0xc1 | 0xc2 | 0xc3 |
+                        0xc4 | 0xc5 | 0xc6 | 0xc7 | 0xc8 | 0xc9 | 0xca | 0xcb |
+                        0xcc | 0xcd | 0xce | 0xcf | 0xd0 | 0xd1 | 0xd2 | 0xd3 |
+                        0xd4 | 0xd5 | 0xd6 | 0xd7 | 0xd8 | 0xd9 | 0xda | 0xdb |
+                        0xdc | 0xdd | 0xde | 0xdf | 0xe0 | 0xe1 | 0xe2 | 0xe3 |
+                        0xe4 | 0xe5 | 0xe6 | 0xe7 | 0xe8 | 0xe9 | 0xea | 0xeb |
+                        0xec | 0xed | 0xee | 0xef | 0xf6 | 0xf7 | 0xf8 | 0xf9 |
+                        0xfb | 0xfc => {
+                            if self.gas.record_cost_unsafe(0) {
+                                self.bytecode.set_ip(unsafe { ip.add(1) });
+                                break;
+                            }
+                            execute!(0, $crate::instructions::control::unknown);
+                        }
+                    }
+                }
+            };
         }
+        crate::for_each_builtin_instruction!(dispatch_switch, true);
         self.end_dispatch();
         self.take_next_action()
     }

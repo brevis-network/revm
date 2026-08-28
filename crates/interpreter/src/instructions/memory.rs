@@ -13,6 +13,10 @@ use crate::InstructionContext;
 ///
 /// The word is written straight into the stack slot it replaces, one limb at a time; see
 /// [`MemoryTr::get_u256_to`] for why the pointer form matters on this target.
+///
+/// Inlined into the dispatch loop: out of line it spends 6 instructions on a prologue and 7
+/// on an epilogue, plus the call and return, for a body of about 70.
+#[inline(always)]
 pub fn mload<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, WIRE>) {
     //gas!(context.interpreter, gas::VERYLOW);
     let len = context.interpreter.stack.len();
@@ -37,7 +41,9 @@ pub fn mload<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, 
 /// Stores a 32-byte word to memory.
 ///
 /// The value is read out of its stack slot one limb at a time rather than popped into
-/// registers first; see [`MemoryTr::set_u256_ptr`].
+/// registers first; see [`MemoryTr::set_u256_ptr`]. Inlined into the dispatch loop for the
+/// same reason as [`mload`].
+#[inline(always)]
 pub fn mstore<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, WIRE>) {
     //gas!(context.interpreter, gas::VERYLOW);
     let len = context.interpreter.stack.len();
@@ -55,12 +61,15 @@ pub fn mstore<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_,
     let src = unsafe { context.interpreter.stack.data().as_ptr().add(len - 2) }.cast::<u64>();
     unsafe { context.interpreter.memory.set_u256_ptr(offset, src) };
     // The two operands are gone; the loads `popn` would do are dead and get removed.
-    let _ = unsafe { context.interpreter.stack.popn::<2>().unwrap_unchecked() };
+    // SAFETY: `len` was read at the top of this function and checked to be at least 2, and
+    // nothing since has pushed or popped.
+    unsafe { context.interpreter.stack.popn_discard::<2>(len) };
 }
 
 /// Implements the MSTORE8 instruction.
 ///
-/// Stores a single byte to memory.
+/// Stores a single byte to memory. Inlined into the dispatch loop like [`mstore`].
+#[inline(always)]
 pub fn mstore8<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, WIRE>) {
     //gas!(context.interpreter, gas::VERYLOW);
     popn!([offset, value], context.interpreter);

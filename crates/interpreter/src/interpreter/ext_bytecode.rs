@@ -52,19 +52,48 @@ impl ExtBytecode {
     /// Creates new `ExtBytecode` with the given hash.
     #[inline]
     pub fn new_with_hash(base: Bytecode, hash: B256) -> Self {
-        Self::new_with_optional_hash(base, Some(hash))
+        // Not `new_with_optional_hash(base, Some(hash))`: building that `Some` is a 32-byte
+        // copy into a 1-aligned payload, i.e. a `memcpy` libcall, once per call frame.
+        let instruction_pointer = base.bytecode_ptr();
+        // SAFETY: every field is initialized exactly once below.
+        unsafe {
+            let mut me = core::mem::MaybeUninit::<Self>::uninit();
+            let p = me.as_mut_ptr();
+            primitives::write_some_b256(
+                core::ptr::addr_of_mut!((*p).bytecode_hash),
+                core::ptr::addr_of!(hash).cast::<u8>(),
+            );
+            core::ptr::addr_of_mut!((*p).base).write(base);
+            core::ptr::addr_of_mut!((*p).instruction_pointer).write(instruction_pointer);
+            core::ptr::addr_of_mut!((*p).action).write(None);
+            core::ptr::addr_of_mut!((*p).continue_execution).write(true);
+            me.assume_init()
+        }
     }
 
     /// Creates new `ExtBytecode` with the given hash.
     #[inline]
     pub fn new_with_optional_hash(base: Bytecode, hash: Option<B256>) -> Self {
         let instruction_pointer = base.bytecode_ptr();
-        Self {
-            base,
-            instruction_pointer,
-            bytecode_hash: hash,
-            action: None,
-            continue_execution: true,
+        // Written field by field so the `Option<B256>` payload goes through
+        // `write_some_b256` rather than a `memcpy` libcall; this runs once per call frame.
+        // SAFETY: every field is initialized exactly once below, so `assume_init` sees a
+        // fully initialized `Self`.
+        unsafe {
+            let mut me = core::mem::MaybeUninit::<Self>::uninit();
+            let p = me.as_mut_ptr();
+            match hash {
+                Some(h) => primitives::write_some_b256(
+                    core::ptr::addr_of_mut!((*p).bytecode_hash),
+                    core::ptr::addr_of!(h).cast::<u8>(),
+                ),
+                None => core::ptr::addr_of_mut!((*p).bytecode_hash).write(None),
+            }
+            core::ptr::addr_of_mut!((*p).base).write(base);
+            core::ptr::addr_of_mut!((*p).instruction_pointer).write(instruction_pointer);
+            core::ptr::addr_of_mut!((*p).action).write(None);
+            core::ptr::addr_of_mut!((*p).continue_execution).write(true);
+            me.assume_init()
         }
     }
 
@@ -139,6 +168,11 @@ impl Jumps for ExtBytecode {
     }
 
     #[inline]
+    fn absolute_ip(&self, offset: usize) -> *const u8 {
+        unsafe { self.base.bytes_ref().as_ptr().add(offset) }
+    }
+
+    #[inline]
     fn is_valid_legacy_jump(&mut self, offset: usize) -> bool {
         self.base
             .legacy_jump_table()
@@ -150,6 +184,16 @@ impl Jumps for ExtBytecode {
     fn opcode(&self) -> u8 {
         // SAFETY: `instruction_pointer` always point to bytecode.
         unsafe { *self.instruction_pointer }
+    }
+
+    #[inline]
+    fn ip(&self) -> *const u8 {
+        self.instruction_pointer
+    }
+
+    #[inline]
+    fn set_ip(&mut self, ip: *const u8) {
+        self.instruction_pointer = ip;
     }
 
     #[inline]

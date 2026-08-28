@@ -10,36 +10,116 @@ use crate::InstructionContext;
 /// Implements the JUMP instruction.
 ///
 /// Unconditional jump to a valid destination.
-pub fn jump<ITy: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, ITy>) {
+#[inline(always)]
+pub fn jump<const FUSE_JUMPDEST: bool, ITy: InterpreterTypes, H: ?Sized>(
+    context: InstructionContext<'_, H, ITy>,
+) {
+    let InstructionContext { interpreter, host } = context;
+    let ip = interpreter.bytecode.ip();
+    // `jump_at` returns `ip` unchanged when it did not jump.
+    let next = jump_at::<FUSE_JUMPDEST, _, _>(
+        InstructionContext {
+            interpreter: &mut *interpreter,
+            host,
+        },
+        ip,
+    );
+    interpreter.bytecode.set_ip(next);
+}
+
+/// [`jump`], but returning the instruction pointer to continue at instead of storing it.
+///
+/// `ip` is the pointer just past the `JUMP` opcode, and is what comes back when the jump is
+/// not taken or the interpreter halted. The switch dispatch of `Interpreter::run_plain` keeps
+/// the instruction pointer in a local, so this form saves it a store before the call, and a
+/// store plus a reload after it.
+#[inline(always)]
+pub fn jump_at<const FUSE_JUMPDEST: bool, ITy: InterpreterTypes, H: ?Sized>(
+    context: InstructionContext<'_, H, ITy>,
+    ip: *const u8,
+) -> *const u8 {
     //gas!(context.interpreter, gas::MID);
-    popn!([target], context.interpreter);
-    jump_inner(context.interpreter, target);
+    popn!([target], context.interpreter, ip);
+    jump_inner::<FUSE_JUMPDEST, _>(context.interpreter, target, ip)
 }
 
 /// Implements the JUMPI instruction.
 ///
 /// Conditional jump to a valid destination if condition is true.
-pub fn jumpi<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, WIRE>) {
-    //gas!(context.interpreter, gas::HIGH);
-    popn!([target, cond], context.interpreter);
+#[inline(always)]
+pub fn jumpi<const FUSE_JUMPDEST: bool, WIRE: InterpreterTypes, H: ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+) {
+    let InstructionContext { interpreter, host } = context;
+    let ip = interpreter.bytecode.ip();
+    let next = jumpi_at::<FUSE_JUMPDEST, _, _>(
+        InstructionContext {
+            interpreter: &mut *interpreter,
+            host,
+        },
+        ip,
+    );
+    interpreter.bytecode.set_ip(next);
+}
 
-    if !super::u256_is_zero(&cond) {
-        jump_inner(context.interpreter, target);
+/// [`jumpi`], but returning the instruction pointer to continue at. See [`jump_at`].
+#[inline(always)]
+pub fn jumpi_at<const FUSE_JUMPDEST: bool, WIRE: InterpreterTypes, H: ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+    ip: *const u8,
+) -> *const u8 {
+    //gas!(context.interpreter, gas::HIGH);
+    popn!([target, cond], context.interpreter, ip);
+
+    if super::u256_is_zero(&cond) {
+        return ip;
     }
+    jump_inner::<FUSE_JUMPDEST, _>(context.interpreter, target, ip)
 }
 
 /// Internal helper function for jump operations.
 ///
 /// Validates jump target and performs the actual jump.
 #[inline(always)]
-fn jump_inner<WIRE: InterpreterTypes>(interpreter: &mut Interpreter<WIRE>, target: U256) {
-    let target = as_usize_or_fail!(interpreter, target, InstructionResult::InvalidJump);
+fn jump_inner<const FUSE_JUMPDEST: bool, WIRE: InterpreterTypes>(
+    interpreter: &mut Interpreter<WIRE>,
+    target: U256,
+    ip: *const u8,
+) -> *const u8 {
+    let target = as_usize_or_fail_ret!(interpreter, target, InstructionResult::InvalidJump, ip);
     if !interpreter.bytecode.is_valid_legacy_jump(target) {
         interpreter.halt(InstructionResult::InvalidJump);
-        return;
+        return ip;
     }
-    // SAFETY: `is_valid_jump` ensures that `dest` is in bounds.
-    interpreter.bytecode.absolute_jump(target);
+    // JUMPDEST elision. `is_valid_legacy_jump` is exactly "the byte at `target` is a
+    // JUMPDEST that is not PUSH data", and JUMPDEST is a pure no-op whose only effect is
+    // spending `gas::JUMPDEST`. So charge that gas here and land one byte past it: the
+    // dispatch loop never spends a fetch/table-lookup/indirect-call round on it.
+    //
+    // Safety of `target + 1`: `analyze_legacy` pads the bytecode so that the last opcode
+    // is a STOP, which for a trailing JUMPDEST means at least one padding byte, so
+    // `target + 1` is still inside the padded bytes.
+    //
+    // Gas equivalence: the only way the fused charge differs from charging it one dispatch
+    // later is when it is the charge that runs out of gas, and out-of-gas is an exceptional
+    // halt that spends the whole limit either way. Nothing else observes the JUMPDEST step;
+    // `pc()` of the following opcode, the stack and the memory are all unchanged.
+    //
+    // Only the switch dispatch of `run_plain` asks for the fusion. The instruction *table*
+    // also drives `Interpreter::step`, and a step-by-step caller (an inspector) does observe
+    // the JUMPDEST step, so the table is built with `FUSE_JUMPDEST = false`.
+    if FUSE_JUMPDEST {
+        if interpreter.gas.record_cost_unsafe(crate::gas::JUMPDEST) {
+            interpreter.halt_oog();
+            return ip;
+        }
+        // SAFETY: `is_valid_jump` ensures that `dest` is in bounds, and the analysis pads
+        // the bytecode so that one byte past a trailing JUMPDEST still exists.
+        interpreter.bytecode.absolute_ip(target + 1)
+    } else {
+        // SAFETY: `is_valid_jump` ensures that `dest` is in bounds.
+        interpreter.bytecode.absolute_ip(target)
+    }
 }
 
 /// Implements the JUMPDEST instruction.

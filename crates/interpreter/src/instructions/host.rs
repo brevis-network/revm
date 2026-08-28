@@ -218,6 +218,9 @@ pub fn blockhash<WIRE: InterpreterTypes, H: Host + ?Sized>(
 /// Implements the SLOAD instruction.
 ///
 /// Loads a word from storage.
+/// Inlined into the dispatch loop: out of line the prologue, epilogue and call cost more
+/// than a dozen instructions on every SLOAD.
+#[inline(always)]
 pub fn sload<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContext<'_, H, WIRE>) {
     popn_top!([], index, context.interpreter);
     let spec_id = context.interpreter.runtime_flag.spec_id();
@@ -245,7 +248,12 @@ pub fn sload<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionConte
                     gas!(context.interpreter, COLD_SLOAD_COST_ADDITIONAL);
                 }
 
-                *index = storage.data;
+                // `*index = storage.data` is a 32-byte store that LLVM lowers to a `memcpy`
+                // libcall here - 62 K of them per mainnet block, the single most frequent
+                // call site in the guest. See `copy_u256`.
+                // SAFETY: `index` is a `&mut U256` into the stack, so 8-aligned and live,
+                // and `storage.data` is a distinct local.
+                unsafe { primitives::copy_u256(index, &storage.data) };
             }
             Err(LoadError::ColdLoadSkipped) => context.interpreter.halt_oog(),
             Err(LoadError::DBError) => context.interpreter.halt_fatal(),
@@ -254,7 +262,8 @@ pub fn sload<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionConte
         let Some(storage) = context.host.sload(target, *index) else {
             return context.interpreter.halt_fatal();
         };
-        *index = storage.data;
+        // SAFETY: as above.
+        unsafe { primitives::copy_u256(index, &storage.data) };
     };
 }
 

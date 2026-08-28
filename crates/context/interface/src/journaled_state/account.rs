@@ -36,10 +36,22 @@ impl<'a, ENTRY: JournalEntryTr> JournaledAccount<'a, ENTRY> {
         account: &'a mut Account,
         journal_entries: &'a mut Vec<ENTRY>,
     ) -> Self {
-        Self {
-            address,
-            account,
-            journal_entries,
+        // Written field by field instead of with a struct literal so that the `Address` goes
+        // through `copy_address_bytes`; see there for why `Self { address, .. }` costs a
+        // `memcpy` libcall. This constructor is on the account-load path and runs ~33 K times
+        // per mainnet block.
+        // SAFETY: every field is initialized exactly once below, so `assume_init` sees a
+        // fully initialized `Self`. `address` is a live 20-byte local.
+        unsafe {
+            let mut this = core::mem::MaybeUninit::<Self>::uninit();
+            let p = this.as_mut_ptr();
+            primitives::copy_address_bytes(
+                core::ptr::addr_of_mut!((*p).address).cast::<u8>(),
+                core::ptr::addr_of!(address).cast::<u8>(),
+            );
+            core::ptr::addr_of_mut!((*p).account).write(account);
+            core::ptr::addr_of_mut!((*p).journal_entries).write(journal_entries);
+            this.assume_init()
         }
     }
 

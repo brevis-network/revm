@@ -40,6 +40,7 @@ use std::boxed::Box;
     <IW as InterpreterTypes>::RuntimeFlag,
     <IW as InterpreterTypes>::Extend,
 )]
+#[repr(C)]
 pub struct EthFrame<IW: InterpreterTypes = EthInterpreter> {
     /// Frame-specific data (Call, Create, or EOFCreate).
     pub data: FrameData,
@@ -49,12 +50,27 @@ pub struct EthFrame<IW: InterpreterTypes = EthInterpreter> {
     pub depth: usize,
     /// Journal checkpoint for state reversion.
     pub checkpoint: JournalCheckpoint,
-    /// Interpreter instance for executing bytecode.
-    pub interpreter: Interpreter<IW>,
     /// Whether the frame has been finished its execution.
     /// Frame is considered finished if it has been called and returned a result.
     pub is_finished: bool,
+    /// Interpreter instance for executing bytecode.
+    ///
+    /// Last field, and the struct is `repr(C)`, for the same reason `Interpreter` puts its
+    /// stack last: the interpreter carries the EVM stack's 32 KiB inline, and the fields
+    /// above it have to stay reachable at a small displacement.
+    pub interpreter: Interpreter<IW>,
 }
+
+/// The same 12-bit displacement constraint as the one on `Interpreter`, for the same reason:
+/// `interpreter` carries the EVM stack's 32 KiB inline, so the fields above it have to stay
+/// within 2048 bytes of the frame's base and nothing may follow it. If either fires, put the
+/// new field before `interpreter`.
+const _: () = assert!(core::mem::offset_of!(EthFrame<EthInterpreter>, interpreter) < 2048);
+const _: () = assert!(
+    core::mem::size_of::<EthFrame<EthInterpreter>>()
+        == core::mem::offset_of!(EthFrame<EthInterpreter>, interpreter)
+            + core::mem::size_of::<Interpreter<EthInterpreter>>()
+);
 
 impl<IT: InterpreterTypes> FrameTr for EthFrame<IT> {
     type FrameResult = FrameResult;
@@ -179,12 +195,28 @@ impl EthFrame<EthInterpreter> {
             }
         }
 
-        let interpreter_input = InputsImpl {
-            target_address: inputs.target_address,
-            caller_address: inputs.caller,
-            bytecode_address: Some(inputs.bytecode_address),
-            input: inputs.input.clone(),
-            call_value: inputs.value.get(),
+        // Field by field rather than a struct literal, so that each address goes through
+        // `copy_address_bytes` instead of a `memcpy` libcall (see there).
+        // SAFETY: every field is initialized exactly once below, so `assume_init` sees a
+        // fully initialized `InputsImpl`.
+        let interpreter_input = unsafe {
+            let mut ii = core::mem::MaybeUninit::<InputsImpl>::uninit();
+            let p = ii.as_mut_ptr();
+            primitives::copy_address_bytes(
+                core::ptr::addr_of_mut!((*p).target_address).cast::<u8>(),
+                core::ptr::addr_of!(inputs.target_address).cast::<u8>(),
+            );
+            primitives::copy_address_bytes(
+                core::ptr::addr_of_mut!((*p).caller_address).cast::<u8>(),
+                core::ptr::addr_of!(inputs.caller).cast::<u8>(),
+            );
+            primitives::write_some_address(
+                core::ptr::addr_of_mut!((*p).bytecode_address),
+                core::ptr::addr_of!(inputs.bytecode_address).cast::<u8>(),
+            );
+            core::ptr::addr_of_mut!((*p).input).write(inputs.input.clone());
+            core::ptr::addr_of_mut!((*p).call_value).write(inputs.value.get());
+            ii.assume_init()
         };
         let is_static = inputs.is_static;
         let gas_limit = inputs.gas_limit;

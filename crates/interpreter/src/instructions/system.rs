@@ -1,6 +1,6 @@
 use crate::{
     gas,
-    interpreter::{u256_from_be_aligned, Interpreter},
+    interpreter::{bswap64_shared, bswap_masks_shared, u256_from_be_aligned, Interpreter},
     interpreter_types::{
         InputsTr, InterpreterTypes, LegacyBytecode, MemoryTr, ReturnData, RuntimeFlag, StackTr,
     },
@@ -14,6 +14,10 @@ use crate::InstructionContext;
 /// Implements the KECCAK256 instruction.
 ///
 /// Computes Keccak-256 hash of memory data.
+///
+/// Inlined into the dispatch loop; out of line it pays a prologue, an epilogue, a call and
+/// a return for a body of about a hundred instructions.
+#[inline(always)]
 pub fn keccak256<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, WIRE>) {
     popn_top!([offset], top, context.interpreter);
     let len = as_usize_or_fail!(context.interpreter, top);
@@ -99,6 +103,10 @@ pub fn codecopy<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'
 /// Implements the CALLDATALOAD instruction.
 ///
 /// Loads 32 bytes of input data from the specified offset.
+///
+/// Inlined into the dispatch loop; out of line it pays a prologue, an epilogue, a call and
+/// a return for a body of about a hundred instructions.
+#[inline(always)]
 pub fn calldataload<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, WIRE>) {
     //gas!(context.interpreter, gas::VERYLOW);
     popn_top!([], offset_ptr, context.interpreter);
@@ -162,6 +170,51 @@ unsafe fn be_word_to(src: *const u8, count: usize, dst: *mut u64) {
             // SAFETY: `dst` has four writable limbs.
             unsafe { dst.add(i).write(limbs[i]) };
             i += 1;
+        }
+        return;
+    }
+    // The whole 32 bytes are present. Assembling a limb from bytes is 8 `lbu` + 14 shift/or;
+    // loading it as one (or two) aligned scalars and byte-reversing it is 13 instructions,
+    // and a limb that is *zero* - the common shape in calldata: small integers, booleans, the
+    // top half of an address - needs no reversal at all. `lwu` needs 4-byte alignment, which
+    // is what an ABI-encoded argument at `4 + 32k` has, and neither load ever reaches outside
+    // `src[..32]`.
+    let addr = src as usize;
+    if addr.is_multiple_of(8) {
+        let (m1, m2) = bswap_masks_shared();
+        // SAFETY: `src[..32]` is readable and 8-aligned.
+        unsafe {
+            let q = src.cast::<u64>();
+            let mut k = 0;
+            while k < 4 {
+                let w = q.add(k).read();
+                if w == 0 {
+                    dst.add(3 - k).write(0);
+                } else {
+                    dst.add(3 - k).write(bswap64_shared(w, m1, m2));
+                }
+                k += 1;
+            }
+        }
+        return;
+    }
+    if addr.is_multiple_of(4) {
+        let (m1, m2) = bswap_masks_shared();
+        // SAFETY: `src[..32]` is readable and 4-aligned, so the eight `u32` reads are in
+        // bounds and aligned. RV64 is little-endian, so the two halves recombine to the same
+        // `u64` an aligned `ld` would have produced.
+        unsafe {
+            let q = src.cast::<u32>();
+            let mut k = 0;
+            while k < 4 {
+                let w = (q.add(2 * k).read() as u64) | ((q.add(2 * k + 1).read() as u64) << 32);
+                if w == 0 {
+                    dst.add(3 - k).write(0);
+                } else {
+                    dst.add(3 - k).write(bswap64_shared(w, m1, m2));
+                }
+                k += 1;
+            }
         }
         return;
     }

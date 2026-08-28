@@ -69,12 +69,31 @@ pub trait Jumps {
     /// Absolute jumps require checking for overflow and if target is a jump destination
     /// from jump table.
     fn absolute_jump(&mut self, offset: usize);
+
+    /// The instruction pointer that [`Jumps::absolute_jump`] would install, without
+    /// installing it.
+    ///
+    /// The switch dispatch of `Interpreter::run_plain` keeps the instruction pointer in a
+    /// local; letting `JUMP`/`JUMPI` hand back the new one directly saves the store, the
+    /// reload and the second store that going through the field costs.
+    fn absolute_ip(&self, offset: usize) -> *const u8;
     /// Check legacy jump destination from jump table.
     fn is_valid_legacy_jump(&mut self, offset: usize) -> bool;
     /// Returns current program counter.
     fn pc(&self) -> usize;
     /// Returns instruction opcode.
     fn opcode(&self) -> u8;
+    /// Returns the raw instruction pointer.
+    ///
+    /// `Interpreter::run_plain` keeps the instruction pointer in a local across the dispatch
+    /// loop and only hands it back through [`Jumps::set_ip`] for the few opcodes that look at
+    /// it, so that the common opcode does not pay a reload the backend cannot remove.
+    fn ip(&self) -> *const u8;
+    /// Sets the raw instruction pointer.
+    ///
+    /// The pointer must be one that came out of [`Jumps::ip`] on the same bytecode, possibly
+    /// moved by the jump methods, i.e. it has to stay inside the (padded) bytecode.
+    fn set_ip(&mut self, ip: *const u8);
 }
 
 /// Trait for Interpreter memory operations.
@@ -243,6 +262,19 @@ pub trait StackTr {
     /// Error is internally set in interpreter.
     fn push_slice(&mut self, slice: &[u8]) -> bool;
 
+    /// Pushes the `N` big-endian bytes at `src` as one word, zero-padded on the left.
+    ///
+    /// Returns `true` if push was successful, `false` if stack overflow.
+    ///
+    /// # Safety
+    ///
+    /// `src` must be valid for reads of `N` bytes.
+    #[must_use]
+    unsafe fn push_slice_const<const N: usize>(&mut self, src: *const u8) -> bool {
+        // SAFETY: forwarded from the caller's contract.
+        self.push_slice(unsafe { core::slice::from_raw_parts(src, N) })
+    }
+
     /// Pushes B256 value to the stack.
     ///
     /// Internally converts B256 to U256 and then calls [`StackTr::push`].
@@ -258,6 +290,21 @@ pub trait StackTr {
     /// Pop N values from the stack and return top value.
     #[must_use]
     fn popn_top<const POPN: usize>(&mut self) -> Option<([U256; POPN], &mut U256)>;
+
+    /// Drops the top `N` values, given the length the caller has already read and checked.
+    ///
+    /// [`StackTr::popn`] re-reads and re-checks the length, which is work an instruction
+    /// like `MSTORE` has already paid for.
+    ///
+    /// # Safety
+    ///
+    /// `len` must be the current stack length in words and must be at least `N`.
+    #[inline]
+    unsafe fn popn_discard<const N: usize>(&mut self, len: usize) {
+        let _ = len;
+        // SAFETY: the caller guarantees at least `N` values are on the stack.
+        let _ = unsafe { self.popn::<N>().unwrap_unchecked() };
+    }
 
     /// Returns top value from the stack.
     #[must_use]
