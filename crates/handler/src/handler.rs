@@ -376,23 +376,26 @@ pub trait Handler {
         }
 
         loop {
-            let call_or_result = evm.frame_run()?;
-
-            let result = match call_or_result {
-                ItemOrResult::Item(init) => {
-                    match evm.frame_init(init)? {
-                        ItemOrResult::Item(_) => {
-                            continue;
-                        }
-                        // Do not pop the frame since no new frame was created
-                        ItemOrResult::Result(result) => result,
-                    }
-                }
-                ItemOrResult::Result(result) => result,
+            // Spelled out with `match` rather than `?`. `Try::branch` takes the
+            // `Result` by value and hands the payload back inside a `ControlFlow`,
+            // which LLVM lowers as a real copy of the ~104-byte `ItemOrResult`
+            // through fresh stack slots - and since the payload carries align-1
+            // fields, that copy is byte-wide.
+            let mut result = match evm.frame_run() {
+                Err(e) => return Err(e.into()),
+                Ok(ItemOrResult::Item(init)) => match evm.frame_init(init) {
+                    Err(e) => return Err(e.into()),
+                    // Do not pop the frame since no new frame was created
+                    Ok(ItemOrResult::Item(_)) => continue,
+                    Ok(ItemOrResult::Result(result)) => result,
+                },
+                Ok(ItemOrResult::Result(result)) => result,
             };
 
-            if let Some(result) = evm.frame_return_result(result)? {
-                return Ok(result);
+            match evm.frame_return_result(&mut result) {
+                Err(e) => return Err(e.into()),
+                Ok(true) => return Ok(result),
+                Ok(false) => {}
             }
         }
     }

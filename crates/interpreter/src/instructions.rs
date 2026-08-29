@@ -292,15 +292,13 @@ const fn instruction_table_impl<WIRE: InterpreterTypes, H: Host>() -> [Instructi
 /// millions of times per block. OR-ing the limbs keeps it at a handful of instructions.
 #[inline(always)]
 pub(crate) fn u256_is_zero(value: &U256) -> bool {
-    let limbs = value.as_limbs();
-    (limbs[0] | limbs[1] | limbs[2] | limbs[3]) == 0
+    primitives::u256_is_zero(value)
 }
 
 /// Whether two `U256` are equal, without going through `memcmp`. See [`u256_is_zero`].
 #[inline(always)]
 pub(crate) fn u256_eq(a: &U256, b: &U256) -> bool {
-    let (a, b) = (a.as_limbs(), b.as_limbs());
-    ((a[0] ^ b[0]) | (a[1] ^ b[1]) | (a[2] ^ b[2]) | (a[3] ^ b[3])) == 0
+    primitives::u256_eq(a, b)
 }
 
 #[cfg(test)]

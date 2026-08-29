@@ -53,6 +53,11 @@ pub fn resize_memory(
 }
 
 /// Calculates gas cost and limit for call instructions.
+///
+/// The bytecode and its hash are written into `known_bytecode` - the very field of
+/// `CallInputs` they are headed for - rather than returned. A `B256` is `[u8; 32]` with
+/// alignment 1, so every by-value hop of a tuple containing one is a byte-wide copy on
+/// RV64IM: the `Result -> Option` rewrap alone measured at 92 retired instructions.
 #[inline(never)]
 pub fn load_acc_and_calc_gas<H: Host + ?Sized>(
     context: &mut InstructionContext<'_, H, impl InterpreterTypes>,
@@ -60,15 +65,21 @@ pub fn load_acc_and_calc_gas<H: Host + ?Sized>(
     transfers_value: bool,
     create_empty_account: bool,
     stack_gas_limit: u64,
-) -> Option<(u64, Bytecode, B256)> {
+    known_bytecode: &mut Option<(B256, Bytecode)>,
+) -> Option<u64> {
     let spec = context.interpreter.runtime_flag.spec_id();
     // calculate static gas first. For berlin hardfork it will take warm gas.
     let static_gas = calc_call_static_gas(spec, transfers_value);
     gas!(context.interpreter, static_gas, None);
 
     // load account delegated and deduct dynamic gas.
-    let (gas, bytecode, code_hash) =
-        load_account_delegated_handle_error(context, to, transfers_value, create_empty_account)?;
+    let gas = load_account_delegated_handle_error(
+        context,
+        to,
+        transfers_value,
+        create_empty_account,
+        known_bytecode,
+    )?;
     let interpreter = &mut context.interpreter;
 
     // deduct dynamic gas.
@@ -88,7 +99,7 @@ pub fn load_acc_and_calc_gas<H: Host + ?Sized>(
         gas_limit = gas_limit.saturating_add(gas::CALL_STIPEND);
     }
 
-    Some((gas_limit, bytecode, code_hash))
+    Some(gas_limit)
 }
 
 /// Loads accounts and its delegate account.
@@ -98,7 +109,8 @@ pub fn load_account_delegated_handle_error<H: Host + ?Sized>(
     to: Address,
     transfers_value: bool,
     create_empty_account: bool,
-) -> Option<(u64, Bytecode, B256)> {
+    known_bytecode: &mut Option<(B256, Bytecode)>,
+) -> Option<u64> {
     // move this to static gas.
     let remaining_gas = context.interpreter.gas.remaining();
     match load_account_delegated(
@@ -108,6 +120,7 @@ pub fn load_account_delegated_handle_error<H: Host + ?Sized>(
         to,
         transfers_value,
         create_empty_account,
+        known_bytecode,
     ) {
         Ok(out) => return Some(out),
         Err(LoadError::ColdLoadSkipped) => {
@@ -131,7 +144,8 @@ pub fn load_account_delegated<H: Host + ?Sized>(
     address: Address,
     transfers_value: bool,
     create_empty_account: bool,
-) -> Result<(u64, Bytecode, B256), LoadError> {
+    known_bytecode: &mut Option<(B256, Bytecode)>,
+) -> Result<u64, LoadError> {
     let mut cost = 0;
     let is_berlin = spec.is_enabled_in(SpecId::BERLIN);
     let is_spurious_dragon = spec.is_enabled_in(SpecId::SPURIOUS_DRAGON);
@@ -141,12 +155,11 @@ pub fn load_account_delegated<H: Host + ?Sized>(
     if is_berlin && account.is_cold {
         cost += COLD_ACCOUNT_ACCESS_COST_ADDITIONAL;
     }
-    let mut bytecode = account.code.clone().unwrap_or_default();
-    let mut code_hash = account.code_hash();
+    *known_bytecode = Some((account.code_hash(), account.code.clone().unwrap_or_default()));
     // New account cost, as account is empty there is no delegated account and we can return early.
     if create_empty_account && account.is_empty {
         cost += new_account_cost(is_spurious_dragon, transfers_value);
-        return Ok((cost, bytecode, code_hash));
+        return Ok(cost);
     }
 
     // load delegate code if account is EIP-7702
@@ -166,11 +179,13 @@ pub fn load_account_delegated<H: Host + ?Sized>(
         if delegate_account.is_cold {
             cost += COLD_ACCOUNT_ACCESS_COST_ADDITIONAL;
         }
-        bytecode = delegate_account.code.clone().unwrap_or_default();
-        code_hash = delegate_account.code_hash();
+        *known_bytecode = Some((
+            delegate_account.code_hash(),
+            delegate_account.code.clone().unwrap_or_default(),
+        ));
     }
 
-    Ok((cost, bytecode, code_hash))
+    Ok(cost)
 }
 
 /// Returns new account cost.

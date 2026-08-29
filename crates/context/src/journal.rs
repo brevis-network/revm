@@ -6,6 +6,7 @@ pub mod inner;
 pub mod warm_addresses;
 
 pub use context_interface::journaled_state::entry::{JournalEntry, JournalEntryTr};
+use primitives::AlignedAddress;
 pub use inner::JournalInner;
 
 use bytecode::Bytecode;
@@ -194,8 +195,8 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
     #[inline]
     fn transfer_loaded(
         &mut self,
-        from: Address,
-        to: Address,
+        from: AlignedAddress,
+        to: AlignedAddress,
         balance: U256,
     ) -> Option<TransferError> {
         self.inner.transfer_loaded(from, to, balance)

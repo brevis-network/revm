@@ -31,7 +31,7 @@ pub fn sub<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 pub fn div<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, WIRE>) {
     //gas!(context.interpreter, gas::LOW);
     popn_top!([op1], op2, context.interpreter);
-    if !op2.is_zero() {
+    if !super::u256_is_zero(op2) {
         *op2 = op1.wrapping_div(*op2);
     }
 }
@@ -51,7 +51,7 @@ pub fn sdiv<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H
 pub fn rem<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, WIRE>) {
     //gas!(context.interpreter, gas::LOW);
     popn_top!([op1], op2, context.interpreter);
-    if !op2.is_zero() {
+    if !super::u256_is_zero(op2) {
         *op2 = op1.wrapping_rem(*op2);
     }
 }

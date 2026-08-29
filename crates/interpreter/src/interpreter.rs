@@ -16,6 +16,7 @@ pub use return_data::ReturnDataImpl;
 pub use runtime_flags::RuntimeFlags;
 pub(crate) use shared_memory::{bswap64_shared, bswap_masks_shared, u256_from_be_aligned};
 pub use shared_memory::{num_words, resize_memory, SharedMemory};
+pub(crate) use shared_memory::store_be_word;
 pub use stack::{Stack, STACK_LIMIT};
 
 // imports
@@ -162,11 +163,15 @@ impl<EXT: Default> Interpreter<EthInterpreter<EXT>> {
 
     /// Clears and reinitializes the interpreter with new parameters.
     #[allow(clippy::too_many_arguments)]
+    ///
+    /// `input` is deliberately not a parameter: an `InputsImpl` is 128 bytes, and handing
+    /// one over by value costs two `memcpy` calls per frame (one into the argument slot,
+    /// one out of it). Callers write [`Interpreter::input`] in place instead, which also
+    /// lets each `Address` in it go through `copy_address_bytes`.
     pub fn clear(
         &mut self,
         memory: SharedMemory,
         bytecode: ExtBytecode,
-        input: InputsImpl,
         is_static: bool,
         spec_id: SpecId,
         gas_limit: u64,
@@ -177,7 +182,7 @@ impl<EXT: Default> Interpreter<EthInterpreter<EXT>> {
             stack,
             return_data,
             memory: memory_ref,
-            input: input_ref,
+            input: _,
             runtime_flag,
             extend,
             gas_stash,
@@ -187,7 +192,6 @@ impl<EXT: Default> Interpreter<EthInterpreter<EXT>> {
         stack.clear();
         return_data.0.clear();
         *memory_ref = memory;
-        *input_ref = input;
         *runtime_flag = RuntimeFlags { spec_id, is_static };
         *extend = EXT::default();
         *gas_stash = u64::MAX;

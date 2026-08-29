@@ -152,6 +152,24 @@ unsafe fn store_be_word_aligned(q: *mut u64, src: *const u64) {
     }
 }
 
+/// Writes the four little-endian limbs at `src` as a 32-byte big-endian word at `p`, taking
+/// the word path when `p` happens to be 8-aligned. For callers whose destination is a
+/// `B256`-shaped buffer, whose alignment is 1 as far as the compiler is concerned.
+///
+/// # Safety
+///
+/// `p` must point at 32 writable bytes and `src` at four readable `u64`s.
+#[inline(always)]
+pub(crate) unsafe fn store_be_word(p: *mut u8, src: *const u64) {
+    if (p as usize).is_multiple_of(core::mem::align_of::<u64>()) {
+        // SAFETY: 32 writable bytes per the contract, 8-aligned as just checked.
+        unsafe { store_be_word_aligned(p.cast::<u64>(), src) };
+        return;
+    }
+    // SAFETY: 32 writable bytes per the contract; needs no alignment.
+    unsafe { store_be_word_bytes(p, src) };
+}
+
 /// Scatters the four little-endian limbs at `src` as a 32-byte big-endian word at `p`, one
 /// byte at a time. Needs no alignment; used for the offsets that are not 8-aligned.
 ///

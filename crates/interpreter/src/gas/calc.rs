@@ -89,7 +89,7 @@ const fn log2floor(value: U256) -> u64 {
 /// `EXP` opcode cost calculation.
 #[inline]
 pub fn exp_cost(spec_id: SpecId, power: U256) -> Option<u64> {
-    if power.is_zero() {
+    if primitives::u256_is_zero(&power) {
         Some(EXP)
     } else {
         // EIP-160: EXP cost increase

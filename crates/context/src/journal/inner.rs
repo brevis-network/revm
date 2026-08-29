@@ -13,6 +13,7 @@ use core::mem;
 use database_interface::Database;
 use primitives::{
     hardfork::SpecId::{self, *},
+    AlignedAddress,
     hash_map::Entry,
     Address, HashMap, Log, StorageKey, StorageValue, B256, KECCAK_EMPTY, U256,
 };
@@ -314,12 +315,12 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     #[inline]
     pub fn transfer_loaded(
         &mut self,
-        from: Address,
-        to: Address,
+        from: AlignedAddress,
+        to: AlignedAddress,
         balance: U256,
     ) -> Option<TransferError> {
-        if from == to {
-            let from_balance = self.state.get_mut(&to).unwrap().info.balance;
+        if from.same(&to) {
+            let from_balance = self.state.get_mut(&to.0).unwrap().info.balance;
             // Check if from balance is enough to transfer the balance.
             if balance > from_balance {
                 return Some(TransferError::OutOfFunds);
@@ -328,13 +329,13 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         }
 
         if balance.is_zero() {
-            Self::touch_account(&mut self.journal, to, self.state.get_mut(&to).unwrap());
+            Self::touch_account(&mut self.journal, to.0, self.state.get_mut(&to.0).unwrap());
             return None;
         }
 
         // sub balance from
-        let from_account = self.state.get_mut(&from).unwrap();
-        Self::touch_account(&mut self.journal, from, from_account);
+        let from_account = self.state.get_mut(&from.0).unwrap();
+        Self::touch_account(&mut self.journal, from.0, from_account);
         let from_balance = &mut from_account.info.balance;
         let Some(from_balance_decr) = from_balance.checked_sub(balance) else {
             return Some(TransferError::OutOfFunds);
@@ -342,8 +343,8 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         *from_balance = from_balance_decr;
 
         // add balance to
-        let to_account = self.state.get_mut(&to).unwrap();
-        Self::touch_account(&mut self.journal, to, to_account);
+        let to_account = self.state.get_mut(&to.0).unwrap();
+        Self::touch_account(&mut self.journal, to.0, to_account);
         let to_balance = &mut to_account.info.balance;
         let Some(to_balance_incr) = to_balance.checked_add(balance) else {
             // Overflow of U256 balance is not possible to happen on mainnet. We don't bother to return funds from from_acc.
@@ -353,7 +354,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
 
         // add journal entry
         self.journal
-            .push(ENTRY::balance_transfer(from, to, balance));
+            .push(ENTRY::balance_transfer(from.0, to.0, balance));
 
         None
     }
@@ -369,7 +370,11 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     ) -> Result<Option<TransferError>, DB::Error> {
         self.load_account(db, from)?;
         self.load_account(db, to)?;
-        Ok(self.transfer_loaded(from, to, balance))
+        Ok(self.transfer_loaded(
+            AlignedAddress::new(&from),
+            AlignedAddress::new(&to),
+            balance,
+        ))
     }
 
     /// Creates account or returns false if collision is detected.
@@ -662,7 +667,11 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         load_code: bool,
         skip_cold_load: bool,
     ) -> Result<StateLoad<JournaledAccount<'_, ENTRY>>, JournalLoadError<DB::Error>> {
-        let load = match self.state.entry(address) {
+        // The by-value `Address` argument sits in a slot LLVM treats as byte-aligned, and
+        // this function reads it four times over: to hash it, to journal it, and to build
+        // the returned `JournaledAccount`. Re-home it once; see `AlignedAddress`.
+        let address = AlignedAddress::new(&address);
+        let load = match self.state.entry(address.0) {
             Entry::Occupied(entry) => {
                 let account = entry.into_mut();
 
@@ -670,7 +679,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
                 let mut is_cold = account.is_cold_transaction_id(self.transaction_id);
                 if is_cold {
                     // account can be loaded by we still need to check warm_addresses to see if it is cold.
-                    let should_be_cold = self.warm_addresses.is_cold(&address);
+                    let should_be_cold = self.warm_addresses.is_cold(&address.0);
 
                     // dont load it cold if skipping cold load is true.
                     if should_be_cold && skip_cold_load {
@@ -697,13 +706,13 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             }
             Entry::Vacant(vac) => {
                 // Precompiles among some other account(coinbase included) are warm loaded so we need to take that into account
-                let is_cold = self.warm_addresses.is_cold(&address);
+                let is_cold = self.warm_addresses.is_cold(&address.0);
 
                 // dont load cold account if skip_cold_load is true
                 if is_cold && skip_cold_load {
                     return Err(JournalLoadError::ColdLoadSkipped);
                 }
-                let account = if let Some(account) = db.basic(address)? {
+                let account = if let Some(account) = db.basic(address.0)? {
                     account.into()
                 } else {
                     Account::new_not_existing(self.transaction_id)
@@ -718,7 +727,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
 
         // journal loading of cold account.
         if load.is_cold {
-            self.journal.push(ENTRY::account_warmed(address));
+            self.journal.push(ENTRY::account_warmed(address.0));
         }
 
         if load_code && load.data.info.code.is_none() {
@@ -731,7 +740,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             info.code = Some(code);
         }
 
-        Ok(load.map(|i| JournaledAccount::new(address, i, &mut self.journal)))
+        Ok(load.map(|i| JournaledAccount::new(address.0, i, &mut self.journal)))
     }
 
     /// Resolves a storage slot to a mutable reference, warming it and journaling the warm
@@ -756,41 +765,91 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         key: StorageKey,
         skip_cold_load: bool,
     ) -> Result<StateLoad<&'a mut EvmStorageSlot>, JournalLoadError<DB::Error>> {
-        // assume acc is warm
-        let account = state.get_mut(&address).unwrap();
+        // assume acc is warm.
+        //
+        // A raw pointer rather than a `&mut`: the slot returned on the hit path points into
+        // this account, so the borrow would have to live for `'a`, and NLL would then refuse
+        // to let the miss path name the account at all. Exactly one reference is ever created
+        // from the pointer, and nothing touches `state` in between.
+        //
+        // Keyed by `FastAddress` so the bucket comparison is word-wise; see there. This is
+        // the only site that uses it - a second caller of the same instantiation pushes
+        // `RawTable::find` past the inliner and it outlines, which costs more than it saves.
+        let account: *mut Account =
+            state.get_mut(primitives::FastAddress::new(&address)).unwrap();
 
-        let is_newly_created = account.is_created();
-        let (slot, is_cold) = match account.storage.entry(key) {
-            Entry::Occupied(occ) => {
-                let slot = occ.into_mut();
-                // skip load if account is cold.
-                let is_cold = slot.is_cold_transaction_id(transaction_id);
-                if skip_cold_load && is_cold {
+        // Hit path: the slot is already in the account's map. 76,069 of 76,821 calls on
+        // mainnet block 24006677 land here, so everything the miss path needs -- the database
+        // read, the insert, the access-list probe -- lives in `sload_slot_miss` instead.
+        // `HashMap::entry` would drag the insert-and-grow machinery in here as well, and it is
+        // that, not the work itself, that gave this function a 464-byte frame and twelve
+        // callee-saved registers to spill.
+        //
+        // SAFETY: `account` was just derived from a live `&mut Account`, and no other access
+        // to `state` happens before it is used.
+        if let Some(slot) = unsafe { (*account).storage.get_mut(&key) } {
+            let is_cold = slot.is_cold_transaction_id(transaction_id);
+            if is_cold {
+                if skip_cold_load {
                     return Err(JournalLoadError::ColdLoadSkipped);
                 }
-                slot.mark_warm_with_transaction_id(transaction_id);
-                (slot, is_cold)
+                // add it to journal as cold loaded.
+                journal.push(ENTRY::storage_warmed(address, key));
             }
-            Entry::Vacant(vac) => {
-                // is storage cold
-                let is_cold = !warm_addresses.is_storage_warm(&address, &key);
+            // `mark_warm_with_transaction_id` would recompute `is_cold_transaction_id`, which
+            // is the value already in hand.
+            slot.transaction_id = transaction_id;
+            slot.is_cold = false;
+            return Ok(StateLoad::new(slot, is_cold));
+        }
 
-                if is_cold && skip_cold_load {
-                    return Err(JournalLoadError::ColdLoadSkipped);
-                }
-                // if storage was cleared, we don't need to ping db.
-                let value = if is_newly_created {
-                    StorageValue::ZERO
-                } else {
-                    db.storage(address, key)?
-                };
+        // SAFETY: as above -- the hit path above returned, so no reference derived from
+        // `account` is still live.
+        Self::sload_slot_miss(
+            unsafe { &mut *account },
+            warm_addresses,
+            journal,
+            transaction_id,
+            db,
+            address,
+            key,
+            skip_cold_load,
+        )
+    }
 
-                (
-                    vac.insert(EvmStorageSlot::new(value, transaction_id)),
-                    is_cold,
-                )
-            }
+    /// The half of [`Self::sload_slot`] that runs when the slot is not in the account's map
+    /// yet, which on mainnet block 24006677 is 752 calls out of 76,821.
+    ///
+    /// Out of line so the hit path carries neither its stack frame nor its register pressure.
+    #[inline(never)]
+    #[cold]
+    fn sload_slot_miss<'a, DB: Database>(
+        account: &'a mut Account,
+        warm_addresses: &WarmAddresses,
+        journal: &mut Vec<ENTRY>,
+        transaction_id: usize,
+        db: &mut DB,
+        address: Address,
+        key: StorageKey,
+        skip_cold_load: bool,
+    ) -> Result<StateLoad<&'a mut EvmStorageSlot>, JournalLoadError<DB::Error>> {
+        // is storage cold
+        let is_cold = !warm_addresses.is_storage_warm(&address, &key);
+
+        if is_cold && skip_cold_load {
+            return Err(JournalLoadError::ColdLoadSkipped);
+        }
+        // if storage was cleared, we don't need to ping db.
+        let value = if account.is_created() {
+            StorageValue::ZERO
+        } else {
+            db.storage(address, key)?
         };
+
+        let slot = account
+            .storage
+            .entry(key)
+            .or_insert(EvmStorageSlot::new(value, transaction_id));
 
         if is_cold {
             // add it to journal as cold loaded.
@@ -830,7 +889,22 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             key,
             skip_cold_load,
         )?;
-        Ok(StateLoad::new(load.data.present_value, load.is_cold))
+        // `StateLoad::new(slot.present_value, ..)` is a 32-byte move that LLVM lowers to a
+        // `memcpy` libcall on this target once the value has been through `Result`'s niche
+        // layout; at 62 K SLOADs per mainnet block it was the single most frequent `memcpy`
+        // call site in the guest. Storing four limbs states the alignment at the store.
+        // SAFETY: `p` points at a fresh, 8-aligned `StateLoad<StorageValue>`, and both of its
+        // fields are written exactly once below, so `assume_init` sees an initialized value.
+        Ok(unsafe {
+            let mut out = mem::MaybeUninit::<StateLoad<StorageValue>>::uninit();
+            let p = out.as_mut_ptr();
+            primitives::copy_u256(
+                core::ptr::addr_of_mut!((*p).data),
+                &load.data.present_value,
+            );
+            core::ptr::addr_of_mut!((*p).is_cold).write(load.is_cold);
+            out.assume_init()
+        })
     }
 
     /// Stores storage slot.
@@ -870,8 +944,9 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         let slot = load.data;
         let present = slot.present_value;
 
-        // new value is same as present, we don't need to do anything
-        if present != new {
+        // new value is same as present, we don't need to do anything.
+        // `!=` on `U256` is a memcmp libcall on the guest target; see `primitives::u256_eq`.
+        if !primitives::u256_eq(&present, &new) {
             journal.push(ENTRY::storage_changed(address, key, present));
             // insert value into present state.
             slot.present_value = new;
@@ -980,6 +1055,7 @@ mod tests {
         assert_eq!(state_load.data, U256::ZERO); // Empty slot
     }
 }
+
 
 /// Builds an [`SStoreResult`] limb by limb.
 ///
