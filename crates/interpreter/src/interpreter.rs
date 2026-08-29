@@ -14,9 +14,9 @@ pub use ext_bytecode::ExtBytecode;
 pub use input::InputsImpl;
 pub use return_data::ReturnDataImpl;
 pub use runtime_flags::RuntimeFlags;
+pub(crate) use shared_memory::store_be_word;
 pub(crate) use shared_memory::{bswap64_shared, bswap_masks_shared, u256_from_be_aligned};
 pub use shared_memory::{num_words, resize_memory, SharedMemory};
-pub(crate) use shared_memory::store_be_word;
 pub use stack::{Stack, STACK_LIMIT};
 
 // imports

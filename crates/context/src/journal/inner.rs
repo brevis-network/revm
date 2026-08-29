@@ -13,9 +13,8 @@ use core::mem;
 use database_interface::Database;
 use primitives::{
     hardfork::SpecId::{self, *},
-    AlignedAddress,
     hash_map::Entry,
-    Address, HashMap, Log, StorageKey, StorageValue, B256, KECCAK_EMPTY, U256,
+    Address, AlignedAddress, HashMap, Log, StorageKey, StorageValue, B256, KECCAK_EMPTY, U256,
 };
 use state::{Account, EvmState, EvmStorageSlot, TransientStorage};
 use std::vec::Vec;
@@ -775,8 +774,9 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // Keyed by `FastAddress` so the bucket comparison is word-wise; see there. This is
         // the only site that uses it - a second caller of the same instantiation pushes
         // `RawTable::find` past the inliner and it outlines, which costs more than it saves.
-        let account: *mut Account =
-            state.get_mut(primitives::FastAddress::new(&address)).unwrap();
+        let account: *mut Account = state
+            .get_mut(primitives::FastAddress::new(&address))
+            .unwrap();
 
         // Hit path: the slot is already in the account's map. 76,069 of 76,821 calls on
         // mainnet block 24006677 land here, so everything the miss path needs -- the database
@@ -898,10 +898,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         Ok(unsafe {
             let mut out = mem::MaybeUninit::<StateLoad<StorageValue>>::uninit();
             let p = out.as_mut_ptr();
-            primitives::copy_u256(
-                core::ptr::addr_of_mut!((*p).data),
-                &load.data.present_value,
-            );
+            primitives::copy_u256(core::ptr::addr_of_mut!((*p).data), &load.data.present_value);
             core::ptr::addr_of_mut!((*p).is_cold).write(load.is_cold);
             out.assume_init()
         })
@@ -1055,7 +1052,6 @@ mod tests {
         assert_eq!(state_load.data, U256::ZERO); // Empty slot
     }
 }
-
 
 /// Builds an [`SStoreResult`] limb by limb.
 ///
