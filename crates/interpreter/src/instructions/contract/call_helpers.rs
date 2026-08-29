@@ -155,7 +155,10 @@ pub fn load_account_delegated<H: Host + ?Sized>(
     if is_berlin && account.is_cold {
         cost += COLD_ACCOUNT_ACCESS_COST_ADDITIONAL;
     }
-    *known_bytecode = Some((account.code_hash(), account.code.clone().unwrap_or_default()));
+    *known_bytecode = Some((
+        account.code_hash(),
+        account.code.clone().unwrap_or_default(),
+    ));
     // New account cost, as account is empty there is no delegated account and we can return early.
     if create_empty_account && account.is_empty {
         cost += new_account_cost(is_spurious_dragon, transfers_value);

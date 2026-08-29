@@ -18,8 +18,8 @@ use interpreter::{
     interpreter::{EthInterpreter, ExtBytecode},
     interpreter_types::ReturnData,
     CallInput, CallInputs, CallOutcome, CallValue, CreateInputs, CreateOutcome, CreateScheme,
-    FrameInput, Gas, InstructionResult, Interpreter, InterpreterAction,
-    InterpreterResult, InterpreterTypes, SharedMemory,
+    FrameInput, Gas, InstructionResult, Interpreter, InterpreterAction, InterpreterResult,
+    InterpreterTypes, SharedMemory,
 };
 use primitives::{
     constants::CALL_STACK_LIMIT,
@@ -187,13 +187,11 @@ impl EthFrame<EthInterpreter> {
         if let CallValue::Transfer(value) = inputs.value {
             // Transfer value from caller to called account
             // Target will get touched even if balance transferred is zero.
-            if let Some(i) =
-                ctx.journal_mut().transfer_loaded(
-                    primitives::AlignedAddress::new(&inputs.caller),
-                    primitives::AlignedAddress::new(&inputs.target_address),
-                    value,
-                )
-            {
+            if let Some(i) = ctx.journal_mut().transfer_loaded(
+                primitives::AlignedAddress::new(&inputs.caller),
+                primitives::AlignedAddress::new(&inputs.target_address),
+                value,
+            ) {
                 ctx.journal_mut().checkpoint_revert(checkpoint);
                 return return_result(i.into());
             }
@@ -633,4 +631,3 @@ pub fn return_create<JOURNAL: JournalTr>(
 
     interpreter_result.result = InstructionResult::Return;
 }
-

@@ -6,8 +6,8 @@ pub mod inner;
 pub mod warm_addresses;
 
 pub use context_interface::journaled_state::entry::{JournalEntry, JournalEntryTr};
-use primitives::AlignedAddress;
 pub use inner::JournalInner;
+use primitives::AlignedAddress;
 
 use bytecode::Bytecode;
 use context_interface::{

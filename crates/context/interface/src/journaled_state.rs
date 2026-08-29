@@ -3,7 +3,6 @@
 pub mod account;
 pub mod entry;
 
-use primitives::AlignedAddress;
 use crate::{
     context::{SStoreResult, SelfDestructResult},
     host::LoadError,
@@ -11,6 +10,7 @@ use crate::{
 };
 use core::ops::{Deref, DerefMut};
 use database_interface::Database;
+use primitives::AlignedAddress;
 use primitives::{
     hardfork::SpecId, Address, Bytes, HashMap, HashSet, Log, StorageKey, StorageValue, B256, U256,
 };
