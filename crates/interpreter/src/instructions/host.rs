@@ -18,11 +18,25 @@ use std::vec::Vec;
 ///
 /// Gets the balance of the given account.
 pub fn balance<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContext<'_, H, WIRE>) {
-    popn_top!([], top, context.interpreter);
+    run_threaded!(context, balance_at)
+}
+
+/// [`balance`], threading the stack cursor.
+///
+/// The body lives here; the plain form above is this one with the cursor read out
+/// of the stack and written back, which is what the instruction *table* needs. See
+/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+#[inline(always)]
+#[allow(unused_mut)]
+pub fn balance_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+    mut sp: usize,
+) -> usize {
+    popn_top_at!([], top, context.interpreter, sp);
     let address = top.into_address();
     let spec_id = context.interpreter.runtime_flag.spec_id();
     if spec_id.is_enabled_in(BERLIN) {
-        let account = berlin_load_account!(context, address, false);
+        let account = berlin_load_account!(context, address, false, sp);
         *top = account.balance;
     } else {
         let gas = if spec_id.is_enabled_in(ISTANBUL) {
@@ -33,31 +47,49 @@ pub fn balance<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionCon
         } else {
             20
         };
-        gas!(context.interpreter, gas);
+        gas!(context.interpreter, gas, sp);
         let Ok(account) = context
             .host
             .load_account_info_skip_cold_load(address, false, false)
         else {
-            return context.interpreter.halt_fatal();
+            context.interpreter.halt_fatal();
+            return sp;
         };
         *top = account.balance;
     };
+    sp
 }
 
 /// EIP-1884: Repricing for trie-size-dependent opcodes
 pub fn selfbalance<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
 ) {
-    check!(context.interpreter, ISTANBUL);
+    run_threaded!(context, selfbalance_at)
+}
+
+/// [`selfbalance`], threading the stack cursor.
+///
+/// The body lives here; the plain form above is this one with the cursor read out
+/// of the stack and written back, which is what the instruction *table* needs. See
+/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+#[inline(always)]
+#[allow(unused_mut)]
+pub fn selfbalance_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+    mut sp: usize,
+) -> usize {
+    check_at!(context.interpreter, sp, ISTANBUL);
     //gas!(context.interpreter, gas::LOW);
 
     let Some(balance) = context
         .host
         .balance(context.interpreter.input.target_address())
     else {
-        return context.interpreter.halt_fatal();
+        context.interpreter.halt_fatal();
+        return sp;
     };
-    push!(context.interpreter, balance.data);
+    push_at!(context.interpreter, sp, balance.data);
+    sp
 }
 
 /// Implements the EXTCODESIZE instruction.
@@ -66,11 +98,25 @@ pub fn selfbalance<WIRE: InterpreterTypes, H: Host + ?Sized>(
 pub fn extcodesize<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
 ) {
-    popn_top!([], top, context.interpreter);
+    run_threaded!(context, extcodesize_at)
+}
+
+/// [`extcodesize`], threading the stack cursor.
+///
+/// The body lives here; the plain form above is this one with the cursor read out
+/// of the stack and written back, which is what the instruction *table* needs. See
+/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+#[inline(always)]
+#[allow(unused_mut)]
+pub fn extcodesize_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+    mut sp: usize,
+) -> usize {
+    popn_top_at!([], top, context.interpreter, sp);
     let address = top.into_address();
     let spec_id = context.interpreter.runtime_flag.spec_id();
     if spec_id.is_enabled_in(BERLIN) {
-        let account = berlin_load_account!(context, address, true);
+        let account = berlin_load_account!(context, address, true, sp);
         // safe to unwrap because we are loading code
         *top = U256::from(account.code.as_ref().unwrap().len());
     } else {
@@ -79,41 +125,58 @@ pub fn extcodesize<WIRE: InterpreterTypes, H: Host + ?Sized>(
         } else {
             20
         };
-        gas!(context.interpreter, gas);
+        gas!(context.interpreter, gas, sp);
         let Ok(account) = context
             .host
             .load_account_info_skip_cold_load(address, true, false)
         else {
-            return context.interpreter.halt_fatal();
+            context.interpreter.halt_fatal();
+            return sp;
         };
         // safe to unwrap because we are loading code
         *top = U256::from(account.code.as_ref().unwrap().len());
     }
+    sp
 }
 
 /// EIP-1052: EXTCODEHASH opcode
 pub fn extcodehash<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
 ) {
-    check!(context.interpreter, CONSTANTINOPLE);
-    popn_top!([], top, context.interpreter);
+    run_threaded!(context, extcodehash_at)
+}
+
+/// [`extcodehash`], threading the stack cursor.
+///
+/// The body lives here; the plain form above is this one with the cursor read out
+/// of the stack and written back, which is what the instruction *table* needs. See
+/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+#[inline(always)]
+#[allow(unused_mut)]
+pub fn extcodehash_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+    mut sp: usize,
+) -> usize {
+    check_at!(context.interpreter, sp, CONSTANTINOPLE);
+    popn_top_at!([], top, context.interpreter, sp);
     let address = top.into_address();
 
     let spec_id = context.interpreter.runtime_flag.spec_id();
     let account = if spec_id.is_enabled_in(BERLIN) {
-        berlin_load_account!(context, address, true)
+        berlin_load_account!(context, address, true, sp)
     } else {
         let gas = if spec_id.is_enabled_in(ISTANBUL) {
             700
         } else {
             400
         };
-        gas!(context.interpreter, gas);
+        gas!(context.interpreter, gas, sp);
         let Ok(account) = context
             .host
             .load_account_info_skip_cold_load(address, true, false)
         else {
-            return context.interpreter.halt_fatal();
+            context.interpreter.halt_fatal();
+            return sp;
         };
         account
     };
@@ -124,6 +187,7 @@ pub fn extcodehash<WIRE: InterpreterTypes, H: Host + ?Sized>(
         account.code_hash
     };
     *top = code_hash.into_u256();
+    sp
 }
 
 /// Implements the EXTCODECOPY instruction.
@@ -187,15 +251,29 @@ pub fn extcodecopy<WIRE: InterpreterTypes, H: Host + ?Sized>(
 pub fn blockhash<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
 ) {
+    run_threaded!(context, blockhash_at)
+}
+
+/// [`blockhash`], threading the stack cursor.
+///
+/// The body lives here; the plain form above is this one with the cursor read out
+/// of the stack and written back, which is what the instruction *table* needs. See
+/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+#[inline(always)]
+#[allow(unused_mut)]
+pub fn blockhash_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+    mut sp: usize,
+) -> usize {
     //gas!(context.interpreter, gas::BLOCKHASH);
-    popn_top!([], number, context.interpreter);
+    popn_top_at!([], number, context.interpreter, sp);
 
     let requested_number = *number;
     let block_number = context.host.block_number();
 
     let Some(diff) = block_number.checked_sub(requested_number) else {
         *number = U256::ZERO;
-        return;
+        return sp;
     };
 
     let diff = as_u64_saturated!(diff);
@@ -203,17 +281,19 @@ pub fn blockhash<WIRE: InterpreterTypes, H: Host + ?Sized>(
     // blockhash should push zero if number is same as current block number.
     if diff == 0 {
         *number = U256::ZERO;
-        return;
+        return sp;
     }
 
     *number = if diff <= BLOCK_HASH_HISTORY {
         let Some(hash) = context.host.block_hash(as_u64_saturated!(requested_number)) else {
-            return context.interpreter.halt_fatal();
+            context.interpreter.halt_fatal();
+            return sp;
         };
         U256::from_be_bytes(hash.0)
     } else {
         U256::ZERO
-    }
+    };
+    sp
 }
 
 /// Implements the SLOAD instruction.
@@ -223,7 +303,21 @@ pub fn blockhash<WIRE: InterpreterTypes, H: Host + ?Sized>(
 /// than a dozen instructions on every SLOAD.
 #[inline(always)]
 pub fn sload<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContext<'_, H, WIRE>) {
-    popn_top!([], index, context.interpreter);
+    run_threaded!(context, sload_at)
+}
+
+/// [`sload`], threading the stack cursor.
+///
+/// The body lives here; the plain form above is this one with the cursor read out
+/// of the stack and written back, which is what the instruction *table* needs. See
+/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+#[inline(always)]
+#[allow(unused_mut)]
+pub fn sload_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+    mut sp: usize,
+) -> usize {
+    popn_top_at!([], index, context.interpreter, sp);
     let spec_id = context.interpreter.runtime_flag.spec_id();
     let target = context.interpreter.input.target_address();
 
@@ -239,14 +333,14 @@ pub fn sload<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionConte
     } else {
         50
     };
-    gas!(context.interpreter, gas);
+    gas!(context.interpreter, gas, sp);
     if spec_id.is_enabled_in(BERLIN) {
         let skip_cold = context.interpreter.gas.remaining() < COLD_SLOAD_COST_ADDITIONAL;
         let res = context.host.sload_skip_cold_load(target, *index, skip_cold);
         match res {
             Ok(storage) => {
                 if storage.is_cold {
-                    gas!(context.interpreter, COLD_SLOAD_COST_ADDITIONAL);
+                    gas!(context.interpreter, COLD_SLOAD_COST_ADDITIONAL, sp);
                 }
 
                 // `*index = storage.data` is a 32-byte store that LLVM lowers to a `memcpy`
@@ -261,19 +355,35 @@ pub fn sload<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionConte
         }
     } else {
         let Some(storage) = context.host.sload(target, *index) else {
-            return context.interpreter.halt_fatal();
+            context.interpreter.halt_fatal();
+            return sp;
         };
         // SAFETY: as above.
         unsafe { primitives::copy_u256(index, &storage.data) };
     };
+    sp
 }
 
 /// Implements the SSTORE instruction.
 ///
 /// Stores a word to storage.
 pub fn sstore<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContext<'_, H, WIRE>) {
-    require_non_staticcall!(context.interpreter);
-    popn!([index, value], context.interpreter);
+    run_threaded!(context, sstore_at)
+}
+
+/// [`sstore`], threading the stack cursor.
+///
+/// The body lives here; the plain form above is this one with the cursor read out
+/// of the stack and written back, which is what the instruction *table* needs. See
+/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+#[inline(always)]
+#[allow(unused_mut)]
+pub fn sstore_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+    mut sp: usize,
+) -> usize {
+    require_non_staticcall_at!(context.interpreter, sp);
+    popn_at!([index, value], context.interpreter, sp);
 
     let target = context.interpreter.input.target_address();
     let spec_id = context.interpreter.runtime_flag.spec_id();
@@ -289,13 +399,14 @@ pub fn sstore<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionCont
         context
             .interpreter
             .halt(InstructionResult::ReentrancySentryOOG);
-        return;
+        return sp;
     }
 
     // static gas
     gas!(
         context.interpreter,
-        gas::static_sstore_cost(context.interpreter.runtime_flag.spec_id())
+        gas::static_sstore_cost(context.interpreter.runtime_flag.spec_id()),
+        sp
     );
 
     let state_load = if spec_id.is_enabled_in(BERLIN) {
@@ -305,12 +416,19 @@ pub fn sstore<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionCont
             .sstore_skip_cold_load(target, index, value, skip_cold);
         match res {
             Ok(load) => load,
-            Err(LoadError::ColdLoadSkipped) => return context.interpreter.halt_oog(),
-            Err(LoadError::DBError) => return context.interpreter.halt_fatal(),
+            Err(LoadError::ColdLoadSkipped) => {
+                context.interpreter.halt_oog();
+                return sp;
+            }
+            Err(LoadError::DBError) => {
+                context.interpreter.halt_fatal();
+                return sp;
+            }
         }
     } else {
         let Some(load) = context.host.sstore(target, index, value) else {
-            return context.interpreter.halt_fatal();
+            context.interpreter.halt_fatal();
+            return sp;
         };
         load
     };
@@ -322,7 +440,8 @@ pub fn sstore<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionCont
             context.interpreter.runtime_flag.spec_id(),
             &state_load.data,
             state_load.is_cold
-        )
+        ),
+        sp
     );
 
     // refund
@@ -330,33 +449,64 @@ pub fn sstore<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionCont
         context.interpreter.runtime_flag.spec_id(),
         &state_load.data,
     ));
+    sp
 }
 
 /// EIP-1153: Transient storage opcodes
 /// Store value to transient storage
 pub fn tstore<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContext<'_, H, WIRE>) {
-    check!(context.interpreter, CANCUN);
-    require_non_staticcall!(context.interpreter);
+    run_threaded!(context, tstore_at)
+}
+
+/// [`tstore`], threading the stack cursor.
+///
+/// The body lives here; the plain form above is this one with the cursor read out
+/// of the stack and written back, which is what the instruction *table* needs. See
+/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+#[inline(always)]
+#[allow(unused_mut)]
+pub fn tstore_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+    mut sp: usize,
+) -> usize {
+    check_at!(context.interpreter, sp, CANCUN);
+    require_non_staticcall_at!(context.interpreter, sp);
     //gas!(context.interpreter, gas::WARM_STORAGE_READ_COST);
 
-    popn!([index, value], context.interpreter);
+    popn_at!([index, value], context.interpreter, sp);
 
     context
         .host
         .tstore(context.interpreter.input.target_address(), index, value);
+    sp
 }
 
 /// EIP-1153: Transient storage opcodes
 /// Load value from transient storage
 pub fn tload<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContext<'_, H, WIRE>) {
-    check!(context.interpreter, CANCUN);
+    run_threaded!(context, tload_at)
+}
+
+/// [`tload`], threading the stack cursor.
+///
+/// The body lives here; the plain form above is this one with the cursor read out
+/// of the stack and written back, which is what the instruction *table* needs. See
+/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+#[inline(always)]
+#[allow(unused_mut)]
+pub fn tload_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+    mut sp: usize,
+) -> usize {
+    check_at!(context.interpreter, sp, CANCUN);
     //gas!(context.interpreter, gas::WARM_STORAGE_READ_COST);
 
-    popn_top!([], index, context.interpreter);
+    popn_top_at!([], index, context.interpreter, sp);
 
     *index = context
         .host
         .tload(context.interpreter.input.target_address(), *index);
+    sp
 }
 
 /// Implements the LOG0-LOG4 instructions.

@@ -160,34 +160,58 @@ macro_rules! for_each_builtin_instruction {
                 (4, $crate::instructions::bitwise::sar_at);
             CLZ => $crate::instructions::bitwise::clz, 5,
                 (4, $crate::instructions::bitwise::clz_at);
-            KECCAK256 => $crate::instructions::system::keccak256, 0, 0;
-            ADDRESS => $crate::instructions::system::address, 2, 0;
-            BALANCE => $crate::instructions::host::balance, 0, 0;
-            ORIGIN => $crate::instructions::tx_info::origin, 2, 0;
-            CALLER => $crate::instructions::system::caller, 2, 0;
-            CALLVALUE => $crate::instructions::system::callvalue, 2, 0;
-            CALLDATALOAD => $crate::instructions::system::calldataload, 3, 0;
-            CALLDATASIZE => $crate::instructions::system::calldatasize, 2, 0;
+            KECCAK256 => $crate::instructions::system::keccak256, 0,
+                (4, $crate::instructions::system::keccak256_at);
+            ADDRESS => $crate::instructions::system::address, 2,
+                (4, $crate::instructions::system::address_at);
+            BALANCE => $crate::instructions::host::balance, 0,
+                (4, $crate::instructions::host::balance_at);
+            ORIGIN => $crate::instructions::tx_info::origin, 2,
+                (4, $crate::instructions::tx_info::origin_at);
+            CALLER => $crate::instructions::system::caller, 2,
+                (4, $crate::instructions::system::caller_at);
+            CALLVALUE => $crate::instructions::system::callvalue, 2,
+                (4, $crate::instructions::system::callvalue_at);
+            CALLDATALOAD => $crate::instructions::system::calldataload, 3,
+                (4, $crate::instructions::system::calldataload_at);
+            CALLDATASIZE => $crate::instructions::system::calldatasize, 2,
+                (4, $crate::instructions::system::calldatasize_at);
             CALLDATACOPY => $crate::instructions::system::calldatacopy, 0, 0;
-            CODESIZE => $crate::instructions::system::codesize, 2, 0;
+            CODESIZE => $crate::instructions::system::codesize, 2,
+                (4, $crate::instructions::system::codesize_at);
             CODECOPY => $crate::instructions::system::codecopy, 0, 0;
-            GASPRICE => $crate::instructions::tx_info::gasprice, 2, 0;
-            EXTCODESIZE => $crate::instructions::host::extcodesize, 0, 0;
+            GASPRICE => $crate::instructions::tx_info::gasprice, 2,
+                (4, $crate::instructions::tx_info::gasprice_at);
+            EXTCODESIZE => $crate::instructions::host::extcodesize, 0,
+                (4, $crate::instructions::host::extcodesize_at);
             EXTCODECOPY => $crate::instructions::host::extcodecopy, 0, 0;
-            RETURNDATASIZE => $crate::instructions::system::returndatasize, 2, 0;
+            RETURNDATASIZE => $crate::instructions::system::returndatasize, 2,
+                (4, $crate::instructions::system::returndatasize_at);
             RETURNDATACOPY => $crate::instructions::system::returndatacopy, 0, 0;
-            EXTCODEHASH => $crate::instructions::host::extcodehash, 0, 0;
-            BLOCKHASH => $crate::instructions::host::blockhash, 20, 0;
-            COINBASE => $crate::instructions::block_info::coinbase, 2, 0;
-            TIMESTAMP => $crate::instructions::block_info::timestamp, 2, 0;
-            NUMBER => $crate::instructions::block_info::block_number, 2, 0;
-            DIFFICULTY => $crate::instructions::block_info::difficulty, 2, 0;
-            GASLIMIT => $crate::instructions::block_info::gaslimit, 2, 0;
-            CHAINID => $crate::instructions::block_info::chainid, 2, 0;
-            SELFBALANCE => $crate::instructions::host::selfbalance, 5, 0;
-            BASEFEE => $crate::instructions::block_info::basefee, 2, 0;
-            BLOBHASH => $crate::instructions::tx_info::blob_hash, 3, 0;
-            BLOBBASEFEE => $crate::instructions::block_info::blob_basefee, 2, 0;
+            EXTCODEHASH => $crate::instructions::host::extcodehash, 0,
+                (4, $crate::instructions::host::extcodehash_at);
+            BLOCKHASH => $crate::instructions::host::blockhash, 20,
+                (4, $crate::instructions::host::blockhash_at);
+            COINBASE => $crate::instructions::block_info::coinbase, 2,
+                (4, $crate::instructions::block_info::coinbase_at);
+            TIMESTAMP => $crate::instructions::block_info::timestamp, 2,
+                (4, $crate::instructions::block_info::timestamp_at);
+            NUMBER => $crate::instructions::block_info::block_number, 2,
+                (4, $crate::instructions::block_info::block_number_at);
+            DIFFICULTY => $crate::instructions::block_info::difficulty, 2,
+                (4, $crate::instructions::block_info::difficulty_at);
+            GASLIMIT => $crate::instructions::block_info::gaslimit, 2,
+                (4, $crate::instructions::block_info::gaslimit_at);
+            CHAINID => $crate::instructions::block_info::chainid, 2,
+                (4, $crate::instructions::block_info::chainid_at);
+            SELFBALANCE => $crate::instructions::host::selfbalance, 5,
+                (4, $crate::instructions::host::selfbalance_at);
+            BASEFEE => $crate::instructions::block_info::basefee, 2,
+                (4, $crate::instructions::block_info::basefee_at);
+            BLOBHASH => $crate::instructions::tx_info::blob_hash, 3,
+                (4, $crate::instructions::tx_info::blob_hash_at);
+            BLOBBASEFEE => $crate::instructions::block_info::blob_basefee, 2,
+                (4, $crate::instructions::block_info::blob_basefee_at);
             POP => $crate::instructions::stack::pop, 2,
                 (4, $crate::instructions::stack::pop_at);
             MLOAD => $crate::instructions::memory::mload, 3,
@@ -196,8 +220,10 @@ macro_rules! for_each_builtin_instruction {
                 (4, $crate::instructions::memory::mstore_at);
             MSTORE8 => $crate::instructions::memory::mstore8, 3,
                 (4, $crate::instructions::memory::mstore8_at);
-            SLOAD => $crate::instructions::host::sload, 0, 0;
-            SSTORE => $crate::instructions::host::sstore, 0, 0;
+            SLOAD => $crate::instructions::host::sload, 0,
+                (4, $crate::instructions::host::sload_at);
+            SSTORE => $crate::instructions::host::sstore, 0,
+                (4, $crate::instructions::host::sstore_at);
             JUMP => $crate::instructions::control::jump::<$fuse, _, _>, 8,
                 (3, $crate::instructions::control::jump_at::<$fuse, _, _>);
             JUMPI => $crate::instructions::control::jumpi::<$fuse, _, _>, 10,
@@ -205,10 +231,13 @@ macro_rules! for_each_builtin_instruction {
             PC => $crate::instructions::control::pc, 2, 1;
             MSIZE => $crate::instructions::memory::msize, 2,
                 (4, $crate::instructions::memory::msize_at);
-            GAS => $crate::instructions::system::gas, 2, 0;
+            GAS => $crate::instructions::system::gas, 2,
+                (4, $crate::instructions::system::gas_at);
             JUMPDEST => $crate::instructions::control::jumpdest, 1, 5;
-            TLOAD => $crate::instructions::host::tload, 100, 0;
-            TSTORE => $crate::instructions::host::tstore, 100, 0;
+            TLOAD => $crate::instructions::host::tload, 100,
+                (4, $crate::instructions::host::tload_at);
+            TSTORE => $crate::instructions::host::tstore, 100,
+                (4, $crate::instructions::host::tstore_at);
             MCOPY => $crate::instructions::memory::mcopy, 0, 0;
             PUSH0 => $crate::instructions::stack::push0, 2,
                 (4, $crate::instructions::stack::push0_at);

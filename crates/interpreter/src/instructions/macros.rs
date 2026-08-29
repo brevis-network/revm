@@ -263,6 +263,18 @@ macro_rules! push_at {
     };
 }
 
+/// The threaded-cursor form of [`require_non_staticcall`]. See [`popn_at`].
+#[macro_export]
+#[collapse_debuginfo(yes)]
+macro_rules! require_non_staticcall_at {
+    ($interpreter:expr, $sp:ident) => {
+        if $interpreter.runtime_flag.is_static() {
+            $interpreter.halt($crate::InstructionResult::StateChangeDuringStaticCall);
+            return $sp;
+        }
+    };
+}
+
 /// The threaded-cursor form of [`check`]. See [`popn_at`].
 #[macro_export]
 #[collapse_debuginfo(yes)]

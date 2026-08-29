@@ -11,19 +11,50 @@ use crate::InstructionContext;
 pub fn gasprice<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
 ) {
+    run_threaded!(context, gasprice_at)
+}
+
+/// [`gasprice`], threading the stack cursor.
+///
+/// The body lives here; the plain form above is this one with the cursor read out
+/// of the stack and written back, which is what the instruction *table* needs. See
+/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+#[inline(always)]
+#[allow(unused_mut)]
+pub fn gasprice_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+    mut sp: usize,
+) -> usize {
     //gas!(context.interpreter, gas::BASE);
-    push!(context.interpreter, context.host.effective_gas_price());
+    push_at!(context.interpreter, sp, context.host.effective_gas_price());
+    sp
 }
 
 /// Implements the ORIGIN instruction.
 ///
 /// Gets the execution origination address.
 pub fn origin<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContext<'_, H, WIRE>) {
+    run_threaded!(context, origin_at)
+}
+
+/// [`origin`], threading the stack cursor.
+///
+/// The body lives here; the plain form above is this one with the cursor read out
+/// of the stack and written back, which is what the instruction *table* needs. See
+/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+#[inline(always)]
+#[allow(unused_mut)]
+pub fn origin_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+    mut sp: usize,
+) -> usize {
     //gas!(context.interpreter, gas::BASE);
-    push!(
+    push_at!(
         context.interpreter,
+        sp,
         context.host.caller().into_word().into()
     );
+    sp
 }
 
 /// Implements the BLOBHASH instruction.
@@ -32,9 +63,24 @@ pub fn origin<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionCont
 pub fn blob_hash<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
 ) {
-    check!(context.interpreter, CANCUN);
+    run_threaded!(context, blob_hash_at)
+}
+
+/// [`blob_hash`], threading the stack cursor.
+///
+/// The body lives here; the plain form above is this one with the cursor read out
+/// of the stack and written back, which is what the instruction *table* needs. See
+/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+#[inline(always)]
+#[allow(unused_mut)]
+pub fn blob_hash_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+    mut sp: usize,
+) -> usize {
+    check_at!(context.interpreter, sp, CANCUN);
     //gas!(context.interpreter, gas::VERYLOW);
-    popn_top!([], index, context.interpreter);
+    popn_top_at!([], index, context.interpreter, sp);
     let i = as_usize_saturated!(index);
     *index = context.host.blob_hash(i).unwrap_or_default();
+    sp
 }

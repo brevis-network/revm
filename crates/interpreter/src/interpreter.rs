@@ -443,15 +443,32 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
         // stack, so that `ld`/`sd` pair is the single biggest repeated cost left in here.
         //
         // Arms tagged `(4, g)` -- and `(2, N)` and `(3, g)`, which thread the instruction
-        // pointer as well -- take the cursor by value and hand back the new one. Arms tagged
-        // `0` or `1` do not: they store the cursor before the call and read it back after,
-        // which costs them two instructions but keeps every opcode that reaches out to the
-        // host, to memory or to a frame action working off the real `Stack` length. `5` is
-        // the opcode that touches neither (`JUMPDEST`).
+        // pointer as well -- take the cursor by value and hand back the new one. That is
+        // everything hot: the arithmetic and bitwise opcodes, `POP`/`PUSH`/`DUP`/`SWAP`,
+        // `MLOAD`/`MSTORE`, `JUMP`/`JUMPI`, and the one-word opcodes that ask the host or the
+        // block for a value. `5` touches neither (`JUMPDEST`).
+        //
+        // Arms tagged `0` or `1` store the cursor before the call and read it back after,
+        // which costs them two instructions. What is left on those tags is the
+        // variable-length copies, `EXP`, `LOG0`..`LOG4` and everything that ends the frame
+        // (`STOP`, `RETURN`, `REVERT`, `CREATE`, the four calls, `SELFDESTRUCT`, `INVALID`) --
+        // about 40 K opcodes a block between them, and the ones that set a frame action are
+        // exactly the ones that must not run with a stale `Stack` length.
         //
         // Nothing between an instruction halting and the loop exit reads the stack, so the
         // halt paths inside the threaded arms do not write the cursor back; the single exit
         // below does it once for all of them. See `StackTr::sp`.
+        //
+        // Like the instruction-pointer threading below, this wants `-tail-dup-size=12` (see
+        // `build-guest.sh`), but unlike it, it pays either way. Measured on block 24006677:
+        //
+        //                    no flag      -tail-dup-size=12
+        //     no threading   431.35 M     420.88 M
+        //     threading      420.67 M     409.03 M
+        //
+        // i.e. -11.86 M with the flag and -10.68 M without it, with a -1.17 M interaction on
+        // top. `jr` in this function goes 198 -> 243, so the dispatch block is still
+        // duplicated into the arms rather than collapsing to one shared indirect branch.
         let mut sp = self.stack.sp();
         // The bump of `ip` lives in the arms, past the opcode read, rather than in the loop
         // header. In the header the backend schedules the `addi` ahead of the `lbu` and has to
@@ -536,8 +553,8 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
             }};
             // `(4, g)`: `g` takes the stack cursor by value and returns the new one, so the
             // opcode's `popn`/`push`/`top` never re-load `Stack`'s length. The instruction
-            // pointer is untouched. This is where the bulk of the arms are -- everything
-            // that only moves words on the stack, plus `MLOAD`/`MSTORE`/`MSTORE8`/`MSIZE`.
+            // pointer is untouched. This is where the bulk of the arms are; see the note on
+            // `sp` in the loop header for which opcodes are on it and which are not.
             ((4, $g:expr), $_f:expr) => {{
                 ip = unsafe { ip.add(1) };
                 sp = $g(
