@@ -402,12 +402,12 @@ pub fn sstore_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
         return sp;
     }
 
+    // The hard-fork revision is a per-block constant, so both `SSTORE` schedules are a
+    // single row of a table rather than a branch chain re-walked on every store.
+    let spec_row = gas::SSTORE_SPEC[spec_id as usize];
+
     // static gas
-    gas!(
-        context.interpreter,
-        gas::static_sstore_cost(context.interpreter.runtime_flag.spec_id()),
-        sp
-    );
+    gas!(context.interpreter, spec_row.static_cost as u64, sp);
 
     let state_load = if spec_id.is_enabled_in(BERLIN) {
         let skip_cold = context.interpreter.gas.remaining() < COLD_SLOAD_COST_ADDITIONAL;
@@ -433,22 +433,19 @@ pub fn sstore_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
         load
     };
 
+    // One classification of the storage transition drives both the dynamic gas and the
+    // refund, instead of two branch nests walking the same three words a second time.
+    let entry = gas::SSTORE_GAS[spec_id as usize][gas::sstore_status(&state_load.data) as usize];
+
     // dynamic gas
-    gas!(
-        context.interpreter,
-        gas::dyn_sstore_cost(
-            context.interpreter.runtime_flag.spec_id(),
-            &state_load.data,
-            state_load.is_cold
-        ),
-        sp
-    );
+    let mut dynamic_gas = entry.dyn_cost as u64;
+    if state_load.is_cold {
+        dynamic_gas += spec_row.cold_extra as u64;
+    }
+    gas!(context.interpreter, dynamic_gas, sp);
 
     // refund
-    context.interpreter.gas.record_refund(gas::sstore_refund(
-        context.interpreter.runtime_flag.spec_id(),
-        &state_load.data,
-    ));
+    context.interpreter.gas.record_refund(entry.refund as i64);
     sp
 }
 
