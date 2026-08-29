@@ -17,7 +17,7 @@ pub use runtime_flags::RuntimeFlags;
 pub(crate) use shared_memory::store_be_word;
 pub(crate) use shared_memory::{bswap64_shared, bswap_masks_shared, u256_from_be_aligned};
 pub use shared_memory::{num_words, resize_memory, SharedMemory};
-pub use stack::{Stack, STACK_LIMIT};
+pub use stack::{Stack, BYTE_LIMIT, STACK_LIMIT, WORD};
 
 // imports
 use crate::{
@@ -435,6 +435,24 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
         // single loop exit stores it (bumped past the opcode it speculatively fetched) so
         // that `end_dispatch` and a resumed frame see the right value.
         let mut ip = self.bytecode.ip();
+        // The stack cursor lives in a local for the whole loop too, for the same reason and
+        // with the same shape: `Stack`'s byte-scaled length sits behind the same `&mut
+        // Interpreter`, and the stack writes go through a pointer LLVM cannot prove disjoint
+        // from it, so every `popn`/`push`/`top` re-loads it and stores it back. The loop
+        // dispatches 8.07 M opcodes on block 24006677 and almost all of them touch the
+        // stack, so that `ld`/`sd` pair is the single biggest repeated cost left in here.
+        //
+        // Arms tagged `(4, g)` -- and `(2, N)` and `(3, g)`, which thread the instruction
+        // pointer as well -- take the cursor by value and hand back the new one. Arms tagged
+        // `0` or `1` do not: they store the cursor before the call and read it back after,
+        // which costs them two instructions but keeps every opcode that reaches out to the
+        // host, to memory or to a frame action working off the real `Stack` length. `5` is
+        // the opcode that touches neither (`JUMPDEST`).
+        //
+        // Nothing between an instruction halting and the loop exit reads the stack, so the
+        // halt paths inside the threaded arms do not write the cursor back; the single exit
+        // below does it once for all of them. See `StackTr::sp`.
+        let mut sp = self.stack.sp();
         // The bump of `ip` lives in the arms, past the opcode read, rather than in the loop
         // header. In the header the backend schedules the `addi` ahead of the `lbu` and has to
         // copy the pre-bump pointer into a second register; from the arm it is an in-place
@@ -442,19 +460,34 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
         macro_rules! execute {
             (0, $f:expr) => {{
                 ip = unsafe { ip.add(1) };
+                // SAFETY: `sp` is this stack's cursor, threaded here from the loop header.
+                unsafe { self.stack.set_sp(sp) };
                 $f(InstructionContext {
                     interpreter: self,
                     host,
                 });
+                sp = self.stack.sp();
             }};
             (1, $f:expr) => {{
                 ip = unsafe { ip.add(1) };
                 self.bytecode.set_ip(ip);
+                // SAFETY: as above.
+                unsafe { self.stack.set_sp(sp) };
                 $f(InstructionContext {
                     interpreter: self,
                     host,
                 });
+                sp = self.stack.sp();
                 ip = self.bytecode.ip();
+            }};
+            // Touches neither the instruction pointer nor the stack, so neither has to be
+            // handed over. `JUMPDEST` only.
+            (5, $f:expr) => {{
+                ip = unsafe { ip.add(1) };
+                $f(InstructionContext {
+                    interpreter: self,
+                    host,
+                });
             }};
             // `PUSH1`..`PUSH32`. Tagged `(2, N)` rather than `1` so that the immediate is read
             // straight from the loop-local instruction pointer. Going through
@@ -490,19 +523,38 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
             // tag these two back to `1`.
             ((3, $g:expr), $_f:expr) => {{
                 ip = unsafe { ip.add(1) };
-                ip = $g(
+                let (next_ip, next_sp) = $g(
                     InstructionContext {
                         interpreter: self,
                         host,
                     },
                     ip,
+                    sp,
+                );
+                ip = next_ip;
+                sp = next_sp;
+            }};
+            // `(4, g)`: `g` takes the stack cursor by value and returns the new one, so the
+            // opcode's `popn`/`push`/`top` never re-load `Stack`'s length. The instruction
+            // pointer is untouched. This is where the bulk of the arms are -- everything
+            // that only moves words on the stack, plus `MLOAD`/`MSTORE`/`MSTORE8`/`MSIZE`.
+            ((4, $g:expr), $_f:expr) => {{
+                ip = unsafe { ip.add(1) };
+                sp = $g(
+                    InstructionContext {
+                        interpreter: self,
+                        host,
+                    },
+                    sp,
                 );
             }};
             ((2, $n:literal), $_f:expr) => {{
                 // SAFETY: same padding invariant `ExtBytecode::read_slice` relies on: the
                 // analysis pads the bytecode past the last opcode, so the $n immediate bytes
                 // of a trailing `PUSH` are readable.
-                if unsafe { self.stack.push_slice_const::<$n>(ip.add(1)) } {
+                if sp != BYTE_LIMIT {
+                    unsafe { self.stack.push_slice_const_at::<$n>(sp, ip.add(1)) };
+                    sp += WORD;
                     ip = unsafe { ip.add(1 + $n) };
                 } else {
                     // `push` leaves the instruction pointer just past the opcode on
@@ -579,6 +631,13 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
             };
         }
         crate::for_each_builtin_instruction!(dispatch_switch, true);
+        // The one write-back of the threaded cursor, for every path that leaves the loop:
+        // the arms hand it from one to the next and never store it, and the halts inside
+        // them only set an action.
+        //
+        // SAFETY: `sp` is this stack's own cursor, threaded through the arms since the loop
+        // header read it.
+        unsafe { self.stack.set_sp(sp) };
         self.end_dispatch();
         self.take_next_action()
     }

@@ -312,6 +312,148 @@ pub trait StackTr {
         self.popn_top().map(|([], top)| top)
     }
 
+    /// The **threaded stack cursor**: the byte-scaled length of the stack.
+    ///
+    /// [`Interpreter::run_plain`](crate::Interpreter::run_plain) keeps this in a loop-local
+    /// for the whole dispatch loop and hands it to the `*_at` operations below, instead of
+    /// letting each of them re-load it out of the stack and store it back. The stack writes
+    /// go through a pointer LLVM cannot prove disjoint from the length field, so the reload
+    /// is one it can not remove: on block 24006677 the `ld`/`sd` pair is on the order of two
+    /// retired instructions per dispatched opcode, and the loop dispatches 8.07 M of them.
+    ///
+    /// The cursor is scaled to bytes for the same reason `Stack::byte_len` is; see the note
+    /// there. An arm updates it by whole `size_of::<U256>()` steps and hands the new value to
+    /// the next arm, and the single loop exit writes it back with [`StackTr::set_sp`].
+    ///
+    /// # Implementing
+    ///
+    /// The default bodies of the `*_at` methods **ignore the cursor** and go through the
+    /// ordinary length-carrying operations. That is always correct, because those keep the
+    /// stack's own length in step, so the cursor an arm computes stays equal to `sp()` and
+    /// `set_sp` has nothing to do. An implementation that wants the win overrides all of
+    /// them together, as [`Stack`](crate::interpreter::Stack) does; overriding only some is
+    /// what would break, so they are documented as one group.
+    #[inline]
+    fn sp(&self) -> usize {
+        self.len() * core::mem::size_of::<U256>()
+    }
+
+    /// Writes the threaded cursor back into the stack, so that everything reached from
+    /// outside the dispatch loop sees the right length again.
+    ///
+    /// # Safety
+    ///
+    /// `sp` must be a cursor of this stack: [`StackTr::sp`] plus the net effect of the
+    /// `*_at` calls made since, and every one of those calls' own preconditions met.
+    #[inline]
+    unsafe fn set_sp(&mut self, sp: usize) {
+        let _ = sp;
+    }
+
+    /// Pops `N` values at the cursor. `[0]` is the topmost. New cursor is `sp - N * 32`.
+    ///
+    /// # Safety
+    ///
+    /// `sp` must be the current cursor, and at least `N * 32`.
+    #[must_use]
+    #[inline]
+    unsafe fn popn_at<const N: usize>(&mut self, sp: usize) -> [U256; N] {
+        let _ = sp;
+        // SAFETY: the caller checked the depth.
+        unsafe { self.popn::<N>().unwrap_unchecked() }
+    }
+
+    /// Pops `N` values at the cursor and returns the word that becomes the new top.
+    /// New cursor is `sp - N * 32`.
+    ///
+    /// # Safety
+    ///
+    /// `sp` must be the current cursor, and at least `(N + 1) * 32`.
+    #[must_use]
+    #[inline]
+    unsafe fn popn_top_at<const N: usize>(&mut self, sp: usize) -> ([U256; N], &mut U256) {
+        let _ = sp;
+        // SAFETY: the caller checked the depth.
+        unsafe { self.popn_top::<N>().unwrap_unchecked() }
+    }
+
+    /// The topmost word at the cursor. The cursor does not move.
+    ///
+    /// # Safety
+    ///
+    /// `sp` must be the current cursor, and at least `32`.
+    #[must_use]
+    #[inline]
+    unsafe fn top_at(&mut self, sp: usize) -> &mut U256 {
+        let _ = sp;
+        // SAFETY: the caller checked the depth.
+        unsafe { self.top().unwrap_unchecked() }
+    }
+
+    /// A pointer to the `depth`-th word from the top at the cursor (`0` is the topmost).
+    /// The cursor does not move.
+    ///
+    /// # Safety
+    ///
+    /// `sp` must be the current cursor, and at least `(depth + 1) * 32`.
+    #[must_use]
+    #[inline]
+    unsafe fn peek_at(&self, sp: usize, depth: usize) -> *const U256 {
+        let _ = sp;
+        let data = self.data();
+        // SAFETY: the caller checked the depth.
+        unsafe { data.as_ptr().add(data.len() - 1 - depth) }
+    }
+
+    /// Writes `value` at the cursor. New cursor is `sp + 32`.
+    ///
+    /// # Safety
+    ///
+    /// `sp` must be the current cursor, and below the stack limit in bytes.
+    #[inline]
+    unsafe fn push_at(&mut self, sp: usize, value: U256) {
+        let _ = sp;
+        let _ = self.push(value);
+    }
+
+    /// Copies the `n`-th word from the top to the cursor. New cursor is `sp + 32`.
+    ///
+    /// # Safety
+    ///
+    /// `sp` must be the current cursor, at least `n * 32`, and below the stack limit in
+    /// bytes. `n` must be non-zero.
+    #[inline]
+    unsafe fn dup_at(&mut self, sp: usize, n: usize) {
+        let _ = sp;
+        let _ = self.dup(n);
+    }
+
+    /// Exchanges the `n`-th and `(n + m)`-th words from the top. The cursor does not move.
+    ///
+    /// # Safety
+    ///
+    /// `sp` must be the current cursor and greater than `(n + m) * 32`. `m` must be
+    /// non-zero.
+    #[inline]
+    unsafe fn exchange_at(&mut self, sp: usize, n: usize, m: usize) {
+        let _ = sp;
+        let _ = self.exchange(n, m);
+    }
+
+    /// Pushes the `N` big-endian bytes at `src` as one word at the cursor, zero-padded on
+    /// the left. New cursor is `sp + 32`.
+    ///
+    /// # Safety
+    ///
+    /// `sp` must be the current cursor and below the stack limit in bytes. `src` must be
+    /// valid for reads of `N` bytes, and `N` must be in `1..=32`.
+    #[inline]
+    unsafe fn push_slice_const_at<const N: usize>(&mut self, sp: usize, src: *const u8) {
+        let _ = sp;
+        // SAFETY: forwarded from the caller's contract.
+        let _ = unsafe { self.push_slice_const::<N>(src) };
+    }
+
     /// Pops one value from the stack.
     #[must_use]
     fn pop(&mut self) -> Option<U256> {

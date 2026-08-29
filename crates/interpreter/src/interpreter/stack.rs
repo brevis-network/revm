@@ -9,10 +9,10 @@ use super::StackTr;
 pub const STACK_LIMIT: usize = 1024;
 
 /// Size of one stack word in bytes.
-const WORD: usize = core::mem::size_of::<U256>();
+pub const WORD: usize = core::mem::size_of::<U256>();
 
 /// [`STACK_LIMIT`] expressed in bytes, i.e. the largest legal [`Stack::byte_len`].
-const BYTE_LIMIT: usize = STACK_LIMIT * WORD;
+pub const BYTE_LIMIT: usize = STACK_LIMIT * WORD;
 
 /// EVM stack with [STACK_LIMIT] capacity of words.
 ///
@@ -188,6 +188,148 @@ impl StackTr for Stack {
     unsafe fn push_slice_const<const N: usize>(&mut self, src: *const u8) -> bool {
         unsafe { self.push_slice_const::<N>(src) }
     }
+
+    // The threaded cursor. See `StackTr` for the contract and `Interpreter::run_plain` for
+    // where the cursor comes from; here it is exactly `byte_len`, so every one of these is
+    // the ordinary operation with the load of `byte_len` (and, where the length changes,
+    // the store back) taken out.
+
+    #[inline(always)]
+    fn sp(&self) -> usize {
+        self.byte_len()
+    }
+
+    #[inline(always)]
+    unsafe fn set_sp(&mut self, sp: usize) {
+        debug_assert!(sp % WORD == 0 && sp <= BYTE_LIMIT);
+        self.byte_len = sp;
+    }
+
+    #[inline(always)]
+    unsafe fn popn_at<const N: usize>(&mut self, sp: usize) -> [U256; N] {
+        // SAFETY: `sp` is a live cursor and at least `N * WORD` by the caller's contract.
+        let end = unsafe { self.end_at(sp) };
+        // `[0]` is the topmost word, so the array is the popped range reversed.
+        core::array::from_fn(|i| unsafe { end.sub(1 + i).read() })
+    }
+
+    #[inline(always)]
+    unsafe fn popn_top_at<const N: usize>(&mut self, sp: usize) -> ([U256; N], &mut U256) {
+        // SAFETY: `sp` is a live cursor and at least `(N + 1) * WORD`.
+        let end = unsafe { self.end_at(sp) };
+        let values = core::array::from_fn(|i| unsafe { end.sub(1 + i).read() });
+        (values, unsafe { &mut *end.sub(N + 1) })
+    }
+
+    #[inline(always)]
+    unsafe fn top_at(&mut self, sp: usize) -> &mut U256 {
+        // SAFETY: `sp` is a live cursor and at least `WORD`.
+        unsafe { &mut *self.end_at(sp).sub(1) }
+    }
+
+    #[inline(always)]
+    unsafe fn peek_at(&self, sp: usize, depth: usize) -> *const U256 {
+        // SAFETY: `sp` is a live cursor and at least `(depth + 1) * WORD`.
+        unsafe {
+            self.base()
+                .cast::<u8>()
+                .add(sp)
+                .cast::<U256>()
+                .sub(1 + depth)
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn push_at(&mut self, sp: usize, value: U256) {
+        // SAFETY: `sp` is a live cursor below `BYTE_LIMIT`, so one more word fits.
+        unsafe { self.end_at(sp).write(value) };
+    }
+
+    #[inline(always)]
+    unsafe fn dup_at(&mut self, sp: usize, n: usize) {
+        // SAFETY: `n * WORD <= sp < BYTE_LIMIT` by the caller's contract.
+        unsafe {
+            let end = self.end_at(sp);
+            ptr::copy_nonoverlapping(end.sub(n), end, 1);
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn exchange_at(&mut self, sp: usize, n: usize, m: usize) {
+        // SAFETY: `(n + m + 1) * WORD <= sp` by the caller's contract, and `m > 0`, so the
+        // two words are in bounds and distinct.
+        unsafe {
+            let top = self.end_at(sp).sub(1);
+            swap_words(top.sub(n), top.sub(n + m));
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn push_slice_const_at<const N: usize>(&mut self, sp: usize, src: *const u8) {
+        // SAFETY: `sp < BYTE_LIMIT`, and `N` bytes at `src` are readable.
+        unsafe { write_be_word::<N>(self.end_at(sp), src) };
+    }
+}
+
+/// Writes the `N` big-endian bytes at `src` as one little-endian-limbed word at `dst`,
+/// zero-padded on the left.
+///
+/// Shared by [`Stack::push_slice_const`] and [`StackTr::push_slice_const_at`]. The limbs are
+/// built with shifts and ors rather than `u64::from_be_bytes`, because this target has no
+/// `rev8` and the byte reversal is ~19 instructions per limb.
+///
+/// # Safety
+///
+/// `dst` must be writable for one word, `src` readable for `N` bytes, and `N` in `1..=32`.
+#[inline(always)]
+unsafe fn write_be_word<const N: usize>(dst: *mut U256, src: *const u8) {
+    debug_assert!(N >= 1 && N <= 32);
+    let dst = dst.cast::<u64>();
+    let mut k = 0;
+    while k < 4 {
+        // Limb `k` holds bytes `N-1-8k ..= N-8k-8` of the big-endian value.
+        let mut v = 0u64;
+        let mut j = 0;
+        while j < 8 {
+            let from_end = k * 8 + j;
+            if from_end < N {
+                v |= (unsafe { *src.add(N - 1 - from_end) } as u64) << (8 * j);
+            }
+            j += 1;
+        }
+        unsafe { dst.add(k).write(v) };
+        k += 1;
+    }
+}
+
+/// Swaps two distinct, live stack words.
+///
+/// Four typed limb moves, not `ptr::swap_nonoverlapping`: that swaps through `*mut u8`,
+/// which loses `U256`'s 8-byte alignment. On a target without misaligned scalar memory
+/// access (pico's `riscv64im-pico-zkvm-elf`) LLVM then expands the 32-byte swap into 64
+/// `lbu` + 64 `sb`. Measured on block 24006677, that made `Stack::exchange` 140.3 M of
+/// 1018.2 M retired instructions, 91 % of them byte loads/stores. Moving the four limbs by
+/// hand also avoids the 32-byte frame slot a `U256` temporary reserves.
+///
+/// # Safety
+///
+/// Both pointers must be live, aligned stack words, and must not overlap.
+#[inline(always)]
+unsafe fn swap_words(p1: *mut U256, p2: *mut U256) {
+    unsafe {
+        let a = p1.cast::<u64>();
+        let b = p2.cast::<u64>();
+        let (a0, a1, a2, a3) = (a.read(), a.add(1).read(), a.add(2).read(), a.add(3).read());
+        let (b0, b1, b2, b3) = (b.read(), b.add(1).read(), b.add(2).read(), b.add(3).read());
+        a.write(b0);
+        a.add(1).write(b1);
+        a.add(2).write(b2);
+        a.add(3).write(b3);
+        b.write(a0);
+        b.add(1).write(a1);
+        b.add(2).write(a2);
+        b.add(3).write(a3);
+    }
 }
 
 impl Stack {
@@ -254,6 +396,21 @@ impl Stack {
                 .add(self.byte_len())
                 .cast::<U256>()
         }
+    }
+
+    /// Pointer one past the topmost word, for a cursor the caller is carrying itself.
+    ///
+    /// Same `add` as [`Stack::top_mut`], but off the caller's register instead of a
+    /// re-loaded `byte_len`.
+    ///
+    /// # Safety
+    ///
+    /// `sp` must be a live cursor, i.e. a multiple of [`WORD`] no greater than
+    /// [`BYTE_LIMIT`].
+    #[inline(always)]
+    unsafe fn end_at(&mut self, sp: usize) -> *mut U256 {
+        // SAFETY: within the inline buffer by the caller's contract.
+        unsafe { self.base_mut().cast::<u8>().add(sp).cast::<U256>() }
     }
 
     /// Returns the length of the stack in words.
@@ -458,31 +615,7 @@ impl Stack {
         // SAFETY: `n` and `n_m` are checked to be within bounds, and they don't overlap.
         unsafe {
             let top = self.top_mut().sub(1);
-            let (p1, p2) = (top.sub(n), top.sub(n_m_index));
-            // Three typed moves, not `ptr::swap_nonoverlapping`: that swaps through
-            // `*mut u8`, which loses `U256`'s 8-byte alignment. On a target without
-            // misaligned scalar memory access (pico's `riscv64im-pico-zkvm-elf`) LLVM then
-            // expands the 32-byte swap into 64 `lbu` + 64 `sb`. Measured on block 24006677,
-            // that made this function 140.3 M of 1018.2 M retired instructions, 91 % of them
-            // byte loads/stores. Reading and writing `U256` keeps the alignment, so the same
-            // swap is 4 `ld` + 4 `sd`. The pointers are known not to overlap, so the single
-            // temporary is the whole cost.
-            // Swapping through a `U256` temporary makes LLVM reserve a 32-byte frame slot
-            // that it then promotes away, leaving a dead `addi sp` pair (2 of the 25
-            // retired instructions of `SWAP1`). Moving the four limbs by hand keeps the
-            // 8 `ld` + 8 `sd` and drops the frame.
-            let a = p1.cast::<u64>();
-            let b = p2.cast::<u64>();
-            let (a0, a1, a2, a3) = (a.read(), a.add(1).read(), a.add(2).read(), a.add(3).read());
-            let (b0, b1, b2, b3) = (b.read(), b.add(1).read(), b.add(2).read(), b.add(3).read());
-            a.write(b0);
-            a.add(1).write(b1);
-            a.add(2).write(b2);
-            a.add(3).write(b3);
-            b.write(a0);
-            b.add(1).write(a1);
-            b.add(2).write(a2);
-            b.add(3).write(a3);
+            swap_words(top.sub(n), top.sub(n_m_index));
         }
         true
     }
@@ -509,23 +642,9 @@ impl Stack {
         // SAFETY: capacity is at least `STACK_LIMIT` and the length is below it, so one more
         // word fits; `N` bytes at `src` are readable by the caller's contract.
         unsafe {
-            let dst = self.top_mut().cast::<u64>();
+            let dst = self.top_mut();
             self.byte_len += WORD;
-            let mut k = 0;
-            while k < 4 {
-                // Limb `k` holds bytes `N-1-8k ..= N-8k-8` of the big-endian value.
-                let mut v = 0u64;
-                let mut j = 0;
-                while j < 8 {
-                    let from_end = k * 8 + j;
-                    if from_end < N {
-                        v |= (*src.add(N - 1 - from_end) as u64) << (8 * j);
-                    }
-                    j += 1;
-                }
-                dst.add(k).write(v);
-                k += 1;
-            }
+            write_be_word::<N>(dst, src);
         }
         true
     }

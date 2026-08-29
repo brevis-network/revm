@@ -16,31 +16,40 @@ pub fn jump<const FUSE_JUMPDEST: bool, ITy: InterpreterTypes, H: ?Sized>(
 ) {
     let InstructionContext { interpreter, host } = context;
     let ip = interpreter.bytecode.ip();
+    let sp = interpreter.stack.sp();
     // `jump_at` returns `ip` unchanged when it did not jump.
-    let next = jump_at::<FUSE_JUMPDEST, _, _>(
+    let (next, sp) = jump_at::<FUSE_JUMPDEST, _, _>(
         InstructionContext {
             interpreter: &mut *interpreter,
             host,
         },
         ip,
+        sp,
     );
+    // SAFETY: `sp` came back from a threaded instruction handed this stack's own cursor.
+    unsafe { interpreter.stack.set_sp(sp) };
     interpreter.bytecode.set_ip(next);
 }
 
-/// [`jump`], but returning the instruction pointer to continue at instead of storing it.
+/// [`jump`], but taking and returning the instruction pointer and the stack cursor instead
+/// of reading them out of the interpreter and storing them back.
 ///
 /// `ip` is the pointer just past the `JUMP` opcode, and is what comes back when the jump is
 /// not taken or the interpreter halted. The switch dispatch of `Interpreter::run_plain` keeps
-/// the instruction pointer in a local, so this form saves it a store before the call, and a
-/// store plus a reload after it.
+/// both the instruction pointer and the stack cursor in locals, so this form saves each of
+/// them a store before the call, and a store plus a reload after it.
 #[inline(always)]
 pub fn jump_at<const FUSE_JUMPDEST: bool, ITy: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, ITy>,
     ip: *const u8,
-) -> *const u8 {
+    mut sp: usize,
+) -> (*const u8, usize) {
     //gas!(context.interpreter, gas::MID);
-    popn!([target], context.interpreter, ip);
-    jump_inner::<FUSE_JUMPDEST, _>(context.interpreter, target, ip)
+    popn_at!([target], context.interpreter, sp, (ip, sp));
+    (
+        jump_inner::<FUSE_JUMPDEST, _>(context.interpreter, target, ip),
+        sp,
+    )
 }
 
 /// Implements the JUMPI instruction.
@@ -52,13 +61,17 @@ pub fn jumpi<const FUSE_JUMPDEST: bool, WIRE: InterpreterTypes, H: ?Sized>(
 ) {
     let InstructionContext { interpreter, host } = context;
     let ip = interpreter.bytecode.ip();
-    let next = jumpi_at::<FUSE_JUMPDEST, _, _>(
+    let sp = interpreter.stack.sp();
+    let (next, sp) = jumpi_at::<FUSE_JUMPDEST, _, _>(
         InstructionContext {
             interpreter: &mut *interpreter,
             host,
         },
         ip,
+        sp,
     );
+    // SAFETY: `sp` came back from a threaded instruction handed this stack's own cursor.
+    unsafe { interpreter.stack.set_sp(sp) };
     interpreter.bytecode.set_ip(next);
 }
 
@@ -67,14 +80,18 @@ pub fn jumpi<const FUSE_JUMPDEST: bool, WIRE: InterpreterTypes, H: ?Sized>(
 pub fn jumpi_at<const FUSE_JUMPDEST: bool, WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     ip: *const u8,
-) -> *const u8 {
+    mut sp: usize,
+) -> (*const u8, usize) {
     //gas!(context.interpreter, gas::HIGH);
-    popn!([target, cond], context.interpreter, ip);
+    popn_at!([target, cond], context.interpreter, sp, (ip, sp));
 
     if super::u256_is_zero(&cond) {
-        return ip;
+        return (ip, sp);
     }
-    jump_inner::<FUSE_JUMPDEST, _>(context.interpreter, target, ip)
+    (
+        jump_inner::<FUSE_JUMPDEST, _>(context.interpreter, target, ip),
+        sp,
+    )
 }
 
 /// Internal helper function for jump operations.

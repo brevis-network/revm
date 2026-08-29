@@ -191,6 +191,119 @@ macro_rules! popn_top {
     };
 }
 
+/// The threaded-cursor form of [`popn`].
+///
+/// `$sp` is the loop-local stack cursor (see [`StackTr::sp`](crate::interpreter_types::StackTr::sp))
+/// and is updated in place; the enclosing function returns it, so the underflow exit returns
+/// the cursor **unchanged** -- the operands are still on the stack, which is what the
+/// non-threaded form leaves behind too.
+///
+/// The cursor is not written back before the halt. Nothing between an instruction halting and
+/// the single loop exit of `Interpreter::run_plain` reads the stack: `halt_*` only sets an
+/// action and poisons the gas counter, and the exit is what stores the cursor.
+#[macro_export]
+#[collapse_debuginfo(yes)]
+macro_rules! popn_at {
+    ([ $($x:ident),* ], $interpreter:expr, $sp:ident) => {
+        if $sp < ($crate::_count!($($x)*)) * $crate::interpreter::WORD {
+            $interpreter.halt_underflow();
+            return $sp;
+        }
+        // SAFETY: depth checked above.
+        let [$( $x ),*] = unsafe {
+            $interpreter.stack.popn_at::<{ $crate::_count!($($x)*) }>($sp)
+        };
+        $sp -= ($crate::_count!($($x)*)) * $crate::interpreter::WORD;
+    };
+    // `$ret` for the instructions that thread the instruction pointer as well and so return
+    // a pair: the cursor in it is the one *before* the pop, which is right -- the operands
+    // are still on the stack.
+    ([ $($x:ident),* ], $interpreter:expr, $sp:ident, $ret:expr) => {
+        if $sp < ($crate::_count!($($x)*)) * $crate::interpreter::WORD {
+            $interpreter.halt_underflow();
+            return $ret;
+        }
+        // SAFETY: depth checked above.
+        let [$( $x ),*] = unsafe {
+            $interpreter.stack.popn_at::<{ $crate::_count!($($x)*) }>($sp)
+        };
+        $sp -= ($crate::_count!($($x)*)) * $crate::interpreter::WORD;
+    };
+}
+
+/// The threaded-cursor form of [`popn_top`]. See [`popn_at`].
+#[macro_export]
+#[collapse_debuginfo(yes)]
+macro_rules! popn_top_at {
+    ([ $($x:ident),* ], $top:ident, $interpreter:expr, $sp:ident) => {
+        if $sp < (1 + $crate::_count!($($x)*)) * $crate::interpreter::WORD {
+            $interpreter.halt_underflow();
+            return $sp;
+        }
+        // SAFETY: depth checked above.
+        let ([$( $x ),*], $top) = unsafe {
+            $interpreter.stack.popn_top_at::<{ $crate::_count!($($x)*) }>($sp)
+        };
+        $sp -= ($crate::_count!($($x)*)) * $crate::interpreter::WORD;
+    };
+}
+
+/// The threaded-cursor form of [`push`]. See [`popn_at`].
+#[macro_export]
+#[collapse_debuginfo(yes)]
+macro_rules! push_at {
+    ($interpreter:expr, $sp:ident, $x:expr) => {
+        if $sp == $crate::interpreter::BYTE_LIMIT {
+            $interpreter.halt_overflow();
+            return $sp;
+        }
+        // SAFETY: room checked above.
+        unsafe { $interpreter.stack.push_at($sp, $x) };
+        $sp += $crate::interpreter::WORD;
+    };
+}
+
+/// The threaded-cursor form of [`check`]. See [`popn_at`].
+#[macro_export]
+#[collapse_debuginfo(yes)]
+macro_rules! check_at {
+    ($interpreter:expr, $sp:ident, $min:ident) => {
+        if !$interpreter
+            .runtime_flag
+            .spec_id()
+            .is_enabled_in(primitives::hardfork::SpecId::$min)
+        {
+            $interpreter.halt_not_activated();
+            return $sp;
+        }
+    };
+}
+
+/// Runs a threaded-cursor instruction as an ordinary one: read the cursor out of the stack,
+/// hand it over, write back what comes out.
+///
+/// This is what the instruction *table* entry of a threaded opcode is, so that the two forms
+/// can not drift apart -- `Interpreter::step` and a custom table keep working, and the body
+/// is written once. Only the switch dispatch of `Interpreter::run_plain` gets the threading.
+#[macro_export]
+#[collapse_debuginfo(yes)]
+macro_rules! run_threaded {
+    ($context:expr, $f:expr) => {{
+        let $crate::InstructionContext { interpreter, host } = $context;
+        let sp = interpreter.stack.sp();
+        let sp = $f(
+            $crate::InstructionContext {
+                interpreter: &mut *interpreter,
+                host,
+            },
+            sp,
+        );
+        // SAFETY: `sp` came back from a threaded instruction that was handed this stack's
+        // own cursor.
+        unsafe { interpreter.stack.set_sp(sp) };
+    }};
+}
+
 /// Pushes a `B256` value onto the stack. Fails the instruction if the stack is full.
 #[macro_export]
 #[collapse_debuginfo(yes)]
