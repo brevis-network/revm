@@ -191,7 +191,55 @@ macro_rules! popn_top {
     };
 }
 
-/// The threaded-cursor form of [`popn`].
+/// Publishes the threaded gas counter back into `Interpreter::gas`.
+///
+/// The dispatch loop of `Interpreter::run_plain` keeps `gas.remaining` in a register and
+/// only the *static* charges are applied to it, so while a threaded instruction is running
+/// the field itself is stale -- too high by everything charged since the last
+/// synchronisation. Every path that lets the counter be *observed* has to publish it first:
+/// a `halt_*` (which copies `Gas` into the action and stashes `remaining` for
+/// `Interpreter::take_next_action` to restore), a `set_action`, or a body that charges
+/// through `gas!`/`resize_memory!` and so needs the field to be the truth.
+///
+/// See the note on `rem` in `Interpreter::run_plain` for the whole invariant.
+#[macro_export]
+#[collapse_debuginfo(yes)]
+macro_rules! sync_gas_at {
+    ($interpreter:expr, $rem:expr) => {
+        $interpreter.gas.set_remaining($rem)
+    };
+}
+
+/// Halts from inside a threaded instruction and hands the dispatch loop its exit.
+///
+/// Publishes the threaded counter (see [`sync_gas_at`]) so that `$halt` copies and stashes
+/// the true `remaining`, runs `$halt`, and evaluates to `u64::MAX`, which the instruction has
+/// to *return*. The loop tests the register and never re-reads `Interpreter::gas`, so a halt
+/// that poisoned only the field would leave it spinning: this is the one thing gas needs that
+/// the threaded stack cursor does not, because the poisoned counter *is* the loop exit.
+///
+/// Dropping the publish would in fact be sound: every halt reachable from a threaded body is
+/// an *exceptional* one, and both `Frame::return_result` and `Handler::last_frame_result` hand
+/// gas back only to a result that `is_ok_or_revert()` and spend the whole limit otherwise, so
+/// the `remaining` in the action is never read. It is kept because it costs nothing -- 12.6 K
+/// retired instructions on block 24006677, i.e. noise -- and it is the reading that stays
+/// right if a non-exceptional halt is ever added here.
+///
+/// That number is regime-dependent, which is worth knowing before trusting it again: while
+/// `JUMP`/`JUMPI` were threaded too (see the note on `rem` in `Interpreter::run_plain`) the
+/// publish was worth *-1.3 M*, because these cold blocks are tail-merged across the ~150 arms
+/// and the store then pinned the counter to one fixed register at every branch into them.
+#[macro_export]
+#[collapse_debuginfo(yes)]
+macro_rules! poison_at {
+    ($interpreter:expr, $rem:expr, $halt:expr) => {{
+        $crate::sync_gas_at!($interpreter, $rem);
+        $halt;
+        u64::MAX
+    }};
+}
+
+/// The threaded form of [`popn`].
 ///
 /// `$sp` is the loop-local stack cursor (see [`StackTr::sp`](crate::interpreter_types::StackTr::sp))
 /// and is updated in place; the enclosing function returns it, so the underflow exit returns
@@ -199,15 +247,16 @@ macro_rules! popn_top {
 /// non-threaded form leaves behind too.
 ///
 /// The cursor is not written back before the halt. Nothing between an instruction halting and
-/// the single loop exit of `Interpreter::run_plain` reads the stack: `halt_*` only sets an
-/// action and poisons the gas counter, and the exit is what stores the cursor.
+/// the single loop exit of `Interpreter::run_plain` reads the stack, and the exit is what
+/// stores the cursor. `$rem`, the loop-local gas counter, is the opposite: it is published
+/// into `Interpreter::gas` for the halt to copy and stash, and comes back poisoned, because
+/// the poisoned counter is what ends the loop.
 #[macro_export]
 #[collapse_debuginfo(yes)]
 macro_rules! popn_at {
-    ([ $($x:ident),* ], $interpreter:expr, $sp:ident) => {
+    ([ $($x:ident),* ], $interpreter:expr, $sp:ident, $rem:ident) => {
         if $sp < ($crate::_count!($($x)*)) * $crate::interpreter::WORD {
-            $interpreter.halt_underflow();
-            return $sp;
+            return ($sp, $crate::poison_at!($interpreter, $rem, $interpreter.halt_underflow()));
         }
         // SAFETY: depth checked above.
         let [$( $x ),*] = unsafe {
@@ -215,9 +264,10 @@ macro_rules! popn_at {
         };
         $sp -= ($crate::_count!($($x)*)) * $crate::interpreter::WORD;
     };
-    // `$ret` for the instructions that thread the instruction pointer as well and so return
-    // a pair: the cursor in it is the one *before* the pop, which is right -- the operands
-    // are still on the stack.
+    // `$ret` for `JUMP`/`JUMPI`, which thread the instruction pointer and the cursor but not
+    // the gas counter (see the note on `rem` in `Interpreter::run_plain`), so they return a
+    // pair and there is nothing to publish. The cursor in `$ret` is the one *before* the pop,
+    // which is right -- the operands are still on the stack.
     ([ $($x:ident),* ], $interpreter:expr, $sp:ident, $ret:expr) => {
         if $sp < ($crate::_count!($($x)*)) * $crate::interpreter::WORD {
             $interpreter.halt_underflow();
@@ -231,14 +281,13 @@ macro_rules! popn_at {
     };
 }
 
-/// The threaded-cursor form of [`popn_top`]. See [`popn_at`].
+/// The threaded form of [`popn_top`]. See [`popn_at`].
 #[macro_export]
 #[collapse_debuginfo(yes)]
 macro_rules! popn_top_at {
-    ([ $($x:ident),* ], $top:ident, $interpreter:expr, $sp:ident) => {
+    ([ $($x:ident),* ], $top:ident, $interpreter:expr, $sp:ident, $rem:ident) => {
         if $sp < (1 + $crate::_count!($($x)*)) * $crate::interpreter::WORD {
-            $interpreter.halt_underflow();
-            return $sp;
+            return ($sp, $crate::poison_at!($interpreter, $rem, $interpreter.halt_underflow()));
         }
         // SAFETY: depth checked above.
         let ([$( $x ),*], $top) = unsafe {
@@ -248,14 +297,13 @@ macro_rules! popn_top_at {
     };
 }
 
-/// The threaded-cursor form of [`push`]. See [`popn_at`].
+/// The threaded form of [`push`]. See [`popn_at`].
 #[macro_export]
 #[collapse_debuginfo(yes)]
 macro_rules! push_at {
-    ($interpreter:expr, $sp:ident, $x:expr) => {
+    ($interpreter:expr, $sp:ident, $rem:ident, $x:expr) => {
         if $sp == $crate::interpreter::BYTE_LIMIT {
-            $interpreter.halt_overflow();
-            return $sp;
+            return ($sp, $crate::poison_at!($interpreter, $rem, $interpreter.halt_overflow()));
         }
         // SAFETY: room checked above.
         unsafe { $interpreter.stack.push_at($sp, $x) };
@@ -263,56 +311,72 @@ macro_rules! push_at {
     };
 }
 
-/// The threaded-cursor form of [`require_non_staticcall`]. See [`popn_at`].
+/// The threaded form of [`require_non_staticcall`]. See [`popn_at`].
 #[macro_export]
 #[collapse_debuginfo(yes)]
 macro_rules! require_non_staticcall_at {
-    ($interpreter:expr, $sp:ident) => {
+    ($interpreter:expr, $sp:ident, $rem:ident) => {
         if $interpreter.runtime_flag.is_static() {
-            $interpreter.halt($crate::InstructionResult::StateChangeDuringStaticCall);
-            return $sp;
+            return (
+                $sp,
+                $crate::poison_at!(
+                    $interpreter,
+                    $rem,
+                    $interpreter.halt($crate::InstructionResult::StateChangeDuringStaticCall)
+                ),
+            );
         }
     };
 }
 
-/// The threaded-cursor form of [`check`]. See [`popn_at`].
+/// The threaded form of [`check`]. See [`popn_at`].
 #[macro_export]
 #[collapse_debuginfo(yes)]
 macro_rules! check_at {
-    ($interpreter:expr, $sp:ident, $min:ident) => {
+    ($interpreter:expr, $sp:ident, $rem:ident, $min:ident) => {
         if !$interpreter
             .runtime_flag
             .spec_id()
             .is_enabled_in(primitives::hardfork::SpecId::$min)
         {
-            $interpreter.halt_not_activated();
-            return $sp;
+            return (
+                $sp,
+                $crate::poison_at!($interpreter, $rem, $interpreter.halt_not_activated()),
+            );
         }
     };
 }
 
-/// Runs a threaded-cursor instruction as an ordinary one: read the cursor out of the stack,
-/// hand it over, write back what comes out.
+/// Runs a threaded instruction as an ordinary one: read the cursor and the gas counter out
+/// of the interpreter, hand them over, write back what comes out.
 ///
 /// This is what the instruction *table* entry of a threaded opcode is, so that the two forms
 /// can not drift apart -- `Interpreter::step` and a custom table keep working, and the body
 /// is written once. Only the switch dispatch of `Interpreter::run_plain` gets the threading.
+///
+/// The gas write-back is a no-op on every path: a body that halted has already poisoned
+/// `Interpreter::gas` itself and hands back the same `u64::MAX`, and one that did not has
+/// either left the counter alone or published its own value. It is written anyway so that
+/// the wrapper stays correct for a body that starts charging gas in the register.
 #[macro_export]
 #[collapse_debuginfo(yes)]
 macro_rules! run_threaded {
     ($context:expr, $f:expr) => {{
         let $crate::InstructionContext { interpreter, host } = $context;
         let sp = interpreter.stack.sp();
-        let sp = $f(
+        let rem = interpreter.gas.remaining();
+        let (sp, rem) = $f(
             $crate::InstructionContext {
                 interpreter: &mut *interpreter,
                 host,
             },
             sp,
+            rem,
         );
         // SAFETY: `sp` came back from a threaded instruction that was handed this stack's
         // own cursor.
         unsafe { interpreter.stack.set_sp(sp) };
+        interpreter.gas.set_remaining(rem);
     }};
 }
 

@@ -32,22 +32,29 @@ pub fn mload<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, 
 pub fn mload_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
     if sp < WORD {
-        context.interpreter.halt_underflow();
-        return sp;
+        return (
+            sp,
+            poison_at!(context.interpreter, rem, context.interpreter.halt_underflow()),
+        );
     }
+    // This one charges gas of its own, so it publishes the threaded counter into the field
+    // the `gas!`/`resize_memory!` charges below work on, and hands back what the field ends
+    // up holding. See `sync_gas_at!`.
+    sync_gas_at!(context.interpreter, rem);
     // SAFETY: depth checked above.
     let word = unsafe { *context.interpreter.stack.peek_at(sp, 0) };
-    let offset = as_usize_or_fail_ret!(context.interpreter, word, sp);
-    resize_memory!(context.interpreter, offset, 32, sp);
+    let offset = as_usize_or_fail_ret!(context.interpreter, word, (sp, u64::MAX));
+    resize_memory!(context.interpreter, offset, 32, (sp, u64::MAX));
     // SAFETY: depth checked above; `resize_memory!` does not touch the stack.
     let dst = (unsafe { context.interpreter.stack.top_at(sp) } as *mut U256).cast::<u64>();
     // SAFETY: `dst` is the four limbs of a live stack word, and memory now covers
     // `offset + 32`.
     unsafe { context.interpreter.memory.get_u256_to(offset, dst) };
-    sp
+    (sp, context.interpreter.gas.remaining())
 }
 
 /// Implements the MSTORE instruction.
@@ -72,23 +79,30 @@ pub fn mstore<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_,
 pub fn mstore_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
     if sp < 2 * WORD {
-        context.interpreter.halt_underflow();
-        return sp;
+        return (
+            sp,
+            poison_at!(context.interpreter, rem, context.interpreter.halt_underflow()),
+        );
     }
+    // This one charges gas of its own, so it publishes the threaded counter into the field
+    // the `gas!`/`resize_memory!` charges below work on, and hands back what the field ends
+    // up holding. See `sync_gas_at!`.
+    sync_gas_at!(context.interpreter, rem);
     // SAFETY: depth checked above.
     let word = unsafe { *context.interpreter.stack.peek_at(sp, 0) };
-    let offset = as_usize_or_fail_ret!(context.interpreter, word, sp);
-    resize_memory!(context.interpreter, offset, 32, sp);
+    let offset = as_usize_or_fail_ret!(context.interpreter, word, (sp, u64::MAX));
+    resize_memory!(context.interpreter, offset, 32, (sp, u64::MAX));
     // SAFETY: depth checked above; `resize_memory!` does not touch the stack. The stack
     // buffer and the memory buffer are distinct allocations, so the write cannot disturb
     // the limbs still to be read.
     let src = unsafe { context.interpreter.stack.peek_at(sp, 1) }.cast::<u64>();
     unsafe { context.interpreter.memory.set_u256_ptr(offset, src) };
     // The two operands are gone; dropping them is one subtraction on the cursor.
-    sp - 2 * WORD
+    (sp - 2 * WORD, context.interpreter.gas.remaining())
 }
 
 /// Implements the MSTORE8 instruction.
@@ -109,13 +123,18 @@ pub fn mstore8<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_
 pub fn mstore8_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
-    popn_at!([offset, value], context.interpreter, sp);
-    let offset = as_usize_or_fail_ret!(context.interpreter, offset, sp);
-    resize_memory!(context.interpreter, offset, 1, sp);
+    popn_at!([offset, value], context.interpreter, sp, rem);
+    // This one charges gas of its own, so it publishes the threaded counter into the field
+    // the `gas!`/`resize_memory!` charges below work on, and hands back what the field ends
+    // up holding. See `sync_gas_at!`.
+    sync_gas_at!(context.interpreter, rem);
+    let offset = as_usize_or_fail_ret!(context.interpreter, offset, (sp, u64::MAX));
+    resize_memory!(context.interpreter, offset, 1, (sp, u64::MAX));
     context.interpreter.memory.set(offset, &[value.byte(0)]);
-    sp
+    (sp, context.interpreter.gas.remaining())
 }
 
 /// Implements the MSIZE instruction.
@@ -135,14 +154,16 @@ pub fn msize<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, 
 pub fn msize_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
     push_at!(
         context.interpreter,
         sp,
+        rem,
         U256::from(context.interpreter.memory.size())
     );
-    sp
+    (sp, rem)
 }
 
 /// Implements the MCOPY instruction.

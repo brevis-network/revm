@@ -470,6 +470,56 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
         // top. `jr` in this function goes 198 -> 243, so the dispatch block is still
         // duplicated into the arms rather than collapsing to one shared indirect branch.
         let mut sp = self.stack.sp();
+        // And the gas counter, for the third time and the same reason: `Gas::remaining` sits
+        // behind the same `&mut Interpreter` as the stack words, so the per-opcode static
+        // charge re-loaded it and stored it back. That pair was 16.86 M retired instructions
+        // on block 24006677 -- 8.07 M `ld` and 7.98 M `sd`, i.e. one of each per dispatched
+        // opcode -- and the biggest per-opcode memory traffic left in here.
+        //
+        // # The invariant
+        //
+        // `rem` is the truth; `Interpreter::gas.remaining` is stale while a threaded arm
+        // runs, too high by every static charge taken since the last publish. Two rules
+        // follow, and the second is what makes gas different from the cursor above:
+        //
+        // 1. Anything that can *observe* the counter has to have it published first --
+        //    `sync_gas_at!`. That is every `halt_*` (which copies `Gas` into the action and
+        //    stashes `remaining` for `Interpreter::take_next_action` to restore), every
+        //    `set_action`, and every body that charges through `gas!`/`resize_memory!`,
+        //    which work on the field.
+        // 2. Every halt has to hand `u64::MAX` back *in the register*. The poison is the
+        //    loop's only exit (see `Interpreter::set_action`), and this loop tests `rem`,
+        //    not the field -- a halt that poisoned only `Interpreter::gas` would leave it
+        //    spinning. The cursor above is the opposite case: its halt paths deliberately
+        //    do not write back, because nothing reads the stack between a halt and the exit.
+        //
+        // The single exit does *not* write `rem` back, because both ways out leave the field
+        // correct on their own: a poisoned exit already has `u64::MAX` in it and the true
+        // value in `gas_stash`, and a genuine out-of-gas goes to `end_dispatch`, whose
+        // `halt_oog` calls `spend_all`.
+        //
+        // Arms tagged `(4, g)` thread it: `g` takes it and returns the new one, and that is
+        // everything on that tag, including `GAS` (which pushes the register). Bodies that
+        // charge dynamic gas -- `MLOAD`/`MSTORE`/`MSTORE8`, `KECCAK256`, `SLOAD`/`SSTORE`,
+        // `BALANCE`/`EXTCODESIZE`/`EXTCODEHASH` -- are on the same tag but publish on entry
+        // and re-read on exit, so they still cost the one `sd`/`ld` pair they cost before.
+        // Arms tagged `0`/`1` do that from here.
+        //
+        // `JUMP`/`JUMPI` (tag `(3, g)`) are **not** threaded, and that is deliberate and
+        // measured. Threading them -- `jump_inner` charging the fused `JUMPDEST` on the
+        // register, and the arm returning a triple -- flips the register allocation of the
+        // whole loop: instead of charging in place on the loop-carried register, *every* arm
+        // gets `addi <scratch>, <carried>, -cost` and a `mv` back before its dispatch. On
+        // block 24006677 that is -1.5 M in the two jump arms and +6.8 M spread over all the
+        // others, **+5.3 M net**. They publish and reload instead, which is what they cost
+        // before this change.
+        //
+        // Note the trigger is not simply "an arm writes the counter": `MLOAD`, `SLOAD` and
+        // the rest of the charging group write it too (they publish and re-read) and do not
+        // provoke it. Whatever the exact cause, the symptom is cheap to check -- `mv` in the
+        // dispatch tails of this function, which the good arrangement has 13 of and the bad
+        // one ~150 -- so check that before believing any future win here.
+        let mut rem = self.gas.remaining();
         // The bump of `ip` lives in the arms, past the opcode read, rather than in the loop
         // header. In the header the backend schedules the `addi` ahead of the `lbu` and has to
         // copy the pre-bump pointer into a second register; from the arm it is an in-place
@@ -479,23 +529,29 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
                 ip = unsafe { ip.add(1) };
                 // SAFETY: `sp` is this stack's cursor, threaded here from the loop header.
                 unsafe { self.stack.set_sp(sp) };
+                self.gas.set_remaining(rem);
                 $f(InstructionContext {
                     interpreter: self,
                     host,
                 });
                 sp = self.stack.sp();
+                // Reading the counter back is also how an action set in there ends the
+                // loop: `set_action` poisons the field, and the poison arrives here.
+                rem = self.gas.remaining();
             }};
             (1, $f:expr) => {{
                 ip = unsafe { ip.add(1) };
                 self.bytecode.set_ip(ip);
                 // SAFETY: as above.
                 unsafe { self.stack.set_sp(sp) };
+                self.gas.set_remaining(rem);
                 $f(InstructionContext {
                     interpreter: self,
                     host,
                 });
                 sp = self.stack.sp();
                 ip = self.bytecode.ip();
+                rem = self.gas.remaining();
             }};
             // Touches neither the instruction pointer nor the stack, so neither has to be
             // handed over. `JUMPDEST` only.
@@ -538,8 +594,10 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
             // is worth -2.62 M without threading and -10.39 M with it. Turning one on
             // without the other is the worst cell of the four. If the flag ever goes away,
             // tag these two back to `1`.
+            // Not gas-threaded on purpose; see the note on `rem` in the loop header.
             ((3, $g:expr), $_f:expr) => {{
                 ip = unsafe { ip.add(1) };
+                self.gas.set_remaining(rem);
                 let (next_ip, next_sp) = $g(
                     InstructionContext {
                         interpreter: self,
@@ -550,6 +608,7 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
                 );
                 ip = next_ip;
                 sp = next_sp;
+                rem = self.gas.remaining();
             }};
             // `(4, g)`: `g` takes the stack cursor by value and returns the new one, so the
             // opcode's `popn`/`push`/`top` never re-load `Stack`'s length. The instruction
@@ -557,13 +616,16 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
             // `sp` in the loop header for which opcodes are on it and which are not.
             ((4, $g:expr), $_f:expr) => {{
                 ip = unsafe { ip.add(1) };
-                sp = $g(
+                let (next_sp, next_rem) = $g(
                     InstructionContext {
                         interpreter: self,
                         host,
                     },
                     sp,
+                    rem,
                 );
+                sp = next_sp;
+                rem = next_rem;
             }};
             ((2, $n:literal), $_f:expr) => {{
                 // SAFETY: same padding invariant `ExtBytecode::read_slice` relies on: the
@@ -575,10 +637,13 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
                     ip = unsafe { ip.add(1 + $n) };
                 } else {
                     // `push` leaves the instruction pointer just past the opcode on
-                    // overflow, and the halt is what ends the loop.
+                    // overflow, and the halt is what ends the loop -- which means handing
+                    // the poisoned counter back to `rem`, not just to `Interpreter::gas`.
                     ip = unsafe { ip.add(1) };
                     self.bytecode.set_ip(ip);
+                    self.gas.set_remaining(rem);
                     self.halt_overflow();
+                    rem = u64::MAX;
                 }
             }};
         }
@@ -593,7 +658,11 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
                     match opcode {
                         $(
                             $crate::instructions::opcode_consts::$op => {
-                                if self.gas.record_cost_unsafe($g) {
+                                // `Gas::record_cost_unsafe` on the threaded counter: the
+                                // sign bit of the wrapped difference, so a poisoned
+                                // `u64::MAX` trips it for any cost including zero.
+                                rem = rem.wrapping_sub($g);
+                                if (rem as i64) < 0 {
                                     self.bytecode.set_ip(unsafe { ip.add(1) });
                                     break;
                                 }
@@ -637,7 +706,8 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
                         0xe4 | 0xe5 | 0xe6 | 0xe7 | 0xe8 | 0xe9 | 0xea | 0xeb |
                         0xec | 0xed | 0xee | 0xef | 0xf6 | 0xf7 | 0xf8 | 0xf9 |
                         0xfb | 0xfc => {
-                            if self.gas.record_cost_unsafe(0) {
+                            // Zero cost, so only the poison can trip this.
+                            if (rem as i64) < 0 {
                                 self.bytecode.set_ip(unsafe { ip.add(1) });
                                 break;
                             }
@@ -651,6 +721,9 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
         // The one write-back of the threaded cursor, for every path that leaves the loop:
         // the arms hand it from one to the next and never store it, and the halts inside
         // them only set an action.
+        //
+        // The gas counter deliberately has no matching write-back; see the invariant on
+        // `rem` above.
         //
         // SAFETY: `sp` is this stack's own cursor, threaded through the arms since the loop
         // header read it.

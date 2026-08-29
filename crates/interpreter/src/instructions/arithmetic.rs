@@ -21,11 +21,12 @@ pub fn add<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 pub fn add_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
-    popn_top_at!([op1], op2, context.interpreter, sp);
+    popn_top_at!([op1], op2, context.interpreter, sp, rem);
     *op2 = op1.wrapping_add(*op2);
-    sp
+    (sp, rem)
 }
 
 /// Implements the MUL instruction - multiplies two values from stack.
@@ -43,11 +44,12 @@ pub fn mul<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 pub fn mul_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::LOW);
-    popn_top_at!([op1], op2, context.interpreter, sp);
+    popn_top_at!([op1], op2, context.interpreter, sp, rem);
     *op2 = op1.wrapping_mul(*op2);
-    sp
+    (sp, rem)
 }
 
 /// Implements the SUB instruction - subtracts two values from stack.
@@ -65,11 +67,12 @@ pub fn sub<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 pub fn sub_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
-    popn_top_at!([op1], op2, context.interpreter, sp);
+    popn_top_at!([op1], op2, context.interpreter, sp, rem);
     *op2 = op1.wrapping_sub(*op2);
-    sp
+    (sp, rem)
 }
 
 /// Implements the DIV instruction - divides two values from stack.
@@ -87,13 +90,14 @@ pub fn div<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 pub fn div_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::LOW);
-    popn_top_at!([op1], op2, context.interpreter, sp);
+    popn_top_at!([op1], op2, context.interpreter, sp, rem);
     if !super::u256_is_zero(op2) {
         *op2 = op1.wrapping_div(*op2);
     }
-    sp
+    (sp, rem)
 }
 
 /// Implements the SDIV instruction.
@@ -113,11 +117,12 @@ pub fn sdiv<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H
 pub fn sdiv_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::LOW);
-    popn_top_at!([op1], op2, context.interpreter, sp);
+    popn_top_at!([op1], op2, context.interpreter, sp, rem);
     *op2 = i256_div(op1, *op2);
-    sp
+    (sp, rem)
 }
 
 /// Implements the MOD instruction.
@@ -137,13 +142,14 @@ pub fn rem<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 pub fn rem_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::LOW);
-    popn_top_at!([op1], op2, context.interpreter, sp);
+    popn_top_at!([op1], op2, context.interpreter, sp, rem);
     if !super::u256_is_zero(op2) {
         *op2 = op1.wrapping_rem(*op2);
     }
-    sp
+    (sp, rem)
 }
 
 /// Implements the SMOD instruction.
@@ -163,11 +169,12 @@ pub fn smod<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H
 pub fn smod_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::LOW);
-    popn_top_at!([op1], op2, context.interpreter, sp);
+    popn_top_at!([op1], op2, context.interpreter, sp, rem);
     *op2 = i256_mod(op1, *op2);
-    sp
+    (sp, rem)
 }
 
 /// Implements the ADDMOD instruction.
@@ -187,11 +194,12 @@ pub fn addmod<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_,
 pub fn addmod_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::MID);
-    popn_top_at!([op1, op2], op3, context.interpreter, sp);
+    popn_top_at!([op1, op2], op3, context.interpreter, sp, rem);
     *op3 = op1.add_mod(op2, *op3);
-    sp
+    (sp, rem)
 }
 
 /// Implements the MULMOD instruction.
@@ -211,11 +219,12 @@ pub fn mulmod<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_,
 pub fn mulmod_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::MID);
-    popn_top_at!([op1, op2], op3, context.interpreter, sp);
+    popn_top_at!([op1, op2], op3, context.interpreter, sp, rem);
     *op3 = op1.mul_mod(op2, *op3);
-    sp
+    (sp, rem)
 }
 
 /// Implements the EXP instruction - exponentiates two values from stack.
@@ -269,9 +278,10 @@ pub fn signextend<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext
 pub fn signextend_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::LOW);
-    popn_top_at!([ext], x, context.interpreter, sp);
+    popn_top_at!([ext], x, context.interpreter, sp, rem);
     // For 31 we also don't need to do anything.
     if ext < U256::from(31) {
         let ext = ext.as_limbs()[0];
@@ -280,5 +290,5 @@ pub fn signextend_at<WIRE: InterpreterTypes, H: ?Sized>(
         let mask = (U256::from(1) << bit_index) - U256::from(1);
         *x = if bit { *x | !mask } else { *x & mask };
     }
-    sp
+    (sp, rem)
 }

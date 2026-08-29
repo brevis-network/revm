@@ -21,11 +21,12 @@ pub fn lt<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, 
 pub fn lt_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
-    popn_top_at!([op1], op2, context.interpreter, sp);
+    popn_top_at!([op1], op2, context.interpreter, sp, rem);
     *op2 = U256::from(op1 < *op2);
-    sp
+    (sp, rem)
 }
 
 /// Implements the GT instruction - greater than comparison.
@@ -43,12 +44,13 @@ pub fn gt<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, 
 pub fn gt_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
-    popn_top_at!([op1], op2, context.interpreter, sp);
+    popn_top_at!([op1], op2, context.interpreter, sp, rem);
 
     *op2 = U256::from(op1 > *op2);
-    sp
+    (sp, rem)
 }
 
 /// Implements the CLZ instruction - count leading zeros.
@@ -66,14 +68,15 @@ pub fn clz<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 pub fn clz_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
-    check_at!(context.interpreter, sp, OSAKA);
+    rem: u64,
+) -> (usize, u64) {
+    check_at!(context.interpreter, sp, rem, OSAKA);
     //gas!(context.interpreter, gas::LOW);
-    popn_top_at!([], op1, context.interpreter, sp);
+    popn_top_at!([], op1, context.interpreter, sp, rem);
 
     let leading_zeros = op1.leading_zeros();
     *op1 = U256::from(leading_zeros);
-    sp
+    (sp, rem)
 }
 
 /// Implements the SLT instruction.
@@ -93,12 +96,13 @@ pub fn slt<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 pub fn slt_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
-    popn_top_at!([op1], op2, context.interpreter, sp);
+    popn_top_at!([op1], op2, context.interpreter, sp, rem);
 
     *op2 = U256::from(i256_cmp(&op1, op2) == Ordering::Less);
-    sp
+    (sp, rem)
 }
 
 /// Implements the SGT instruction.
@@ -118,12 +122,13 @@ pub fn sgt<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 pub fn sgt_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
-    popn_top_at!([op1], op2, context.interpreter, sp);
+    popn_top_at!([op1], op2, context.interpreter, sp, rem);
 
     *op2 = U256::from(i256_cmp(&op1, op2) == Ordering::Greater);
-    sp
+    (sp, rem)
 }
 
 /// Implements the EQ instruction.
@@ -143,12 +148,13 @@ pub fn eq<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, 
 pub fn eq_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
-    popn_top_at!([op1], op2, context.interpreter, sp);
+    popn_top_at!([op1], op2, context.interpreter, sp, rem);
 
     *op2 = U256::from(super::u256_eq(&op1, op2));
-    sp
+    (sp, rem)
 }
 
 /// Implements the ISZERO instruction.
@@ -168,11 +174,12 @@ pub fn iszero<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_,
 pub fn iszero_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
-    popn_top_at!([], op1, context.interpreter, sp);
+    popn_top_at!([], op1, context.interpreter, sp, rem);
     *op1 = U256::from(super::u256_is_zero(op1));
-    sp
+    (sp, rem)
 }
 
 /// Implements the AND instruction.
@@ -192,11 +199,12 @@ pub fn bitand<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_,
 pub fn bitand_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
-    popn_top_at!([op1], op2, context.interpreter, sp);
+    popn_top_at!([op1], op2, context.interpreter, sp, rem);
     *op2 = op1 & *op2;
-    sp
+    (sp, rem)
 }
 
 /// Implements the OR instruction.
@@ -216,12 +224,13 @@ pub fn bitor<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, 
 pub fn bitor_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
-    popn_top_at!([op1], op2, context.interpreter, sp);
+    popn_top_at!([op1], op2, context.interpreter, sp, rem);
 
     *op2 = op1 | *op2;
-    sp
+    (sp, rem)
 }
 
 /// Implements the XOR instruction.
@@ -241,12 +250,13 @@ pub fn bitxor<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_,
 pub fn bitxor_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
-    popn_top_at!([op1], op2, context.interpreter, sp);
+    popn_top_at!([op1], op2, context.interpreter, sp, rem);
 
     *op2 = op1 ^ *op2;
-    sp
+    (sp, rem)
 }
 
 /// Implements the NOT instruction.
@@ -266,12 +276,13 @@ pub fn not<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 pub fn not_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
-    popn_top_at!([], op1, context.interpreter, sp);
+    popn_top_at!([], op1, context.interpreter, sp, rem);
 
     *op1 = !*op1;
-    sp
+    (sp, rem)
 }
 
 /// Implements the BYTE instruction.
@@ -291,9 +302,10 @@ pub fn byte<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H
 pub fn byte_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
-    popn_top_at!([op1], op2, context.interpreter, sp);
+    popn_top_at!([op1], op2, context.interpreter, sp, rem);
 
     let o1 = as_usize_saturated!(op1);
     *op2 = if o1 < 32 {
@@ -302,7 +314,7 @@ pub fn byte_at<WIRE: InterpreterTypes, H: ?Sized>(
     } else {
         U256::ZERO
     };
-    sp
+    (sp, rem)
 }
 
 /// EIP-145: Bitwise shifting instructions in EVM
@@ -320,10 +332,11 @@ pub fn shl<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 pub fn shl_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
-    check_at!(context.interpreter, sp, CONSTANTINOPLE);
+    rem: u64,
+) -> (usize, u64) {
+    check_at!(context.interpreter, sp, rem, CONSTANTINOPLE);
     //gas!(context.interpreter, gas::VERYLOW);
-    popn_top_at!([op1], op2, context.interpreter, sp);
+    popn_top_at!([op1], op2, context.interpreter, sp, rem);
 
     let shift = as_usize_saturated!(op1);
     *op2 = if shift < 256 {
@@ -331,7 +344,7 @@ pub fn shl_at<WIRE: InterpreterTypes, H: ?Sized>(
     } else {
         U256::ZERO
     };
-    sp
+    (sp, rem)
 }
 
 /// EIP-145: Bitwise shifting instructions in EVM
@@ -349,10 +362,11 @@ pub fn shr<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 pub fn shr_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
-    check_at!(context.interpreter, sp, CONSTANTINOPLE);
+    rem: u64,
+) -> (usize, u64) {
+    check_at!(context.interpreter, sp, rem, CONSTANTINOPLE);
     //gas!(context.interpreter, gas::VERYLOW);
-    popn_top_at!([op1], op2, context.interpreter, sp);
+    popn_top_at!([op1], op2, context.interpreter, sp, rem);
 
     let shift = as_usize_saturated!(op1);
     *op2 = if shift < 256 {
@@ -360,7 +374,7 @@ pub fn shr_at<WIRE: InterpreterTypes, H: ?Sized>(
     } else {
         U256::ZERO
     };
-    sp
+    (sp, rem)
 }
 
 /// EIP-145: Bitwise shifting instructions in EVM
@@ -378,10 +392,11 @@ pub fn sar<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 pub fn sar_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
-    check_at!(context.interpreter, sp, CONSTANTINOPLE);
+    rem: u64,
+) -> (usize, u64) {
+    check_at!(context.interpreter, sp, rem, CONSTANTINOPLE);
     //gas!(context.interpreter, gas::VERYLOW);
-    popn_top_at!([op1], op2, context.interpreter, sp);
+    popn_top_at!([op1], op2, context.interpreter, sp, rem);
 
     let shift = as_usize_saturated!(op1);
     *op2 = if shift < 256 {
@@ -391,7 +406,7 @@ pub fn sar_at<WIRE: InterpreterTypes, H: ?Sized>(
     } else {
         U256::ZERO
     };
-    sp
+    (sp, rem)
 }
 
 #[cfg(test)]

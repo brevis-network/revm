@@ -92,10 +92,17 @@ pub type InstructionTable<W, H> = [Instruction<W, H>; 256];
 ///   itself, instead of paying a store, a load and a second store for each.
 /// * `(3, f)` -- `JUMP`/`JUMPI`: both threaded. `f` takes the pointer and the cursor and
 ///   returns the new pair rather than storing either.
-/// * `(4, f)` -- the stack cursor threaded, the instruction pointer untouched. `f` takes the
-///   cursor and returns the new one. This is most of the hot list: the arithmetic and
-///   bitwise opcodes, `POP`/`PUSH0`/`DUP`/`SWAP`, and `MLOAD`/`MSTORE`/`MSTORE8`/`MSIZE`.
+/// * `(4, f)` -- the stack cursor *and the gas counter* threaded, the instruction pointer
+///   untouched. `f` takes both and returns the new pair. This is most of the hot list: the
+///   arithmetic and bitwise opcodes, `POP`/`PUSH0`/`DUP`/`SWAP`, `MLOAD`/`MSTORE`/`MSTORE8`/
+///   `MSIZE`, and the one-word opcodes that ask the host or the block for a value.
 /// * `5` -- touches neither (`JUMPDEST`).
+///
+/// The gas counter rides along on `(2, N)` and `(4, f)` but **not** on `(3, f)`: `JUMP`/
+/// `JUMPI` publish and reload it like tag `0` does. They are the only hot arms that *change*
+/// the counter, and an arm that redefines it costs a register copy on every other arm too --
+/// the note on `rem` in [`Interpreter::run_plain`](crate::Interpreter::run_plain) has the
+/// numbers.
 ///
 /// Threading depends on `-tail-dup-size=12` being set; the dispatch loop has the numbers.
 ///

@@ -21,11 +21,12 @@ pub fn chainid<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionCon
 pub fn chainid_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
-    check_at!(context.interpreter, sp, ISTANBUL);
+    rem: u64,
+) -> (usize, u64) {
+    check_at!(context.interpreter, sp, rem, ISTANBUL);
     //gas!(context.interpreter, gas::BASE);
-    push_at!(context.interpreter, sp, context.host.chain_id());
-    sp
+    push_at!(context.interpreter, sp, rem, context.host.chain_id());
+    (sp, rem)
 }
 
 /// Implements the COINBASE instruction.
@@ -47,14 +48,16 @@ pub fn coinbase<WIRE: InterpreterTypes, H: Host + ?Sized>(
 pub fn coinbase_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
     push_at!(
         context.interpreter,
         sp,
+        rem,
         context.host.beneficiary().into_word().into()
     );
-    sp
+    (sp, rem)
 }
 
 /// Implements the TIMESTAMP instruction.
@@ -76,10 +79,11 @@ pub fn timestamp<WIRE: InterpreterTypes, H: Host + ?Sized>(
 pub fn timestamp_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
-    push_at!(context.interpreter, sp, context.host.timestamp());
-    sp
+    push_at!(context.interpreter, sp, rem, context.host.timestamp());
+    (sp, rem)
 }
 
 /// Implements the NUMBER instruction.
@@ -101,10 +105,11 @@ pub fn block_number<WIRE: InterpreterTypes, H: Host + ?Sized>(
 pub fn block_number_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
-    push_at!(context.interpreter, sp, context.host.block_number());
-    sp
+    push_at!(context.interpreter, sp, rem, context.host.block_number());
+    (sp, rem)
 }
 
 /// Implements the DIFFICULTY/PREVRANDAO instruction.
@@ -126,7 +131,8 @@ pub fn difficulty<WIRE: InterpreterTypes, H: Host + ?Sized>(
 pub fn difficulty_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
     if context
         .interpreter
@@ -135,11 +141,11 @@ pub fn difficulty_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
         .is_enabled_in(MERGE)
     {
         // Unwrap is safe as this fields is checked in validation handler.
-        push_at!(context.interpreter, sp, context.host.prevrandao().unwrap());
+        push_at!(context.interpreter, sp, rem, context.host.prevrandao().unwrap());
     } else {
-        push_at!(context.interpreter, sp, context.host.difficulty());
+        push_at!(context.interpreter, sp, rem, context.host.difficulty());
     }
-    sp
+    (sp, rem)
 }
 
 /// Implements the GASLIMIT instruction.
@@ -161,10 +167,11 @@ pub fn gaslimit<WIRE: InterpreterTypes, H: Host + ?Sized>(
 pub fn gaslimit_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
-    push_at!(context.interpreter, sp, context.host.gas_limit());
-    sp
+    push_at!(context.interpreter, sp, rem, context.host.gas_limit());
+    (sp, rem)
 }
 
 /// EIP-3198: BASEFEE opcode
@@ -182,11 +189,12 @@ pub fn basefee<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionCon
 pub fn basefee_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
-    check_at!(context.interpreter, sp, LONDON);
+    rem: u64,
+) -> (usize, u64) {
+    check_at!(context.interpreter, sp, rem, LONDON);
     //gas!(context.interpreter, gas::BASE);
-    push_at!(context.interpreter, sp, context.host.basefee());
-    sp
+    push_at!(context.interpreter, sp, rem, context.host.basefee());
+    (sp, rem)
 }
 
 /// EIP-7516: BLOBBASEFEE opcode
@@ -206,9 +214,10 @@ pub fn blob_basefee<WIRE: InterpreterTypes, H: Host + ?Sized>(
 pub fn blob_basefee_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
-    check_at!(context.interpreter, sp, CANCUN);
+    rem: u64,
+) -> (usize, u64) {
+    check_at!(context.interpreter, sp, rem, CANCUN);
     //gas!(context.interpreter, gas::BASE);
-    push_at!(context.interpreter, sp, context.host.blob_gasprice());
-    sp
+    push_at!(context.interpreter, sp, rem, context.host.blob_gasprice());
+    (sp, rem)
 }

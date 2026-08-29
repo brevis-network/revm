@@ -31,12 +31,17 @@ pub fn balance<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionCon
 pub fn balance_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
-    popn_top_at!([], top, context.interpreter, sp);
+    rem: u64,
+) -> (usize, u64) {
+    popn_top_at!([], top, context.interpreter, sp, rem);
+    // This one charges gas of its own, so it publishes the threaded counter into the field
+    // the `gas!`/`resize_memory!` charges below work on, and hands back what the field ends
+    // up holding. See `sync_gas_at!`.
+    sync_gas_at!(context.interpreter, rem);
     let address = top.into_address();
     let spec_id = context.interpreter.runtime_flag.spec_id();
     if spec_id.is_enabled_in(BERLIN) {
-        let account = berlin_load_account!(context, address, false, sp);
+        let account = berlin_load_account!(context, address, false, (sp, u64::MAX));
         *top = account.balance;
     } else {
         let gas = if spec_id.is_enabled_in(ISTANBUL) {
@@ -47,17 +52,19 @@ pub fn balance_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
         } else {
             20
         };
-        gas!(context.interpreter, gas, sp);
+        gas!(context.interpreter, gas, (sp, u64::MAX));
         let Ok(account) = context
             .host
             .load_account_info_skip_cold_load(address, false, false)
         else {
-            context.interpreter.halt_fatal();
-            return sp;
+            return (
+                sp,
+                poison_at!(context.interpreter, rem, context.interpreter.halt_fatal()),
+            );
         };
         *top = account.balance;
     };
-    sp
+    (sp, context.interpreter.gas.remaining())
 }
 
 /// EIP-1884: Repricing for trie-size-dependent opcodes
@@ -77,19 +84,22 @@ pub fn selfbalance<WIRE: InterpreterTypes, H: Host + ?Sized>(
 pub fn selfbalance_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
-    check_at!(context.interpreter, sp, ISTANBUL);
+    rem: u64,
+) -> (usize, u64) {
+    check_at!(context.interpreter, sp, rem, ISTANBUL);
     //gas!(context.interpreter, gas::LOW);
 
     let Some(balance) = context
         .host
         .balance(context.interpreter.input.target_address())
     else {
-        context.interpreter.halt_fatal();
-        return sp;
+        return (
+            sp,
+            poison_at!(context.interpreter, rem, context.interpreter.halt_fatal()),
+        );
     };
-    push_at!(context.interpreter, sp, balance.data);
-    sp
+    push_at!(context.interpreter, sp, rem, balance.data);
+    (sp, rem)
 }
 
 /// Implements the EXTCODESIZE instruction.
@@ -111,12 +121,17 @@ pub fn extcodesize<WIRE: InterpreterTypes, H: Host + ?Sized>(
 pub fn extcodesize_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
-    popn_top_at!([], top, context.interpreter, sp);
+    rem: u64,
+) -> (usize, u64) {
+    popn_top_at!([], top, context.interpreter, sp, rem);
+    // This one charges gas of its own, so it publishes the threaded counter into the field
+    // the `gas!`/`resize_memory!` charges below work on, and hands back what the field ends
+    // up holding. See `sync_gas_at!`.
+    sync_gas_at!(context.interpreter, rem);
     let address = top.into_address();
     let spec_id = context.interpreter.runtime_flag.spec_id();
     if spec_id.is_enabled_in(BERLIN) {
-        let account = berlin_load_account!(context, address, true, sp);
+        let account = berlin_load_account!(context, address, true, (sp, u64::MAX));
         // safe to unwrap because we are loading code
         *top = U256::from(account.code.as_ref().unwrap().len());
     } else {
@@ -125,18 +140,20 @@ pub fn extcodesize_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
         } else {
             20
         };
-        gas!(context.interpreter, gas, sp);
+        gas!(context.interpreter, gas, (sp, u64::MAX));
         let Ok(account) = context
             .host
             .load_account_info_skip_cold_load(address, true, false)
         else {
-            context.interpreter.halt_fatal();
-            return sp;
+            return (
+                sp,
+                poison_at!(context.interpreter, rem, context.interpreter.halt_fatal()),
+            );
         };
         // safe to unwrap because we are loading code
         *top = U256::from(account.code.as_ref().unwrap().len());
     }
-    sp
+    (sp, context.interpreter.gas.remaining())
 }
 
 /// EIP-1052: EXTCODEHASH opcode
@@ -156,27 +173,34 @@ pub fn extcodehash<WIRE: InterpreterTypes, H: Host + ?Sized>(
 pub fn extcodehash_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
-    check_at!(context.interpreter, sp, CONSTANTINOPLE);
-    popn_top_at!([], top, context.interpreter, sp);
+    rem: u64,
+) -> (usize, u64) {
+    check_at!(context.interpreter, sp, rem, CONSTANTINOPLE);
+    popn_top_at!([], top, context.interpreter, sp, rem);
+    // This one charges gas of its own, so it publishes the threaded counter into the field
+    // the `gas!`/`resize_memory!` charges below work on, and hands back what the field ends
+    // up holding. See `sync_gas_at!`.
+    sync_gas_at!(context.interpreter, rem);
     let address = top.into_address();
 
     let spec_id = context.interpreter.runtime_flag.spec_id();
     let account = if spec_id.is_enabled_in(BERLIN) {
-        berlin_load_account!(context, address, true, sp)
+        berlin_load_account!(context, address, true, (sp, u64::MAX))
     } else {
         let gas = if spec_id.is_enabled_in(ISTANBUL) {
             700
         } else {
             400
         };
-        gas!(context.interpreter, gas, sp);
+        gas!(context.interpreter, gas, (sp, u64::MAX));
         let Ok(account) = context
             .host
             .load_account_info_skip_cold_load(address, true, false)
         else {
-            context.interpreter.halt_fatal();
-            return sp;
+            return (
+                sp,
+                poison_at!(context.interpreter, rem, context.interpreter.halt_fatal()),
+            );
         };
         account
     };
@@ -187,7 +211,7 @@ pub fn extcodehash_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
         account.code_hash
     };
     *top = code_hash.into_u256();
-    sp
+    (sp, context.interpreter.gas.remaining())
 }
 
 /// Implements the EXTCODECOPY instruction.
@@ -264,16 +288,17 @@ pub fn blockhash<WIRE: InterpreterTypes, H: Host + ?Sized>(
 pub fn blockhash_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::BLOCKHASH);
-    popn_top_at!([], number, context.interpreter, sp);
+    popn_top_at!([], number, context.interpreter, sp, rem);
 
     let requested_number = *number;
     let block_number = context.host.block_number();
 
     let Some(diff) = block_number.checked_sub(requested_number) else {
         *number = U256::ZERO;
-        return sp;
+        return (sp, rem);
     };
 
     let diff = as_u64_saturated!(diff);
@@ -281,19 +306,21 @@ pub fn blockhash_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
     // blockhash should push zero if number is same as current block number.
     if diff == 0 {
         *number = U256::ZERO;
-        return sp;
+        return (sp, rem);
     }
 
     *number = if diff <= BLOCK_HASH_HISTORY {
         let Some(hash) = context.host.block_hash(as_u64_saturated!(requested_number)) else {
-            context.interpreter.halt_fatal();
-            return sp;
+            return (
+                sp,
+                poison_at!(context.interpreter, rem, context.interpreter.halt_fatal()),
+            );
         };
         U256::from_be_bytes(hash.0)
     } else {
         U256::ZERO
     };
-    sp
+    (sp, rem)
 }
 
 /// Implements the SLOAD instruction.
@@ -316,8 +343,13 @@ pub fn sload<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionConte
 pub fn sload_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
-    popn_top_at!([], index, context.interpreter, sp);
+    rem: u64,
+) -> (usize, u64) {
+    popn_top_at!([], index, context.interpreter, sp, rem);
+    // This one charges gas of its own, so it publishes the threaded counter into the field
+    // the `gas!`/`resize_memory!` charges below work on, and hands back what the field ends
+    // up holding. See `sync_gas_at!`.
+    sync_gas_at!(context.interpreter, rem);
     let spec_id = context.interpreter.runtime_flag.spec_id();
     let target = context.interpreter.input.target_address();
 
@@ -333,14 +365,14 @@ pub fn sload_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
     } else {
         50
     };
-    gas!(context.interpreter, gas, sp);
+    gas!(context.interpreter, gas, (sp, u64::MAX));
     if spec_id.is_enabled_in(BERLIN) {
         let skip_cold = context.interpreter.gas.remaining() < COLD_SLOAD_COST_ADDITIONAL;
         let res = context.host.sload_skip_cold_load(target, *index, skip_cold);
         match res {
             Ok(storage) => {
                 if storage.is_cold {
-                    gas!(context.interpreter, COLD_SLOAD_COST_ADDITIONAL, sp);
+                    gas!(context.interpreter, COLD_SLOAD_COST_ADDITIONAL, (sp, u64::MAX));
                 }
 
                 // `*index = storage.data` is a 32-byte store that LLVM lowers to a `memcpy`
@@ -355,13 +387,15 @@ pub fn sload_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
         }
     } else {
         let Some(storage) = context.host.sload(target, *index) else {
-            context.interpreter.halt_fatal();
-            return sp;
+            return (
+                sp,
+                poison_at!(context.interpreter, rem, context.interpreter.halt_fatal()),
+            );
         };
         // SAFETY: as above.
         unsafe { primitives::copy_u256(index, &storage.data) };
     };
-    sp
+    (sp, context.interpreter.gas.remaining())
 }
 
 /// Implements the SSTORE instruction.
@@ -381,9 +415,14 @@ pub fn sstore<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionCont
 pub fn sstore_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
-    require_non_staticcall_at!(context.interpreter, sp);
-    popn_at!([index, value], context.interpreter, sp);
+    rem: u64,
+) -> (usize, u64) {
+    require_non_staticcall_at!(context.interpreter, sp, rem);
+    popn_at!([index, value], context.interpreter, sp, rem);
+    // This one charges gas of its own, so it publishes the threaded counter into the field
+    // the `gas!`/`resize_memory!` charges below work on, and hands back what the field ends
+    // up holding. See `sync_gas_at!`.
+    sync_gas_at!(context.interpreter, rem);
 
     let target = context.interpreter.input.target_address();
     let spec_id = context.interpreter.runtime_flag.spec_id();
@@ -399,7 +438,7 @@ pub fn sstore_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
         context
             .interpreter
             .halt(InstructionResult::ReentrancySentryOOG);
-        return sp;
+        return (sp, u64::MAX);
     }
 
     // The hard-fork revision is a per-block constant, so both `SSTORE` schedules are a
@@ -407,7 +446,7 @@ pub fn sstore_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
     let spec_row = gas::SSTORE_SPEC[spec_id as usize];
 
     // static gas
-    gas!(context.interpreter, spec_row.static_cost as u64, sp);
+    gas!(context.interpreter, spec_row.static_cost as u64, (sp, u64::MAX));
 
     let state_load = if spec_id.is_enabled_in(BERLIN) {
         let skip_cold = context.interpreter.gas.remaining() < COLD_SLOAD_COST_ADDITIONAL;
@@ -418,17 +457,17 @@ pub fn sstore_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
             Ok(load) => load,
             Err(LoadError::ColdLoadSkipped) => {
                 context.interpreter.halt_oog();
-                return sp;
+                return (sp, u64::MAX);
             }
             Err(LoadError::DBError) => {
                 context.interpreter.halt_fatal();
-                return sp;
+                return (sp, u64::MAX);
             }
         }
     } else {
         let Some(load) = context.host.sstore(target, index, value) else {
             context.interpreter.halt_fatal();
-            return sp;
+            return (sp, u64::MAX);
         };
         load
     };
@@ -442,11 +481,11 @@ pub fn sstore_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
     if state_load.is_cold {
         dynamic_gas += spec_row.cold_extra as u64;
     }
-    gas!(context.interpreter, dynamic_gas, sp);
+    gas!(context.interpreter, dynamic_gas, (sp, u64::MAX));
 
     // refund
     context.interpreter.gas.record_refund(entry.refund as i64);
-    sp
+    (sp, context.interpreter.gas.remaining())
 }
 
 /// EIP-1153: Transient storage opcodes
@@ -465,17 +504,18 @@ pub fn tstore<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionCont
 pub fn tstore_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
-    check_at!(context.interpreter, sp, CANCUN);
-    require_non_staticcall_at!(context.interpreter, sp);
+    rem: u64,
+) -> (usize, u64) {
+    check_at!(context.interpreter, sp, rem, CANCUN);
+    require_non_staticcall_at!(context.interpreter, sp, rem);
     //gas!(context.interpreter, gas::WARM_STORAGE_READ_COST);
 
-    popn_at!([index, value], context.interpreter, sp);
+    popn_at!([index, value], context.interpreter, sp, rem);
 
     context
         .host
         .tstore(context.interpreter.input.target_address(), index, value);
-    sp
+    (sp, rem)
 }
 
 /// EIP-1153: Transient storage opcodes
@@ -494,16 +534,17 @@ pub fn tload<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionConte
 pub fn tload_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
-    check_at!(context.interpreter, sp, CANCUN);
+    rem: u64,
+) -> (usize, u64) {
+    check_at!(context.interpreter, sp, rem, CANCUN);
     //gas!(context.interpreter, gas::WARM_STORAGE_READ_COST);
 
-    popn_top_at!([], index, context.interpreter, sp);
+    popn_top_at!([], index, context.interpreter, sp, rem);
 
     *index = context
         .host
         .tload(context.interpreter.input.target_address(), *index);
-    sp
+    (sp, rem)
 }
 
 /// Implements the LOG0-LOG4 instructions.

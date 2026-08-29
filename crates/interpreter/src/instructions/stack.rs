@@ -24,11 +24,12 @@ pub fn pop<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 pub fn pop_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
     // Can ignore return. as relative N jump is safe operation.
-    popn_at!([_i], context.interpreter, sp);
-    sp
+    popn_at!([_i], context.interpreter, sp, rem);
+    (sp, rem)
 }
 
 /// EIP-3855: PUSH0 instruction
@@ -48,11 +49,12 @@ pub fn push0<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, 
 pub fn push0_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
-    check_at!(context.interpreter, sp, SHANGHAI);
+    rem: u64,
+) -> (usize, u64) {
+    check_at!(context.interpreter, sp, rem, SHANGHAI);
     //gas!(context.interpreter, gas::BASE);
-    push_at!(context.interpreter, sp, U256::ZERO);
-    sp
+    push_at!(context.interpreter, sp, rem, U256::ZERO);
+    (sp, rem)
 }
 
 /// Implements the PUSH1-PUSH32 instructions.
@@ -92,19 +94,22 @@ pub fn dup<const N: usize, WIRE: InterpreterTypes, H: ?Sized>(
 pub fn dup_at<const N: usize, WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
     // One unsigned compare, exactly as `Stack::dup`; see the note there for why the two
     // bounds fold into one.
     let need = N * WORD;
     let limit = (BYTE_LIMIT - WORD).saturating_sub(need);
     if sp.wrapping_sub(need) > limit {
-        context.interpreter.halt_overflow();
-        return sp;
+        return (
+            sp,
+            poison_at!(context.interpreter, rem, context.interpreter.halt_overflow()),
+        );
     }
     // SAFETY: depth and room checked above.
     unsafe { context.interpreter.stack.dup_at(sp, N) };
-    sp + WORD
+    (sp + WORD, rem)
 }
 
 /// Implements the SWAP1-SWAP16 instructions.
@@ -126,15 +131,18 @@ pub fn swap<const N: usize, WIRE: InterpreterTypes, H: ?Sized>(
 pub fn swap_at<const N: usize, WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
     assert!(N != 0);
     // Same bound as `Stack::exchange` with `n = 0`, `m = N`.
     if N * WORD >= sp {
-        context.interpreter.halt_overflow();
-        return sp;
+        return (
+            sp,
+            poison_at!(context.interpreter, rem, context.interpreter.halt_overflow()),
+        );
     }
     // SAFETY: depth checked above, and `N` is non-zero, so the two words are distinct.
     unsafe { context.interpreter.stack.exchange_at(sp, 0, N) };
-    sp
+    (sp, rem)
 }

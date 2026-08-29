@@ -32,10 +32,15 @@ pub fn keccak256<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<
 pub fn keccak256_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
-    popn_top_at!([offset], top, context.interpreter, sp);
-    let len = as_usize_or_fail_ret!(context.interpreter, top, sp);
-    gas_or_fail!(context.interpreter, gas::keccak256_cost(len), sp);
+    rem: u64,
+) -> (usize, u64) {
+    popn_top_at!([offset], top, context.interpreter, sp, rem);
+    // This one charges gas of its own, so it publishes the threaded counter into the field
+    // the `gas!`/`resize_memory!` charges below work on, and hands back what the field ends
+    // up holding. See `sync_gas_at!`.
+    sync_gas_at!(context.interpreter, rem);
+    let len = as_usize_or_fail_ret!(context.interpreter, top, (sp, u64::MAX));
+    gas_or_fail!(context.interpreter, gas::keccak256_cost(len), (sp, u64::MAX));
     // Built in an 8-aligned slot so the `B256` -> `U256` byte reversal below can load limbs
     // with `ld` instead of 32 `lbu`.
     #[repr(align(8))]
@@ -43,13 +48,13 @@ pub fn keccak256_at<WIRE: InterpreterTypes, H: ?Sized>(
     let hash = AlignedWord(if len == 0 {
         KECCAK_EMPTY
     } else {
-        let from = as_usize_or_fail_ret!(context.interpreter, offset, sp);
-        resize_memory!(context.interpreter, from, len, sp);
+        let from = as_usize_or_fail_ret!(context.interpreter, offset, (sp, u64::MAX));
+        resize_memory!(context.interpreter, from, len, (sp, u64::MAX));
         primitives::keccak256(context.interpreter.memory.slice_len(from, len).as_ref())
     });
     // SAFETY: `AlignedWord` is 8-aligned and holds 32 bytes.
     *top = unsafe { u256_from_be_aligned(hash.0.as_ptr()) };
-    sp
+    (sp, context.interpreter.gas.remaining())
 }
 
 /// Implements the ADDRESS instruction.
@@ -69,11 +74,13 @@ pub fn address<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_
 pub fn address_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
     push_at!(
         context.interpreter,
         sp,
+        rem,
         context
             .interpreter
             .input
@@ -81,7 +88,7 @@ pub fn address_at<WIRE: InterpreterTypes, H: ?Sized>(
             .into_word()
             .into()
     );
-    sp
+    (sp, rem)
 }
 
 /// Implements the CALLER instruction.
@@ -101,11 +108,13 @@ pub fn caller<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_,
 pub fn caller_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
     push_at!(
         context.interpreter,
         sp,
+        rem,
         context
             .interpreter
             .input
@@ -113,7 +122,7 @@ pub fn caller_at<WIRE: InterpreterTypes, H: ?Sized>(
             .into_word()
             .into()
     );
-    sp
+    (sp, rem)
 }
 
 /// Implements the CODESIZE instruction.
@@ -133,14 +142,16 @@ pub fn codesize<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'
 pub fn codesize_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
     push_at!(
         context.interpreter,
         sp,
+        rem,
         U256::from(context.interpreter.bytecode.bytecode_len())
     );
-    sp
+    (sp, rem)
 }
 
 /// Implements the CODECOPY instruction.
@@ -184,9 +195,10 @@ pub fn calldataload<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionConte
 pub fn calldataload_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
-    popn_top_at!([], offset_ptr, context.interpreter, sp);
+    popn_top_at!([], offset_ptr, context.interpreter, sp, rem);
     let offset = as_usize_saturated!(offset_ptr);
     // Assemble straight into the stack slot, one limb at a time. Building a `U256` first
     // keeps all four limbs live to the end, which cost this instruction a prologue that
@@ -207,7 +219,7 @@ pub fn calldataload_at<WIRE: InterpreterTypes, H: ?Sized>(
             dst.add(2).write(0);
             dst.add(3).write(0);
         }
-        return sp;
+        return (sp, rem);
     }
     let count = 32.min(input_len - offset);
     match context.interpreter.input.input() {
@@ -221,7 +233,7 @@ pub fn calldataload_at<WIRE: InterpreterTypes, H: ?Sized>(
             unsafe { be_word_to(input_slice.as_ptr().add(offset), count, dst) }
         }
     }
-    sp
+    (sp, rem)
 }
 
 /// Reads `count` (`<= 32`) big-endian bytes from `src` into the four little-endian limbs at
@@ -334,14 +346,16 @@ pub fn calldatasize<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionConte
 pub fn calldatasize_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
     push_at!(
         context.interpreter,
         sp,
+        rem,
         U256::from(context.interpreter.input.input().len())
     );
-    sp
+    (sp, rem)
 }
 
 /// Implements the CALLVALUE instruction.
@@ -361,14 +375,16 @@ pub fn callvalue<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<
 pub fn callvalue_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
     push_at!(
         context.interpreter,
         sp,
+        rem,
         context.interpreter.input.call_value()
     );
-    sp
+    (sp, rem)
 }
 
 /// Implements the CALLDATACOPY instruction.
@@ -415,15 +431,17 @@ pub fn returndatasize<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionCon
 pub fn returndatasize_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
-    check_at!(context.interpreter, sp, BYZANTIUM);
+    rem: u64,
+) -> (usize, u64) {
+    check_at!(context.interpreter, sp, rem, BYZANTIUM);
     //gas!(context.interpreter, gas::BASE);
     push_at!(
         context.interpreter,
         sp,
+        rem,
         U256::from(context.interpreter.return_data.buffer().len())
     );
-    sp
+    (sp, rem)
 }
 
 /// EIP-211: New opcodes: RETURNDATASIZE and RETURNDATACOPY
@@ -471,14 +489,11 @@ pub fn gas<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 pub fn gas_at<WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
-    push_at!(
-        context.interpreter,
-        sp,
-        U256::from(context.interpreter.gas.remaining())
-    );
-    sp
+    push_at!(context.interpreter, sp, rem, U256::from(rem));
+    (sp, rem)
 }
 
 /// Common logic for copying data from a source buffer to the EVM's memory.

@@ -24,10 +24,11 @@ pub fn gasprice<WIRE: InterpreterTypes, H: Host + ?Sized>(
 pub fn gasprice_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
-    push_at!(context.interpreter, sp, context.host.effective_gas_price());
-    sp
+    push_at!(context.interpreter, sp, rem, context.host.effective_gas_price());
+    (sp, rem)
 }
 
 /// Implements the ORIGIN instruction.
@@ -47,14 +48,16 @@ pub fn origin<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionCont
 pub fn origin_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
     push_at!(
         context.interpreter,
         sp,
+        rem,
         context.host.caller().into_word().into()
     );
-    sp
+    (sp, rem)
 }
 
 /// Implements the BLOBHASH instruction.
@@ -76,11 +79,12 @@ pub fn blob_hash<WIRE: InterpreterTypes, H: Host + ?Sized>(
 pub fn blob_hash_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     mut sp: usize,
-) -> usize {
-    check_at!(context.interpreter, sp, CANCUN);
+    rem: u64,
+) -> (usize, u64) {
+    check_at!(context.interpreter, sp, rem, CANCUN);
     //gas!(context.interpreter, gas::VERYLOW);
-    popn_top_at!([], index, context.interpreter, sp);
+    popn_top_at!([], index, context.interpreter, sp, rem);
     let i = as_usize_saturated!(index);
     *index = context.host.blob_hash(i).unwrap_or_default();
-    sp
+    (sp, rem)
 }
