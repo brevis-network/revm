@@ -20,7 +20,7 @@ impl Serialize for ExtBytecode {
         ExtBytecodeSerde {
             base: Cow::Borrowed(&self.base),
             program_counter: self.pc(),
-            bytecode_hash: self.bytecode_hash,
+            bytecode_hash: self.bytecode_hash.get(),
         }
         .serialize(serializer)
     }

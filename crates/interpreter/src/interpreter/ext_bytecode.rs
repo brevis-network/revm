@@ -2,7 +2,7 @@ use super::{Immediates, JumpCtx, Jumps, LegacyBytecode};
 use crate::{interpreter_types::LoopControl, InterpreterAction};
 use bytecode::{utils::read_u16, Bytecode};
 use core::ops::Deref;
-use primitives::B256;
+use primitives::{MaybeB256, B256};
 
 #[cfg(feature = "serde")]
 mod serde;
@@ -15,9 +15,12 @@ pub struct ExtBytecode {
     /// Whether the execution should continue.
     continue_execution: bool,
     /// Bytecode Keccak-256 hash.
-    /// This is `None` if it hasn't been calculated yet.
+    /// This is absent if it hasn't been calculated yet.
     /// Since it's not necessary for execution, it's not calculated by default.
-    bytecode_hash: Option<B256>,
+    ///
+    /// [`MaybeB256`] rather than `Option<B256>` so the 32 bytes land somewhere the compiler
+    /// knows is 8-aligned; see there.
+    bytecode_hash: MaybeB256,
     /// Actions that the EVM should do. It contains return value of the Interpreter or inputs for `CALL` or `CREATE` instructions.
     /// For `RETURN` or `REVERT` instructions it contains the result of the instruction.
     pub action: Option<InterpreterAction>,
@@ -75,7 +78,7 @@ impl ExtBytecode {
         // SAFETY: `p` is writable storage for a `Self` per the contract, and every field is
         // initialized exactly once below.
         unsafe {
-            primitives::write_some_b256(
+            MaybeB256::write_some(
                 core::ptr::addr_of_mut!((*p).bytecode_hash),
                 core::ptr::addr_of!(hash).cast::<u8>(),
             );
@@ -111,11 +114,11 @@ impl ExtBytecode {
         // initialized exactly once below.
         unsafe {
             match hash {
-                Some(h) => primitives::write_some_b256(
+                Some(h) => MaybeB256::write_some(
                     core::ptr::addr_of_mut!((*p).bytecode_hash),
                     core::ptr::addr_of!(h).cast::<u8>(),
                 ),
-                None => core::ptr::addr_of_mut!((*p).bytecode_hash).write(None),
+                None => core::ptr::addr_of_mut!((*p).bytecode_hash).write(MaybeB256::NONE),
             }
             core::ptr::addr_of_mut!((*p).base).write(base);
             core::ptr::addr_of_mut!((*p).instruction_pointer).write(instruction_pointer);
@@ -158,23 +161,26 @@ impl ExtBytecode {
     #[inline]
     pub fn calculate_hash(&mut self) -> B256 {
         let hash = self.base.hash_slow();
-        self.bytecode_hash = Some(hash);
+        self.bytecode_hash = MaybeB256::some(&hash);
         hash
     }
 
     /// Returns the bytecode hash.
     #[inline]
     pub fn hash(&mut self) -> Option<B256> {
-        self.bytecode_hash
+        self.bytecode_hash.get()
     }
 
     /// Returns the bytecode hash or calculates it if it is not set.
     #[inline]
     pub fn get_or_calculate_hash(&mut self) -> B256 {
-        *self.bytecode_hash.get_or_insert_with(
-            #[cold]
-            || self.base.hash_slow(),
-        )
+        if self.bytecode_hash.is_some() {
+            // SAFETY-free fast path: `is_some`, so `get` is `Some`.
+            return self.bytecode_hash.get().unwrap_or_default();
+        }
+        let hash = self.base.hash_slow();
+        self.bytecode_hash = MaybeB256::some(&hash);
+        hash
     }
 }
 
@@ -340,6 +346,8 @@ mod tests {
         let bytecode = Bytecode::new_raw(Bytes::from(&[0x60, 0x00][..]));
         let hash = bytecode.hash_slow();
         let ext_bytecode = ExtBytecode::new_with_hash(bytecode.clone(), hash);
-        assert_eq!(ext_bytecode.bytecode_hash, Some(hash));
+        assert_eq!(ext_bytecode.bytecode_hash.get(), Some(hash));
+        assert!(ext_bytecode.bytecode_hash.is_some());
+        assert_eq!(ExtBytecode::new(bytecode).bytecode_hash.get(), None);
     }
 }

@@ -276,6 +276,106 @@ pub unsafe fn write_some_b256(dst: *mut Option<B256>, src: *const u8) {
     }
 }
 
+/// An `Option<B256>` whose payload the compiler knows is 8-aligned.
+///
+/// `Option<B256>` is a tag byte plus a 32-byte align-1 payload, so the payload sits at an odd
+/// offset of a 33-byte align-1 object: whatever the enclosing struct's alignment,
+/// `&option.payload` is *never* 8-aligned, and every write of one takes
+/// [`write_some_b256`]'s `memcpy` fallback rather than its four `sd`. Measured on mainnet
+/// block 24006677: `ExtBytecode`'s bytecode hash took the fallback 20,024 times out of
+/// 20,024, once per call frame.
+///
+/// `#[repr(C)]` plus the explicit padding puts the payload at offset 8 of an align-8 struct
+/// by construction, so no probing and no runtime check are needed -- and the "absent" case
+/// costs one `sb` instead of a discriminant plus a 32-byte zero fill.
+#[repr(C, align(8))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MaybeB256 {
+    present: bool,
+    _pad: [u8; 7],
+    hash: B256,
+}
+
+const _: () = assert!(core::mem::offset_of!(MaybeB256, hash).is_multiple_of(8));
+
+impl Default for MaybeB256 {
+    #[inline]
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+impl MaybeB256 {
+    /// The absent value.
+    pub const NONE: Self = Self {
+        present: false,
+        _pad: [0; 7],
+        hash: B256::ZERO,
+    };
+
+    /// Wraps `Some(hash)`.
+    #[inline(always)]
+    pub fn some(hash: &B256) -> Self {
+        let mut me = Self::NONE;
+        // SAFETY: `me.hash` is 32 writable bytes 8-aligned by construction, `hash` is a live
+        // distinct `B256`, and the two do not overlap.
+        unsafe { copy_b256_bytes(me.hash.as_mut_ptr(), hash.as_ptr()) };
+        me.present = true;
+        me
+    }
+
+    /// Writes `Some(<the 32 bytes at `src`>)` through `dst`. See [`write_some_b256`].
+    ///
+    /// # Safety
+    /// `dst` must point at a writable `MaybeB256` and `src` at 32 readable bytes that do not
+    /// overlap it.
+    #[inline(always)]
+    pub unsafe fn write_some(dst: *mut Self, src: *const u8) {
+        // SAFETY: `dst` is writable per the contract, and `hash` is 8-aligned within it.
+        unsafe {
+            copy_b256_bytes(core::ptr::addr_of_mut!((*dst).hash).cast::<u8>(), src);
+            core::ptr::addr_of_mut!((*dst).present).write(true);
+            core::ptr::addr_of_mut!((*dst)._pad).write([0; 7]);
+        }
+    }
+
+    /// The wrapped hash, if any.
+    #[inline(always)]
+    pub fn get(&self) -> Option<B256> {
+        if self.present {
+            Some(self.hash)
+        } else {
+            None
+        }
+    }
+
+    /// True when a hash is present.
+    #[inline(always)]
+    pub fn is_some(&self) -> bool {
+        self.present
+    }
+
+    /// The wrapped hash, filling it in from `f` if absent.
+    #[inline(always)]
+    pub fn get_or_insert_with(&mut self, f: impl FnOnce() -> B256) -> B256 {
+        if !self.present {
+            self.hash = f();
+            self.present = true;
+        }
+        self.hash
+    }
+}
+
+impl From<Option<B256>> for MaybeB256 {
+    #[inline(always)]
+    fn from(value: Option<B256>) -> Self {
+        match value {
+            Some(h) => Self::some(&h),
+            None => Self::NONE,
+        }
+    }
+}
+
 /// True when the 32 bytes at `a` equal the 32 bytes at `b`.
 ///
 /// A `[u8; 32]` (so `B256`, `FixedBytes<32>`) equality lowers to a `memcmp` libcall on this
@@ -658,6 +758,46 @@ mod fast_key_tests {
         // SAFETY: `slot` is a live, initialized `Option<Address>`; `want` is distinct.
         unsafe { write_some_address(&mut slot, want.as_ptr()) };
         assert_eq!(slot, Some(want));
+    }
+
+    /// `MaybeB256` has to behave exactly like the `Option<B256>` it replaces, from every
+    /// start alignment of the source. Non-vacuous: the absent case is asserted to be `None`
+    /// and the present case to be `Some(<those exact bytes>)`, so neither a helper that
+    /// wrote nothing nor one that wrote the wrong bytes could pass.
+    #[test]
+    fn maybe_b256_matches_option() {
+        assert_eq!(MaybeB256::NONE.get(), None);
+        assert!(!MaybeB256::NONE.is_some());
+        assert_eq!(MaybeB256::default().get(), None);
+        assert_eq!(MaybeB256::from(None).get(), None);
+        for os in 0..8usize {
+            let mut bytes = [0u8; 32];
+            for (k, b) in bytes.iter_mut().enumerate() {
+                *b = (k as u8).wrapping_mul(17).wrapping_add(5);
+            }
+            let want = B256::from(bytes);
+            let mut store = vec![0u8; 64];
+            let pad = store.as_ptr().align_offset(8);
+            // SAFETY: room for a 32-byte window at `pad + os`; `B256` is align 1.
+            unsafe {
+                let ps = store.as_mut_ptr().add(pad + os);
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(), ps, 32);
+                let src = &*ps.cast::<B256>();
+                assert_eq!(MaybeB256::some(src).get(), Some(want), "some os={os}");
+                assert!(MaybeB256::some(src).is_some());
+                assert_eq!(MaybeB256::from(Some(*src)).get(), Some(want), "from os={os}");
+                let mut slot = MaybeB256::NONE;
+                MaybeB256::write_some(&mut slot, ps);
+                assert_eq!(slot.get(), Some(want), "write_some os={os}");
+                // and it overwrites a previous value rather than merging
+                MaybeB256::write_some(&mut slot, B256::repeat_byte(0xab).as_ptr());
+                assert_eq!(slot.get(), Some(B256::repeat_byte(0xab)));
+            }
+        }
+        let mut slot = MaybeB256::NONE;
+        assert_eq!(slot.get_or_insert_with(|| B256::repeat_byte(7)), B256::repeat_byte(7));
+        assert_eq!(slot.get(), Some(B256::repeat_byte(7)));
+        assert_eq!(slot.get_or_insert_with(|| B256::repeat_byte(9)), B256::repeat_byte(7));
     }
 
     /// A `FastAddress` query has to hash into the bucket an `Address` key was stored in, and
