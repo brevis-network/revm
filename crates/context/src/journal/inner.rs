@@ -871,6 +871,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     ///
     /// Panics if the account is not present in the state.
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn sload_slot<'a, DB: Database>(
         state: &'a mut EvmState,
         account_cache: &mut AccountCache,
