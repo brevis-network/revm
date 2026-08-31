@@ -510,6 +510,23 @@ pub fn memory_resize(
         return None;
     }
     let memory_offset = as_usize_or_fail_ret!(interpreter, memory_offset, None);
+    // Not `resize_memory_written!`, though it looks like it should be.
+    //
+    // All three callers -- CODECOPY, CALLDATACOPY, RETURNDATACOPY -- do overwrite every
+    // byte of the range they grow into (`set_data` copies what the source has and
+    // `fill(0)`s the rest), so the hint would be *sound*. It is just not worth anything:
+    // measured at **+147,976** on block 24006677, of which +75,205 is this function itself
+    // growing.
+    //
+    // The reason is the ratio. These three are ~11,000 dispatches between them against
+    // MSTORE's 290,738, and they mostly write into memory that already exists, so there is
+    // very little fill to skip -- while `resize_written` is the larger function and is
+    // called on every one of those dispatches, growing or not. The hint pays for MSTORE
+    // because 36.5 % of MSTOREs grow and the skipped fill is a whole word each time.
+    //
+    // MCOPY was measured with it too, taking the `dst >= src` half (the only sound one --
+    // when `src` is the max, the bytes grown into are the copy's *source* and must read as
+    // zero): a further +652. Not worth the branch.
     resize_memory!(interpreter, memory_offset, len, None);
 
     Some(memory_offset)
