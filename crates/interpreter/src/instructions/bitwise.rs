@@ -317,6 +317,73 @@ pub fn byte_at<WIRE: InterpreterTypes, H: ?Sized>(
     (sp, rem)
 }
 
+/// `x << shift` for `shift < 256`, computed entirely in registers.
+///
+/// `U256`'s `Shl` goes through ruint's `overflowing_shl`, which builds the result with
+/// `array::from_fn` over a *dynamic* limb offset. LLVM cannot keep that in registers: on the
+/// guest target the `SHL` arm of the dispatch loop zeroes a four-word frame buffer, spills
+/// the four input limbs to a second one, runs a four-iteration load/shift/store loop between
+/// them, and then copies the result through a *third* buffer before it reaches the stack word
+/// -- 24 frame loads and stores for what is a dozen register operations. Measured on block
+/// 24006677: 95,464 `SHL`+`SHR` dispatches carrying 1.74 M retired loads and stores of frame
+/// traffic, plus the loop's own overhead.
+///
+/// This is the same shape as a hardware barrel shifter and has no memory in it: two stages of
+/// selects move whole limbs, then one funnel stage moves bits. The `m` mask is what keeps the
+/// bit stage branch-free -- `b == 0` would otherwise need `x >> 64`, which is not a shift.
+#[inline(always)]
+fn u256_shl(x: &U256, shift: usize) -> U256 {
+    let l = x.as_limbs();
+    let w = shift >> 6;
+    // Stage 1 and 2: move by two limbs, then by one. Eight selects, no memory.
+    let (b0, b1, b2, b3) = if w & 2 != 0 {
+        (0, 0, l[0], l[1])
+    } else {
+        (l[0], l[1], l[2], l[3])
+    };
+    let (a0, a1, a2, a3) = if w & 1 != 0 {
+        (0, b0, b1, b2)
+    } else {
+        (b0, b1, b2, b3)
+    };
+    // Stage 3: the bit funnel.
+    let b = (shift & 63) as u32;
+    let c = (64 - b) & 63;
+    let m = if b == 0 { 0 } else { u64::MAX };
+    U256::from_limbs([
+        a0 << b,
+        (a1 << b) | ((a0 >> c) & m),
+        (a2 << b) | ((a1 >> c) & m),
+        (a3 << b) | ((a2 >> c) & m),
+    ])
+}
+
+/// `x >> shift` for `shift < 256`, computed entirely in registers. See [`u256_shl`].
+#[inline(always)]
+fn u256_shr(x: &U256, shift: usize) -> U256 {
+    let l = x.as_limbs();
+    let w = shift >> 6;
+    let (b0, b1, b2, b3) = if w & 2 != 0 {
+        (l[2], l[3], 0, 0)
+    } else {
+        (l[0], l[1], l[2], l[3])
+    };
+    let (a0, a1, a2, a3) = if w & 1 != 0 {
+        (b1, b2, b3, 0)
+    } else {
+        (b0, b1, b2, b3)
+    };
+    let b = (shift & 63) as u32;
+    let c = (64 - b) & 63;
+    let m = if b == 0 { 0 } else { u64::MAX };
+    U256::from_limbs([
+        (a0 >> b) | ((a1 << c) & m),
+        (a1 >> b) | ((a2 << c) & m),
+        (a2 >> b) | ((a3 << c) & m),
+        a3 >> b,
+    ])
+}
+
 /// EIP-145: Bitwise shifting instructions in EVM
 pub fn shl<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, WIRE>) {
     run_threaded!(context, shl_at)
@@ -340,7 +407,7 @@ pub fn shl_at<WIRE: InterpreterTypes, H: ?Sized>(
 
     let shift = as_usize_saturated!(op1);
     *op2 = if shift < 256 {
-        *op2 << shift
+        u256_shl(op2, shift)
     } else {
         U256::ZERO
     };
@@ -370,7 +437,7 @@ pub fn shr_at<WIRE: InterpreterTypes, H: ?Sized>(
 
     let shift = as_usize_saturated!(op1);
     *op2 = if shift < 256 {
-        *op2 >> shift
+        u256_shr(op2, shift)
     } else {
         U256::ZERO
     };
@@ -407,6 +474,36 @@ pub fn sar_at<WIRE: InterpreterTypes, H: ?Sized>(
         U256::ZERO
     };
     (sp, rem)
+}
+
+#[cfg(test)]
+mod shift_tests {
+    use super::{u256_shl, u256_shr};
+    use primitives::U256;
+
+    /// Every shift width against ruint's own operators, on patterns that exercise each limb
+    /// boundary and each bit boundary.
+    #[test]
+    fn shl_shr_match_ruint_for_every_shift() {
+        let cases = [
+            U256::ZERO,
+            U256::MAX,
+            U256::from(1u64),
+            U256::from(u64::MAX),
+            U256::from_limbs([1, 0, 0, 0]),
+            U256::from_limbs([0, 0, 0, 1]),
+            U256::from_limbs([0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210, 1, u64::MAX]),
+            U256::from_limbs([u64::MAX, 0, u64::MAX, 0]),
+            U256::from_limbs([0, u64::MAX, 0, u64::MAX]),
+            U256::from_limbs([0x8000_0000_0000_0000, 0, 0, 0x8000_0000_0000_0000]),
+        ];
+        for x in cases {
+            for shift in 0..256usize {
+                assert_eq!(u256_shl(&x, shift), x << shift, "shl {x:?} by {shift}");
+                assert_eq!(u256_shr(&x, shift), x >> shift, "shr {x:?} by {shift}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
