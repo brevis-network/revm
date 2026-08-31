@@ -808,9 +808,31 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // this function reads it four times over: to hash it, to journal it, and to build
         // the returned `JournaledAccount`. Re-home it once; see `AlignedAddress`.
         let address = AlignedAddress::new(&address);
-        let load = match self.state.entry(address.0) {
-            Entry::Occupied(entry) => {
-                let account = entry.into_mut();
+        // `entry` takes the key by value and compares it with `K: Eq`, so `Equivalent` cannot
+        // redirect the bucket comparison and it stays the 20-byte `memcmp` libcall
+        // `Address: PartialEq` lowers to - 32,786 of them on mainnet block 24006677, at ~39
+        // retired instructions each, on a function that is called 32,983 times and finds the
+        // account already there almost every time. `get_mut` can be keyed by
+        // `FastAddressAt`, and the insert then only has to exist on the path that misses.
+        //
+        // Tag 3, and this is its only call site: one query type shared between two sites
+        // makes LLVM outline hashbrown's probe and the call costs more than the `memcmp`;
+        // see `FastAddressAt`.
+        //
+        // A raw pointer rather than the `&mut Account` itself: the borrow it comes from would
+        // have to stay live across the vacant arm, which needs `self.state` again, and NLL
+        // cannot see that the two arms are exclusive. Exactly one reference is created from
+        // it and nothing touches `self.state` in between.
+        let occupied: Option<*mut Account> = self
+            .state
+            .get_mut(primitives::FastAddressAt::<3>::new(&address.0))
+            .map(|account| account as *mut Account);
+
+        let load = match occupied {
+            Some(account) => {
+                // SAFETY: derived from a live `&mut Account` just above, and nothing has
+                // touched `self.state` since.
+                let account = unsafe { &mut *account };
 
                 // skip load if account is cold.
                 let mut is_cold = account.is_cold_transaction_id(self.transaction_id);
@@ -841,7 +863,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
                     is_cold,
                 }
             }
-            Entry::Vacant(vac) => {
+            None => {
                 // Required: the insert below is the only one this module performs on the
                 // state map, so it is the only place a bucket pointer can be moved. Cleared
                 // before the insert rather than after so that no path out of this arm can
@@ -860,8 +882,14 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
                     Account::new_not_existing(self.transaction_id)
                 };
 
+                // `entry` only on this path, which is the rare one: it costs the `memcmp`
+                // the hit path no longer pays, and it is the only spelling that hands back a
+                // `&mut Account` for the value it inserted.
                 StateLoad {
-                    data: vac.insert(account),
+                    data: match self.state.entry(address.0) {
+                        Entry::Occupied(e) => e.into_mut(),
+                        Entry::Vacant(vac) => vac.insert(account),
+                    },
                     is_cold,
                 }
             }
