@@ -460,7 +460,10 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             return None;
         }
 
-        if balance.is_zero() {
+        // `U256::is_zero` is spelled `*self == Self::ZERO` upstream, so it is a 32-byte
+        // `memcmp` libcall on this target: 16,383 calls on mainnet block 24006677, one per
+        // value-carrying `CALL`. See `primitives::u256_is_zero`.
+        if primitives::u256_is_zero(&balance) {
             // SAFETY: as above.
             Self::touch_account(&mut self.journal, to.0, unsafe { &mut *to_account });
             return None;
@@ -695,7 +698,8 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
 
         Ok(StateLoad {
             data: SelfDestructResult {
-                had_value: !balance.is_zero(),
+                // See the `transfer_loaded` comment: a `memcmp` libcall otherwise.
+                had_value: !primitives::u256_is_zero(&balance),
                 target_exists: !is_empty,
                 previously_destroyed: destroyed_status
                     == SelfdestructionRevertStatus::RepeatedSelfdestruction,
@@ -1185,7 +1189,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     /// EIP-1153: Transient storage opcodes
     #[inline]
     pub fn tstore(&mut self, address: Address, key: StorageKey, new: StorageValue) {
-        let had_value = if new.is_zero() {
+        let had_value = if primitives::u256_is_zero(&new) {
             // if new values is zero, remove entry from transient storage.
             // if previous values was some insert it inside journal.
             // If it is none nothing should be inserted.

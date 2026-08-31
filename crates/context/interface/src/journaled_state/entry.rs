@@ -392,7 +392,7 @@ impl JournalEntryTr for JournalEntry {
                     return;
                 };
                 let tkey = (address, key);
-                if had_value.is_zero() {
+                if primitives::u256_is_zero(&had_value) {
                     // if previous value is zero, remove it
                     transient_storage.remove(&tkey);
                 } else {
