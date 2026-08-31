@@ -186,7 +186,13 @@ pub fn iszero_at<WIRE: InterpreterTypes, H: ?Sized>(
 ) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
     popn_top_at!([], op1, context.interpreter, sp, rem);
-    *op1 = U256::from(super::u256_is_zero(op1));
+    // A non-zero low limb settles it without the other three loads and the or-reduce.
+    let l = op1.as_limbs();
+    if l[0] != 0 {
+        *op1 = U256::ZERO;
+        return (sp, rem);
+    }
+    *op1 = U256::from((l[1] | l[2] | l[3]) == 0);
     (sp, rem)
 }
 
