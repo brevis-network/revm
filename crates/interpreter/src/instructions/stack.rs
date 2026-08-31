@@ -1,5 +1,5 @@
 use crate::{
-    interpreter::{BYTE_LIMIT, WORD},
+    interpreter::{too_shallow_for, BYTE_LIMIT, WORD},
     interpreter_types::{Immediates, InterpreterTypes, Jumps, RuntimeFlag, StackTr},
     InstructionResult,
 };
@@ -97,19 +97,24 @@ pub fn dup_at<const N: usize, WIRE: InterpreterTypes, H: ?Sized>(
     rem: u64,
 ) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
-    // One unsigned compare, exactly as `Stack::dup`; see the note there for why the two
-    // bounds fold into one.
-    let need = N * WORD;
-    let limit = (BYTE_LIMIT - WORD).saturating_sub(need);
-    if sp.wrapping_sub(need) > limit {
+    // Room, then depth. The cursor is the offset of the topmost word (see `StackTr::sp`), so
+    // "full" is `BYTE_LIMIT - WORD` and "at least `N` words deep" is `sp >= (N - 1) * WORD`.
+    // The switch dispatch of `Interpreter::run_plain` does not come through here -- `DUP` is
+    // tagged `(6, N)` and tests the same two bounds against a pinned register -- so this form
+    // is the readable one rather than the one unsigned compare it used to fold into.
+    if sp == BYTE_LIMIT - WORD || (sp as isize) <= too_shallow_for(N) {
         return (
             sp,
-            poison_at!(context.interpreter, rem, context.interpreter.halt_overflow()),
+            poison_at!(
+                context.interpreter,
+                rem,
+                context.interpreter.halt_overflow()
+            ),
         );
     }
     // SAFETY: depth and room checked above.
     unsafe { context.interpreter.stack.dup_at(sp, N) };
-    (sp + WORD, rem)
+    (sp.wrapping_add(WORD), rem)
 }
 
 /// Implements the SWAP1-SWAP16 instructions.
@@ -136,10 +141,14 @@ pub fn swap_at<const N: usize, WIRE: InterpreterTypes, H: ?Sized>(
     //gas!(context.interpreter, gas::VERYLOW);
     assert!(N != 0);
     // Same bound as `Stack::exchange` with `n = 0`, `m = N`.
-    if N * WORD >= sp {
+    if (sp as isize) <= too_shallow_for(1 + N) {
         return (
             sp,
-            poison_at!(context.interpreter, rem, context.interpreter.halt_overflow()),
+            poison_at!(
+                context.interpreter,
+                rem,
+                context.interpreter.halt_overflow()
+            ),
         );
     }
     // SAFETY: depth checked above, and `N` is non-zero, so the two words are distinct.

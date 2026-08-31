@@ -17,7 +17,7 @@ pub use runtime_flags::RuntimeFlags;
 pub(crate) use shared_memory::store_be_word;
 pub(crate) use shared_memory::{bswap64_shared, bswap_masks_shared, u256_from_be_aligned};
 pub use shared_memory::{num_words, resize_memory, SharedMemory};
-pub use stack::{Stack, BYTE_LIMIT, STACK_LIMIT, WORD};
+pub use stack::{too_shallow_for, Stack, BYTE_LIMIT, STACK_LIMIT, WORD};
 
 // imports
 use crate::{
@@ -529,6 +529,16 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
         // time. Unlike the cursor and the counter, nothing in the loop *writes* them --
         // one `run_plain` call is one frame and one bytecode -- so this is a plain
         // loop-invariant hoist and the arms take it by value without handing it back.
+        // `BYTE_LIMIT`, pinned. The `PUSH1`..`PUSH32` arms below test the cursor
+        // against it, and `PUSH1`/`PUSH2` alone are 24 % of all dispatched opcodes, so the
+        // `lui` that materialises 32768 is 2.26 M retired instructions on block 24006677 --
+        // one per push, because a one-instruction constant is below LLVM's
+        // constant-hoisting threshold and gets rematerialised at every site instead.
+        // `black_box` makes it opaque, so it can not be rematerialised and has to live in a
+        // register for the whole loop. (Expressing the bound as a *two*-instruction constant
+        // to get over the hoisting threshold was tried and does not work: the pass leaves
+        // `icmp` constants alone, and every site went from one instruction to two, +2.26 M.)
+        let byte_limit = core::hint::black_box(BYTE_LIMIT - WORD);
         let jctx = self.bytecode.jump_ctx();
         // The bump of `ip` lives in the arms, past the opcode read, rather than in the loop
         // header. In the header the backend schedules the `addi` ahead of the `lbu` and has to
@@ -638,13 +648,42 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
                 sp = next_sp;
                 rem = next_rem;
             }};
+            // `DUP1`..`DUP16`. Tagged `(6, N)` rather than `(4, dup_at)` so that the two
+            // bounds are tested *here*, where the pinned `byte_limit` is in scope.
+            //
+            // `dup_at` folds them into one unsigned compare against `BYTE_LIMIT - WORD - N *
+            // WORD`, which is the best a single test can do but costs three instructions to
+            // set up: an `add` off a hoisted base plus `lui`/`addiw` for a constant two
+            // instructions wide. Measured on block 24006677 that is 4.27 M retired
+            // instructions for 1.42 M dispatched `DUP`s. Split in two against the pinned
+            // register it is `bne` (no constant at all) plus `bgeu` against `N * WORD`, and
+            // for `DUP1` the depth test is `sp != 0`, i.e. a bare `bnez` -- so two
+            // instructions for `DUP1` and three for the rest.
+            //
+            // The two tests can only stay split because `byte_limit` is opaque: LLVM folds
+            // `sp < a || sp >= b` back into one range compare whenever it knows both
+            // constants, which is exactly what `dup_at` gets.
+            ((6, $n:literal), $_f:expr) => {{
+                ip = unsafe { ip.add(1) };
+                if sp != byte_limit && (sp as isize) > too_shallow_for($n) {
+                    // SAFETY: room and depth checked above, in that order.
+                    unsafe { self.stack.dup_at(sp, $n) };
+                    sp = sp.wrapping_add(WORD);
+                } else {
+                    // Same halt as `poison_at!`: publish the counter for the halt to stash,
+                    // hand the poison back in the register, leave the cursor alone.
+                    self.gas.set_remaining(rem);
+                    self.halt_overflow();
+                    rem = u64::MAX;
+                }
+            }};
             ((2, $n:literal), $_f:expr) => {{
                 // SAFETY: same padding invariant `ExtBytecode::read_slice` relies on: the
                 // analysis pads the bytecode past the last opcode, so the $n immediate bytes
                 // of a trailing `PUSH` are readable.
-                if sp != BYTE_LIMIT {
+                if sp != byte_limit {
                     unsafe { self.stack.push_slice_const_at::<$n>(sp, ip.add(1)) };
-                    sp += WORD;
+                    sp = sp.wrapping_add(WORD);
                     ip = unsafe { ip.add(1 + $n) };
                 } else {
                     // `push` leaves the instruction pointer just past the opcode on
@@ -665,6 +704,18 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
                     // bytecode so that the last opcode is a STOP, so the pointer never walks
                     // off the end: STOP sets an action, which poisons the gas counter and
                     // ends the loop on the next charge.
+                    // The cursor's type invariant, restated on the loop-carried register.
+                    // `Stack::byte_len` asserts it on every *load* of the length precisely so
+                    // that `byte_len < WORD` lowers as `byte_len == 0` -- see the comment
+                    // there -- but the threaded cursor never goes through that load, so every
+                    // arm was re-deriving the bound from nothing: `sp < WORD` became `li 32`
+                    // plus `bgeu` instead of a bare `beqz`. Restating it here, where it
+                    // dominates every arm, hands the same two facts back.
+                    //
+                    // SAFETY: `sp` starts as `Stack::sp()`, which is `byte_len` and carries
+                    // the invariant, and every arm moves it by whole words after checking the
+                    // bound it is about to cross; the halt paths hand it back untouched.
+                    unsafe { core::hint::assert_unchecked(sp % WORD == 0) };
                     let opcode = unsafe { *ip };
                     match opcode {
                         $(

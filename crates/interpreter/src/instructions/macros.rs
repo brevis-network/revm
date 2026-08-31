@@ -255,21 +255,21 @@ macro_rules! poison_at {
 #[collapse_debuginfo(yes)]
 macro_rules! popn_at {
     ([ $($x:ident),* ], $interpreter:expr, $sp:ident, $rem:ident) => {
-        if $sp < ($crate::_count!($($x)*)) * $crate::interpreter::WORD {
+        if ($sp as isize) <= $crate::interpreter::too_shallow_for($crate::_count!($($x)*)) {
             return ($sp, $crate::poison_at!($interpreter, $rem, $interpreter.halt_underflow()));
         }
         // SAFETY: depth checked above.
         let [$( $x ),*] = unsafe {
             $interpreter.stack.popn_at::<{ $crate::_count!($($x)*) }>($sp)
         };
-        $sp -= ($crate::_count!($($x)*)) * $crate::interpreter::WORD;
+        $sp = $sp.wrapping_sub(($crate::_count!($($x)*)) * $crate::interpreter::WORD);
     };
     // `$ret` for `JUMP`/`JUMPI`, which thread the instruction pointer and the cursor but not
     // the gas counter (see the note on `rem` in `Interpreter::run_plain`), so they return a
     // pair and there is nothing to publish. The cursor in `$ret` is the one *before* the pop,
     // which is right -- the operands are still on the stack.
     ([ $($x:ident),* ], $interpreter:expr, $sp:ident, $ret:expr) => {
-        if $sp < ($crate::_count!($($x)*)) * $crate::interpreter::WORD {
+        if ($sp as isize) <= $crate::interpreter::too_shallow_for($crate::_count!($($x)*)) {
             $interpreter.halt_underflow();
             return $ret;
         }
@@ -277,7 +277,7 @@ macro_rules! popn_at {
         let [$( $x ),*] = unsafe {
             $interpreter.stack.popn_at::<{ $crate::_count!($($x)*) }>($sp)
         };
-        $sp -= ($crate::_count!($($x)*)) * $crate::interpreter::WORD;
+        $sp = $sp.wrapping_sub(($crate::_count!($($x)*)) * $crate::interpreter::WORD);
     };
 }
 
@@ -286,14 +286,14 @@ macro_rules! popn_at {
 #[collapse_debuginfo(yes)]
 macro_rules! popn_top_at {
     ([ $($x:ident),* ], $top:ident, $interpreter:expr, $sp:ident, $rem:ident) => {
-        if $sp < (1 + $crate::_count!($($x)*)) * $crate::interpreter::WORD {
+        if ($sp as isize) <= $crate::interpreter::too_shallow_for(1 + $crate::_count!($($x)*)) {
             return ($sp, $crate::poison_at!($interpreter, $rem, $interpreter.halt_underflow()));
         }
         // SAFETY: depth checked above.
         let ([$( $x ),*], $top) = unsafe {
             $interpreter.stack.popn_top_at::<{ $crate::_count!($($x)*) }>($sp)
         };
-        $sp -= ($crate::_count!($($x)*)) * $crate::interpreter::WORD;
+        $sp = $sp.wrapping_sub(($crate::_count!($($x)*)) * $crate::interpreter::WORD);
     };
 }
 
@@ -302,12 +302,15 @@ macro_rules! popn_top_at {
 #[collapse_debuginfo(yes)]
 macro_rules! push_at {
     ($interpreter:expr, $sp:ident, $rem:ident, $x:expr) => {
-        if $sp == $crate::interpreter::BYTE_LIMIT {
-            return ($sp, $crate::poison_at!($interpreter, $rem, $interpreter.halt_overflow()));
+        if $sp == $crate::interpreter::BYTE_LIMIT - $crate::interpreter::WORD {
+            return (
+                $sp,
+                $crate::poison_at!($interpreter, $rem, $interpreter.halt_overflow()),
+            );
         }
         // SAFETY: room checked above.
         unsafe { $interpreter.stack.push_at($sp, $x) };
-        $sp += $crate::interpreter::WORD;
+        $sp = $sp.wrapping_add($crate::interpreter::WORD);
     };
 }
 

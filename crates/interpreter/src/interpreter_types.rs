@@ -362,7 +362,8 @@ pub trait StackTr {
         self.popn_top().map(|([], top)| top)
     }
 
-    /// The **threaded stack cursor**: the byte-scaled length of the stack.
+    /// The **threaded stack cursor**: the byte offset of the topmost word, i.e. the
+    /// byte-scaled length of the stack less one word, and `-WORD` (wrapped) when it is empty.
     ///
     /// [`Interpreter::run_plain`](crate::Interpreter::run_plain) keeps this in a loop-local
     /// for the whole dispatch loop and hands it to the `*_at` operations below, instead of
@@ -371,8 +372,9 @@ pub trait StackTr {
     /// is one it can not remove: on block 24006677 the `ld`/`sd` pair is on the order of two
     /// retired instructions per dispatched opcode, and the loop dispatches 8.07 M of them.
     ///
-    /// The cursor is scaled to bytes for the same reason `Stack::byte_len` is; see the note
-    /// there. An arm updates it by whole `size_of::<U256>()` steps and hands the new value to
+    /// The cursor is scaled to bytes for the same reason `Stack::byte_len` is, and biased
+    /// down by one word so that the one- and two-word depth tests branch against zero; both
+    /// notes are on `Stack`'s implementation of `sp` below. An arm updates it by whole `size_of::<U256>()` steps and hands the new value to
     /// the next arm, and the single loop exit writes it back with [`StackTr::set_sp`].
     ///
     /// # Implementing
@@ -385,7 +387,7 @@ pub trait StackTr {
     /// what would break, so they are documented as one group.
     #[inline]
     fn sp(&self) -> usize {
-        self.len() * core::mem::size_of::<U256>()
+        (self.len() * core::mem::size_of::<U256>()).wrapping_sub(core::mem::size_of::<U256>())
     }
 
     /// Writes the threaded cursor back into the stack, so that everything reached from
@@ -404,7 +406,7 @@ pub trait StackTr {
     ///
     /// # Safety
     ///
-    /// `sp` must be the current cursor, and at least `N * 32`.
+    /// `sp` must be the current cursor, and at least `(N - 1) * 32`.
     #[must_use]
     #[inline]
     unsafe fn popn_at<const N: usize>(&mut self, sp: usize) -> [U256; N] {
@@ -418,7 +420,7 @@ pub trait StackTr {
     ///
     /// # Safety
     ///
-    /// `sp` must be the current cursor, and at least `(N + 1) * 32`.
+    /// `sp` must be the current cursor, and at least `N * 32`.
     #[must_use]
     #[inline]
     unsafe fn popn_top_at<const N: usize>(&mut self, sp: usize) -> ([U256; N], &mut U256) {
@@ -431,7 +433,7 @@ pub trait StackTr {
     ///
     /// # Safety
     ///
-    /// `sp` must be the current cursor, and at least `32`.
+    /// `sp` must be the current cursor, and at least zero.
     #[must_use]
     #[inline]
     unsafe fn top_at(&mut self, sp: usize) -> &mut U256 {
@@ -445,7 +447,7 @@ pub trait StackTr {
     ///
     /// # Safety
     ///
-    /// `sp` must be the current cursor, and at least `(depth + 1) * 32`.
+    /// `sp` must be the current cursor, and at least `depth * 32`.
     #[must_use]
     #[inline]
     unsafe fn peek_at(&self, sp: usize, depth: usize) -> *const U256 {
@@ -459,7 +461,7 @@ pub trait StackTr {
     ///
     /// # Safety
     ///
-    /// `sp` must be the current cursor, and below the stack limit in bytes.
+    /// `sp` must be the current cursor, and below the stack limit in bytes less one word.
     #[inline]
     unsafe fn push_at(&mut self, sp: usize, value: U256) {
         let _ = sp;
@@ -470,7 +472,7 @@ pub trait StackTr {
     ///
     /// # Safety
     ///
-    /// `sp` must be the current cursor, at least `n * 32`, and below the stack limit in
+    /// `sp` must be the current cursor, at least `(n - 1) * 32`, and below the stack limit in
     /// bytes. `n` must be non-zero.
     #[inline]
     unsafe fn dup_at(&mut self, sp: usize, n: usize) {
@@ -482,7 +484,7 @@ pub trait StackTr {
     ///
     /// # Safety
     ///
-    /// `sp` must be the current cursor and greater than `(n + m) * 32`. `m` must be
+    /// `sp` must be the current cursor and at least `(n + m) * 32`. `m` must be
     /// non-zero.
     #[inline]
     unsafe fn exchange_at(&mut self, sp: usize, n: usize, m: usize) {
@@ -495,7 +497,7 @@ pub trait StackTr {
     ///
     /// # Safety
     ///
-    /// `sp` must be the current cursor and below the stack limit in bytes. `src` must be
+    /// `sp` must be the current cursor and below the stack limit in bytes less one word. `src` must be
     /// valid for reads of `N` bytes, and `N` must be in `1..=32`.
     #[inline]
     unsafe fn push_slice_const_at<const N: usize>(&mut self, sp: usize, src: *const u8) {

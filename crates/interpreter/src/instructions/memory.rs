@@ -1,6 +1,6 @@
 use crate::{
     gas,
-    interpreter::WORD,
+    interpreter::{too_shallow_for, WORD},
     interpreter_types::{InterpreterTypes, MemoryTr, RuntimeFlag, StackTr},
 };
 use core::cmp::max;
@@ -35,10 +35,14 @@ pub fn mload_at<WIRE: InterpreterTypes, H: ?Sized>(
     rem: u64,
 ) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
-    if sp < WORD {
+    if (sp as isize) <= too_shallow_for(1) {
         return (
             sp,
-            poison_at!(context.interpreter, rem, context.interpreter.halt_underflow()),
+            poison_at!(
+                context.interpreter,
+                rem,
+                context.interpreter.halt_underflow()
+            ),
         );
     }
     // This one charges gas of its own, so it publishes the threaded counter into the field
@@ -82,10 +86,14 @@ pub fn mstore_at<WIRE: InterpreterTypes, H: ?Sized>(
     rem: u64,
 ) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
-    if sp < 2 * WORD {
+    if (sp as isize) <= too_shallow_for(2) {
         return (
             sp,
-            poison_at!(context.interpreter, rem, context.interpreter.halt_underflow()),
+            poison_at!(
+                context.interpreter,
+                rem,
+                context.interpreter.halt_underflow()
+            ),
         );
     }
     // This one charges gas of its own, so it publishes the threaded counter into the field
@@ -102,7 +110,10 @@ pub fn mstore_at<WIRE: InterpreterTypes, H: ?Sized>(
     let src = unsafe { context.interpreter.stack.peek_at(sp, 1) }.cast::<u64>();
     unsafe { context.interpreter.memory.set_u256_ptr(offset, src) };
     // The two operands are gone; dropping them is one subtraction on the cursor.
-    (sp - 2 * WORD, context.interpreter.gas.remaining())
+    (
+        sp.wrapping_sub(2 * WORD),
+        context.interpreter.gas.remaining(),
+    )
 }
 
 /// Implements the MSTORE8 instruction.

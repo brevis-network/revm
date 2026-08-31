@@ -280,38 +280,22 @@ macro_rules! for_each_builtin_instruction {
             PUSH30 => $crate::instructions::stack::push::<30, _, _>, 3, (2, 30);
             PUSH31 => $crate::instructions::stack::push::<31, _, _>, 3, (2, 31);
             PUSH32 => $crate::instructions::stack::push::<32, _, _>, 3, (2, 32);
-            DUP1 => $crate::instructions::stack::dup::<1, _, _>, 3,
-                (4, $crate::instructions::stack::dup_at::<1, _, _>);
-            DUP2 => $crate::instructions::stack::dup::<2, _, _>, 3,
-                (4, $crate::instructions::stack::dup_at::<2, _, _>);
-            DUP3 => $crate::instructions::stack::dup::<3, _, _>, 3,
-                (4, $crate::instructions::stack::dup_at::<3, _, _>);
-            DUP4 => $crate::instructions::stack::dup::<4, _, _>, 3,
-                (4, $crate::instructions::stack::dup_at::<4, _, _>);
-            DUP5 => $crate::instructions::stack::dup::<5, _, _>, 3,
-                (4, $crate::instructions::stack::dup_at::<5, _, _>);
-            DUP6 => $crate::instructions::stack::dup::<6, _, _>, 3,
-                (4, $crate::instructions::stack::dup_at::<6, _, _>);
-            DUP7 => $crate::instructions::stack::dup::<7, _, _>, 3,
-                (4, $crate::instructions::stack::dup_at::<7, _, _>);
-            DUP8 => $crate::instructions::stack::dup::<8, _, _>, 3,
-                (4, $crate::instructions::stack::dup_at::<8, _, _>);
-            DUP9 => $crate::instructions::stack::dup::<9, _, _>, 3,
-                (4, $crate::instructions::stack::dup_at::<9, _, _>);
-            DUP10 => $crate::instructions::stack::dup::<10, _, _>, 3,
-                (4, $crate::instructions::stack::dup_at::<10, _, _>);
-            DUP11 => $crate::instructions::stack::dup::<11, _, _>, 3,
-                (4, $crate::instructions::stack::dup_at::<11, _, _>);
-            DUP12 => $crate::instructions::stack::dup::<12, _, _>, 3,
-                (4, $crate::instructions::stack::dup_at::<12, _, _>);
-            DUP13 => $crate::instructions::stack::dup::<13, _, _>, 3,
-                (4, $crate::instructions::stack::dup_at::<13, _, _>);
-            DUP14 => $crate::instructions::stack::dup::<14, _, _>, 3,
-                (4, $crate::instructions::stack::dup_at::<14, _, _>);
-            DUP15 => $crate::instructions::stack::dup::<15, _, _>, 3,
-                (4, $crate::instructions::stack::dup_at::<15, _, _>);
-            DUP16 => $crate::instructions::stack::dup::<16, _, _>, 3,
-                (4, $crate::instructions::stack::dup_at::<16, _, _>);
+            DUP1 => $crate::instructions::stack::dup::<1, _, _>, 3, (6, 1);
+            DUP2 => $crate::instructions::stack::dup::<2, _, _>, 3, (6, 2);
+            DUP3 => $crate::instructions::stack::dup::<3, _, _>, 3, (6, 3);
+            DUP4 => $crate::instructions::stack::dup::<4, _, _>, 3, (6, 4);
+            DUP5 => $crate::instructions::stack::dup::<5, _, _>, 3, (6, 5);
+            DUP6 => $crate::instructions::stack::dup::<6, _, _>, 3, (6, 6);
+            DUP7 => $crate::instructions::stack::dup::<7, _, _>, 3, (6, 7);
+            DUP8 => $crate::instructions::stack::dup::<8, _, _>, 3, (6, 8);
+            DUP9 => $crate::instructions::stack::dup::<9, _, _>, 3, (6, 9);
+            DUP10 => $crate::instructions::stack::dup::<10, _, _>, 3, (6, 10);
+            DUP11 => $crate::instructions::stack::dup::<11, _, _>, 3, (6, 11);
+            DUP12 => $crate::instructions::stack::dup::<12, _, _>, 3, (6, 12);
+            DUP13 => $crate::instructions::stack::dup::<13, _, _>, 3, (6, 13);
+            DUP14 => $crate::instructions::stack::dup::<14, _, _>, 3, (6, 14);
+            DUP15 => $crate::instructions::stack::dup::<15, _, _>, 3, (6, 15);
+            DUP16 => $crate::instructions::stack::dup::<16, _, _>, 3, (6, 16);
             SWAP1 => $crate::instructions::stack::swap::<1, _, _>, 3,
                 (4, $crate::instructions::stack::swap_at::<1, _, _>);
             SWAP2 => $crate::instructions::stack::swap::<2, _, _>, 3,
