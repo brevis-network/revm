@@ -316,6 +316,7 @@ impl<T> RefcellExt<T> for RefCell<T> {
 /// the `new` static method to ensure memory safety.
 #[derive(Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(from = "SharedMemoryDe"))]
 pub struct SharedMemory {
     /// The underlying buffer.
     buffer: Option<Rc<RefCell<Vec<u8>>>>,
@@ -340,12 +341,31 @@ pub struct SharedMemory {
     ///    context can run while this one is suspended, and a child is always handed back
     ///    through [`free_child_context`](Self::free_child_context), which recomputes
     ///    `base`. Nesting cascades: each frame refreshes its own on the way out.
+    /// 4. **The value arrives from the wire.** A pointer cannot be serialised, so `base` is
+    ///    skipped and has to be rebuilt from `buffer` and `my_checkpoint`;
+    ///    [`SharedMemoryDe`] is what `Deserialize` goes through to do that. Deriving
+    ///    `Deserialize` straight onto this struct left `base` null beside a real buffer,
+    ///    i.e. INV-B broken from the moment the value existed.
+    /// 5. **Someone else holding the same `Rc` reallocates the `Vec`.** This one has no
+    ///    restore site, because there is no hook: `LocalContextTr::shared_memory_buffer`
+    ///    is a public trait method handing out `&Rc<RefCell<Vec<u8>>>`, and anything that
+    ///    clones it can `borrow_mut().reserve(..)` behind this struct's back.
+    ///
+    ///    It does not happen in tree, and that was checked rather than assumed: the only
+    ///    two uses of that buffer are `LocalContext::clear`, which is `set_len(0)` and
+    ///    cannot reallocate, and `Handler::first_frame_input`, which clones the `Rc` into
+    ///    [`new_with_buffer`](Self::new_with_buffer) and so computes `base` at that moment.
+    ///    rsp does not touch it at all. A consumer that grows the buffer through that
+    ///    trait method while a `SharedMemory` is live would break INV-B, and the only thing
+    ///    standing there is `check_base` -- which is a panic in a native build and nothing
+    ///    at all in the guest. Closing it properly means not exposing the `Rc`, which is an
+    ///    upstream API change.
     ///
     /// Checked on every access in non-guest builds, which is where the test suite runs;
     /// see the `assert_eq!` in [`get_u256`](Self::get_u256) and friends.
     ///
     /// It is derived state, so it is excluded from `PartialEq` and is not serialised.
-    #[cfg_attr(feature = "serde", serde(skip, default = "null_base"))]
+    #[cfg_attr(feature = "serde", serde(skip))]
     base: *mut u8,
     /// Child checkpoint that we need to free context to.
     child_checkpoint: Option<usize>,
@@ -354,11 +374,54 @@ pub struct SharedMemory {
     memory_limit: u64,
 }
 
-/// The null `base` a deserialised [`SharedMemory`] starts with; it is recomputed by the
-/// first constructor or checkpoint operation that runs on it.
+/// What a [`SharedMemory`] deserialises through, so that `base` is rebuilt rather than left
+/// null.
+///
+/// `base` is a pointer, so it cannot be carried on the wire and has to be recomputed from
+/// the two fields it is derived from. Deriving `Deserialize` straight onto `SharedMemory`
+/// left it null while `buffer` came back as a real allocation -- INV-B broken from the
+/// moment the value existed. In a native build the `check_base` assertion catches that on
+/// the first access, but the guest compiles those out, so there it was a store through
+/// `null + offset`. It was not reachable from the guest (nothing deserialises a
+/// `SharedMemory` there, and the guest ELF carries no such symbol), but "not reachable
+/// today" is not what INV-B says, and the field's own documentation claimed a fix-up that
+/// nothing performed.
+///
+/// The field set is exactly `SharedMemory`'s minus the skipped `base`, so the wire format
+/// is unchanged.
 #[cfg(feature = "serde")]
-fn null_base() -> *mut u8 {
-    core::ptr::null_mut()
+#[derive(serde::Deserialize)]
+struct SharedMemoryDe {
+    buffer: Option<Rc<RefCell<Vec<u8>>>>,
+    my_checkpoint: usize,
+    child_checkpoint: Option<usize>,
+    #[cfg(feature = "memory_limit")]
+    memory_limit: u64,
+}
+
+#[cfg(feature = "serde")]
+impl From<SharedMemoryDe> for SharedMemory {
+    fn from(de: SharedMemoryDe) -> Self {
+        // INV-B: restored here, which is the only way a deserialised value can reach a
+        // caller. Null when there is no buffer, exactly as `invalid()` leaves it.
+        let base = match &de.buffer {
+            // SAFETY: `my_checkpoint` is in bounds of the buffer for any `SharedMemory` that
+            // was serialised from a live one (one-past-the-end at worst), so the offset is a
+            // valid pointer to form. A corrupt `my_checkpoint` on the wire would make this
+            // out of bounds -- but it would equally make every length in the struct wrong,
+            // and `check_base` asserts the bound on every access in non-guest builds.
+            Some(b) => unsafe { b.dbg_borrow_mut().as_mut_ptr().add(de.my_checkpoint) },
+            None => core::ptr::null_mut(),
+        };
+        Self {
+            buffer: de.buffer,
+            base,
+            my_checkpoint: de.my_checkpoint,
+            child_checkpoint: de.child_checkpoint,
+            #[cfg(feature = "memory_limit")]
+            memory_limit: de.memory_limit,
+        }
+    }
 }
 
 /// `base` is derived from `buffer` and `my_checkpoint`, so it never distinguishes two
@@ -517,6 +580,13 @@ impl SharedMemory {
     }
 
     /// Creates a new memory instance with a given shared buffer.
+    ///
+    /// # Precondition
+    ///
+    /// The caller must not reallocate `buffer` through any other handle to the same `Rc`
+    /// while the returned `SharedMemory` is alive -- growing it past its capacity moves the
+    /// allocation and leaves the cached `base` dangling. Shrinking, and growing within the
+    /// existing capacity, are both fine. See INV-B case 5 on the field.
     pub fn new_with_buffer(buffer: Rc<RefCell<Vec<u8>>>) -> Self {
         // INV-B, case 1: `my_checkpoint` is 0, so `base` is the allocation itself.
         let base = buffer.dbg_borrow_mut().as_mut_ptr();
