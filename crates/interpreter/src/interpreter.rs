@@ -745,15 +745,26 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
                     // trigger -- the back edge is. If a future edit to this arm loses the
                     // win, check those two `mv` counts before anything else.
                     //
-                    // # What is left on the table
+                    // # The successor test's order: measured, and it is a trap
                     //
-                    // The successor test compiles to `li`/`beq`/`li`/`bne` and LLVM orders
-                    // the two constants numerically, so `JUMP` (0x56) is tested before the
-                    // 2.5x more frequent `JUMPI` (0x57): four instructions on a `JUMPI` hit
-                    // where two would do. Getting the order right is worth ~0.51 M and
-                    // getting the constants into loop-resident registers another ~1.07 M
-                    // (2.64 M of test today against a 1.07 M floor), but every attempt to
-                    // steer either one is another roll of the dice against the cliff above.
+                    // The test compiles to `li`/`beq`/`li`/`bne` and LLVM orders the two
+                    // constants numerically, so `JUMP` (0x56) is tested before the 2.5x more
+                    // frequent `JUMPI` (0x57): four instructions on a `JUMPI` hit where two
+                    // would do. Counting blocks, getting that order right is worth exactly
+                    // 510,436.
+                    //
+                    // **It is not available.** Forcing the order with `black_box` on the
+                    // `JUMPI` constant stops LLVM forming the switch at all, and this arm
+                    // went 25,919,362 -> 28,286,887, **+2,367,525** (34.8 -> 38.0 per
+                    // dispatch) -- against a hoped -0.51 M. Note that `jr` (251 -> 252) and
+                    // `mv` (156 -> 157) did *not* catch it: the damage was inside the arm,
+                    // not at the register-allocation cliff, so the two cheap tells are no
+                    // guard here. Do not re-roll this with `black_box`.
+                    //
+                    // Pinning the two constants in loop-resident registers would be worth a
+                    // further ~1.07 M (2.13 M of test today against a 1.07 M floor), but the
+                    // loop has no registers left -- `jctx` is already spilled and reloaded
+                    // three times per jump for the same reason.
                     //
                     // SAFETY of the peek: the byte just past the immediate is the next
                     // opcode, which the unfused path reads in the loop header on the very
