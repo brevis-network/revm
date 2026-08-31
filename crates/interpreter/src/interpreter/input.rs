@@ -1,5 +1,5 @@
 use crate::{interpreter_types::InputsTr, CallInput};
-use primitives::{Address, U256};
+use primitives::{Address, MaybeAddress, U256};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
@@ -11,7 +11,10 @@ pub struct InputsImpl {
     pub target_address: Address,
     /// Address of the bytecode that is being executed. This field is not used inside Interpreter but it is used
     /// by dependent projects that would need to know the address of the bytecode.
-    pub bytecode_address: Option<Address>,
+    ///
+    /// [`MaybeAddress`] rather than `Option<Address>` so the 20 bytes land somewhere the
+    /// compiler knows is 8-aligned; see there.
+    pub bytecode_address: MaybeAddress,
     /// Address of the caller of the call.
     pub caller_address: Address,
     /// Input data for the call.
@@ -48,7 +51,7 @@ impl InputsTr for InputsImpl {
     }
 
     fn bytecode_address(&self) -> Option<&Address> {
-        self.bytecode_address.as_ref()
+        self.bytecode_address.get()
     }
 
     fn input(&self) -> &CallInput {

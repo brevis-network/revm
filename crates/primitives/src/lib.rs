@@ -276,6 +276,84 @@ pub unsafe fn write_some_b256(dst: *mut Option<B256>, src: *const u8) {
     }
 }
 
+/// An `Option<Address>` whose payload the compiler knows is 8-aligned.
+///
+/// [`MaybeB256`]'s story for the 20-byte type. `Option<Address>` is a tag byte plus a
+/// 20-byte align-1 payload, so the payload sits at an odd offset of a 21-byte align-1
+/// object and is never 8-aligned however the enclosing struct is laid out: writing one
+/// takes [`copy_address_bytes`]'s byte path, 20 `lbu`/`sb` pairs, every single time.
+/// `InputsImpl`'s `bytecode_address` did that 20,024 times on mainnet block 24006677, once
+/// per call frame.
+///
+/// `#[repr(C)]` plus explicit padding puts the payload at offset 8 of an align-8 struct by
+/// construction, so `copy_address_bytes` sees a destination it can prove and takes its three
+/// word accesses.
+#[repr(C, align(8))]
+#[derive(Clone, Copy, Debug, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct MaybeAddress {
+    present: bool,
+    _pad: [u8; 7],
+    address: Address,
+}
+
+const _: () = assert!(core::mem::offset_of!(MaybeAddress, address).is_multiple_of(8));
+
+impl Default for MaybeAddress {
+    #[inline]
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+/// Only the tag, and the address when the tag is set: the padding is not part of the value.
+impl PartialEq for MaybeAddress {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.present == other.present && (!self.present || address_eq(&self.address, &other.address))
+    }
+}
+
+impl MaybeAddress {
+    /// The absent value.
+    pub const NONE: Self = Self {
+        present: false,
+        _pad: [0; 7],
+        address: Address::ZERO,
+    };
+
+    /// Writes `Some(<the 20 bytes at `src`>)` through `dst`.
+    ///
+    /// # Safety
+    /// `dst` must point at a writable (possibly uninitialized) `MaybeAddress` and `src` at 20
+    /// readable bytes that do not overlap it.
+    #[inline(always)]
+    pub unsafe fn write_some(dst: *mut Self, src: *const u8) {
+        // SAFETY: `dst` is writable per the contract, and `address` is 8-aligned within it.
+        unsafe {
+            copy_address_bytes(core::ptr::addr_of_mut!((*dst).address).cast::<u8>(), src);
+            core::ptr::addr_of_mut!((*dst).present).write(true);
+            core::ptr::addr_of_mut!((*dst)._pad).write([0; 7]);
+        }
+    }
+
+    /// The wrapped address, if any.
+    #[inline(always)]
+    pub fn get(&self) -> Option<&Address> {
+        if self.present {
+            Some(&self.address)
+        } else {
+            None
+        }
+    }
+
+    /// True when an address is present.
+    #[inline(always)]
+    pub fn is_some(&self) -> bool {
+        self.present
+    }
+}
+
 /// An `Option<B256>` whose payload the compiler knows is 8-aligned.
 ///
 /// `Option<B256>` is a tag byte plus a 32-byte align-1 payload, so the payload sits at an odd
@@ -798,6 +876,69 @@ mod fast_key_tests {
         assert_eq!(slot.get_or_insert_with(|| B256::repeat_byte(7)), B256::repeat_byte(7));
         assert_eq!(slot.get(), Some(B256::repeat_byte(7)));
         assert_eq!(slot.get_or_insert_with(|| B256::repeat_byte(9)), B256::repeat_byte(7));
+    }
+
+    /// `MaybeAddress` has to behave exactly like the `Option<Address>` it replaces, from
+    /// every start alignment of the source, and its `PartialEq` has to ignore the padding
+    /// while distinguishing every one-byte difference in the address. Non-vacuous: the
+    /// absent case is asserted to be `None` and the present case to be exactly those 20
+    /// bytes, so neither a helper that wrote nothing nor one that wrote the wrong bytes
+    /// could pass.
+    #[test]
+    fn maybe_address_matches_option() {
+        assert_eq!(MaybeAddress::NONE.get(), None);
+        assert!(!MaybeAddress::NONE.is_some());
+        assert_eq!(MaybeAddress::default().get(), None);
+        for os in 0..8usize {
+            let mut bytes = [0u8; 20];
+            for (k, b) in bytes.iter_mut().enumerate() {
+                *b = (k as u8).wrapping_mul(23).wrapping_add(9);
+            }
+            let want = Address::from(bytes);
+            let mut store = vec![0u8; 64];
+            let pad = store.as_ptr().align_offset(8);
+            // SAFETY: room for a 20-byte window at `pad + os`; `Address` is align 1.
+            unsafe {
+                let ps = store.as_mut_ptr().add(pad + os);
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(), ps, 20);
+                let mut slot = MaybeAddress::NONE;
+                MaybeAddress::write_some(&mut slot, ps);
+                assert!(slot.is_some(), "os={os}");
+                assert_eq!(slot.get(), Some(&want), "os={os}");
+                // and it overwrites a previous value rather than merging with it
+                let other = Address::repeat_byte(0xc3);
+                MaybeAddress::write_some(&mut slot, other.as_ptr());
+                assert_eq!(slot.get(), Some(&other), "os={os}");
+            }
+        }
+        // Equality: absent == absent, absent != present, and every single-byte difference.
+        let mut a = MaybeAddress::NONE;
+        let mut b = MaybeAddress::NONE;
+        assert_eq!(a, b);
+        let base = Address::repeat_byte(0x11);
+        // SAFETY: both slots are live `MaybeAddress`es and `base` is a distinct object.
+        unsafe { MaybeAddress::write_some(&mut a, base.as_ptr()) };
+        assert_ne!(a, b);
+        // SAFETY: as above.
+        unsafe { MaybeAddress::write_some(&mut b, base.as_ptr()) };
+        assert_eq!(a, b);
+        for i in 0..20usize {
+            let mut bytes = [0x11u8; 20];
+            bytes[i] = 0x12;
+            let diff = Address::from(bytes);
+            let mut c = MaybeAddress::NONE;
+            // SAFETY: as above.
+            unsafe { MaybeAddress::write_some(&mut c, diff.as_ptr()) };
+            assert_ne!(a, c, "i={i}");
+        }
+        // Padding does not participate: a value built by hand with dirty padding still
+        // compares equal.
+        let dirty = MaybeAddress {
+            present: true,
+            _pad: [0xff; 7],
+            address: base,
+        };
+        assert_eq!(a, dirty);
     }
 
     /// A `FastAddress` query has to hash into the bucket an `Address` key was stored in, and

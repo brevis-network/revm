@@ -249,7 +249,7 @@ impl EthFrame<EthInterpreter> {
                 inputs.target_address.as_ptr(),
             );
             primitives::copy_address_bytes(ii.caller_address.as_mut_ptr(), inputs.caller.as_ptr());
-            primitives::write_some_address(
+            primitives::MaybeAddress::write_some(
                 &mut ii.bytecode_address,
                 inputs.bytecode_address.as_ptr(),
             );
@@ -364,7 +364,7 @@ impl EthFrame<EthInterpreter> {
             );
             primitives::copy_address_bytes(ii.caller_address.as_mut_ptr(), inputs.caller.as_ptr());
         }
-        ii.bytecode_address = None;
+        ii.bytecode_address = primitives::MaybeAddress::NONE;
         ii.input = CallInput::Bytes(Bytes::new());
         ii.call_value = inputs.value;
 
