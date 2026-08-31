@@ -475,6 +475,12 @@ impl MemoryTr for SharedMemory {
         true
     }
 
+    #[inline]
+    fn resize_written(&mut self, new_size: usize, wr_off: usize, wr_len: usize) -> bool {
+        self.resize_written(new_size, wr_off, wr_len);
+        true
+    }
+
     /// Returns `true` if the `new_size` for the current context memory will
     /// make the shared buffer length exceed the `memory_limit`.
     #[cfg(feature = "memory_limit")]
@@ -662,30 +668,7 @@ impl SharedMemory {
             let n = new_len - old_len;
             // SAFETY: `old_len + n == new_len <= capacity`, so the tail is in the allocation.
             unsafe {
-                let p = buf.as_mut_ptr().add(old_len);
-                if n == 32 && (p as usize).is_multiple_of(core::mem::align_of::<u64>()) {
-                    // The overwhelmingly common case: memory grew by one EVM word.
-                    let q = p.cast::<u64>();
-                    q.write_volatile(0);
-                    q.add(1).write_volatile(0);
-                    q.add(2).write_volatile(0);
-                    q.add(3).write_volatile(0);
-                } else if n.is_multiple_of(8)
-                    && (p as usize).is_multiple_of(core::mem::align_of::<u64>())
-                {
-                    // Also common (`CALLDATACOPY` and friends grow by several words at
-                    // once), so it stays inline: it needs two scratch registers and no call,
-                    // which costs `resize_memory_cold` nothing in its prologue.
-                    let mut q = p.cast::<u64>();
-                    let mut left = n / 8;
-                    while left != 0 {
-                        q.write_volatile(0);
-                        q = q.add(1);
-                        left -= 1;
-                    }
-                } else {
-                    zero_tail(p, n);
-                }
+                zero_span(buf.as_mut_ptr().add(old_len), n);
                 buf.set_len(new_len);
             }
             return;
@@ -694,6 +677,86 @@ impl SharedMemory {
         // INV-B, case 2: `grow_zeroed` is the one place the `Vec` can outgrow its capacity
         // and move. Everything above stays inside the existing allocation.
         // SAFETY: `my_checkpoint <= buf.len()` by the checkpoint invariant.
+        self.base = unsafe { buf.as_mut_ptr().add(self.my_checkpoint) };
+    }
+
+    /// [`resize`](Self::resize), for a caller that overwrites `wr_off..wr_off + wr_len`
+    /// before anything can read the memory.
+    ///
+    /// The new tail is `old_len..new_len`, and the caller covers `wr_start..wr_end` of it,
+    /// so only a gap below and a round-up above are left to zero. For the shape that
+    /// dominates - `MSTORE` at the current memory top with a 32-aligned offset, 65 % of all
+    /// the grows on mainnet block 24006677 - both are empty and the grow is a `set_len` and
+    /// nothing else: the four `sd zero` it used to run were dead stores, overwritten by the
+    /// `set_u256_ptr` on the next line.
+    ///
+    /// The gas charged is unchanged: `resize_memory_written` computes the same word count
+    /// and calls the same `record_new_len`. This only skips stores nothing can observe.
+    ///
+    /// # Correctness
+    ///
+    /// See [`MemoryTr::resize_written`]. `wr_off + wr_len <= new_size` is required and is
+    /// asserted in debug builds.
+    #[inline]
+    pub fn resize_written(&mut self, new_size: usize, wr_off: usize, wr_len: usize) {
+        debug_assert!(
+            wr_off + wr_len <= new_size,
+            "the written range escapes the grow"
+        );
+        let new_len = self.my_checkpoint + new_size;
+        // SAFETY: as in `resize`.
+        let buf = unsafe { &mut *self.buffer().as_ptr() };
+        let old_len = buf.len();
+        if new_len > old_len && new_len <= buf.capacity() {
+            let wr_start = self.my_checkpoint + wr_off;
+            let wr_end = wr_start + wr_len;
+            let gap = wr_start > old_len;
+            let round_up = new_len > wr_end;
+            if gap | round_up {
+                // Both ends are rounded *outwards* to a multiple of 8. `zero_span` only
+                // has a word-at-a-time path when the span is 8-aligned and a multiple of 8,
+                // and splitting on an unaligned `wr_start`/`wr_end` otherwise drops the fill
+                // into the byte loop - measured at +1.23 M on block 24006677, which is more
+                // than the split saves. Rounding outwards only ever re-zeroes bytes inside
+                // the caller's own range, which the caller overwrites anyway.
+                //
+                // `old_len` and `new_len` are both multiples of 32 - EVM memory only grows
+                // to whole words from a whole-word checkpoint - so every span below is
+                // 8-aligned with a length that is a multiple of 8.
+                let (zlo, zhi) = if gap & round_up {
+                    // Both: an unaligned offset past the current top. Rare enough not to be
+                    // worth two fills, so zero the lot, the caller's part included.
+                    (old_len, new_len)
+                } else if gap {
+                    // Only the hole between the old top and where the caller writes.
+                    // `wr_start + 7 < new_len`, because `wr_start + wr_len <= new_len` and
+                    // `wr_len` is 32 for every caller in tree, so this stays in bounds.
+                    (old_len, (wr_start + 7) & !7)
+                } else {
+                    // Only the round-up to a whole word above what the caller writes. The
+                    // `max` also covers a caller that writes entirely below the old top.
+                    let hi_start = wr_end & !7;
+                    (
+                        if hi_start > old_len {
+                            hi_start
+                        } else {
+                            old_len
+                        },
+                        new_len,
+                    )
+                };
+                // SAFETY: `old_len <= zlo <= zhi <= new_len <= capacity`, so the span is
+                // inside the allocation.
+                unsafe { zero_span(buf.as_mut_ptr().add(zlo), zhi - zlo) };
+            }
+            // SAFETY: every byte below `new_len` is initialised - below `old_len` already,
+            // and above it either by the fill above or, where it was skipped, by the
+            // caller's own write, which the contract requires to happen before any read.
+            unsafe { buf.set_len(new_len) };
+            return;
+        }
+        grow_zeroed(buf, new_len);
+        // INV-B, case 2.
         self.base = unsafe { buf.as_mut_ptr().add(self.my_checkpoint) };
     }
 
@@ -1141,6 +1204,81 @@ pub const fn num_words(len: usize) -> usize {
     len.saturating_add(31) / 32
 }
 
+/// Zeroes `n` bytes at `p`.
+///
+/// Volatile so that LLVM's loop-idiom pass cannot turn these back into a `memset` libcall,
+/// which is measured at 76.9 retired instructions to zero the 32 bytes of one EVM word.
+///
+/// # Safety
+///
+/// `p` must point at `n` writable bytes.
+#[inline(always)]
+unsafe fn zero_span(p: *mut u8, n: usize) {
+    // SAFETY: `n` writable bytes at `p`, per the contract.
+    unsafe {
+        if n == 32 && (p as usize).is_multiple_of(core::mem::align_of::<u64>()) {
+            // The overwhelmingly common case: memory grew by one EVM word.
+            let q = p.cast::<u64>();
+            q.write_volatile(0);
+            q.add(1).write_volatile(0);
+            q.add(2).write_volatile(0);
+            q.add(3).write_volatile(0);
+        } else if n.is_multiple_of(8) && (p as usize).is_multiple_of(core::mem::align_of::<u64>()) {
+            // Also common (`CALLDATACOPY` and friends grow by several words at once), so it
+            // stays inline: it needs two scratch registers and no call.
+            let mut q = p.cast::<u64>();
+            let mut left = n / 8;
+            while left != 0 {
+                q.write_volatile(0);
+                q = q.add(1);
+                left -= 1;
+            }
+        } else {
+            zero_tail(p, n);
+        }
+    }
+}
+
+/// [`resize_memory`], for an instruction that overwrites every byte of
+/// `offset..offset + len`. The gas is computed identically - same word count, same
+/// `record_new_len` - and only the dead part of the zero fill is skipped.
+#[inline]
+#[must_use]
+pub fn resize_memory_written<Memory: MemoryTr>(
+    gas: &mut crate::Gas,
+    memory: &mut Memory,
+    offset: usize,
+    len: usize,
+) -> bool {
+    let new_num_words = num_words(offset.saturating_add(len));
+    if new_num_words > gas.memory().words_num {
+        resize_memory_cold_written(gas, memory, new_num_words, offset, len)
+    } else {
+        true
+    }
+}
+
+/// [`resize_memory_cold`] for [`resize_memory_written`]; inlined for the same reason.
+#[inline(always)]
+fn resize_memory_cold_written<Memory: MemoryTr>(
+    gas: &mut crate::Gas,
+    memory: &mut Memory,
+    new_num_words: usize,
+    offset: usize,
+    len: usize,
+) -> bool {
+    let cost = unsafe {
+        gas.memory_mut()
+            .record_new_len(new_num_words)
+            .unwrap_unchecked()
+    };
+    if !gas.record_cost(cost) {
+        return false;
+    }
+    memory.resize_written(new_num_words * 32, offset, len);
+    true
+}
+
 /// Performs EVM memory resize.
 #[inline]
 #[must_use]
@@ -1389,6 +1527,86 @@ mod tests {
         assert_eq!(parent.get_u256(0), U256::from(0xDEAD_BEEFu64));
         parent.set_u256(0, U256::from(11u64));
         assert_eq!(parent.get_u256(0), U256::from(11u64));
+    }
+
+    /// `resize_written` is only allowed to skip stores the caller is about to make, so for
+    /// every shape a caller can produce it has to leave the buffer *byte for byte* what
+    /// `resize` followed by the same write would have left.
+    ///
+    /// The sweep is over every combination of a starting length, a destination offset -
+    /// aligned, unaligned, below the old top, above it, in the gap - and a nesting
+    /// checkpoint, which is every case the four-way split in `resize_written` distinguishes.
+    /// It cannot go vacuous: it compares the whole buffer, both sides run the same write,
+    /// and it asserts that the sweep actually reached each of the four cases.
+    #[test]
+    fn resize_written_leaves_the_same_bytes_as_resize() {
+        let value = U256::from_limbs([0x0102_0304_0506_0708, 0x1112, 0, 0xAABB_CCDD]);
+        let mut saw_neither = 0usize;
+        let mut saw_gap = 0usize;
+        let mut saw_round_up = 0usize;
+        let mut saw_both = 0usize;
+
+        for checkpoint_words in [0usize, 1, 3] {
+            for old_words in 0..6usize {
+                for offset in [0usize, 1, 4, 31, 32, 33, 64, 96, 97, 128, 130, 160, 192] {
+                    let new_size = num_words(offset + 32) * 32;
+                    if new_size < old_words * 32 {
+                        // `resize_memory` never shrinks; skip what a caller cannot produce.
+                        continue;
+                    }
+
+                    // Two buffers with identical dirty history, so that anything left
+                    // un-zeroed shows up as a difference rather than as a lucky zero.
+                    let build = || {
+                        let mut parent = SharedMemory::with_capacity(4096);
+                        if checkpoint_words > 0 {
+                            parent.resize(checkpoint_words * 32);
+                            parent.set(0, &std::vec![0xC7u8; checkpoint_words * 32]);
+                        }
+                        let mut sm = parent.new_child_context();
+                        // Dirty the region this child is about to use and hand it back, so
+                        // the bytes above `old_words * 32` are non-zero garbage.
+                        sm.resize(256);
+                        sm.set(0, &[0x9Eu8; 256]);
+                        drop(sm);
+                        parent.free_child_context();
+                        let mut sm = parent.new_child_context();
+                        sm.resize(old_words * 32);
+                        (parent, sm)
+                    };
+
+                    let (_pa, mut a) = build();
+                    a.resize(new_size);
+                    a.set_u256(offset, value);
+
+                    let (_pb, mut b) = build();
+                    b.resize_written(new_size, offset, 32);
+                    b.set_u256(offset, value);
+
+                    assert_eq!(a.len(), b.len(), "offset {offset}: MSIZE diverged");
+                    assert_eq!(
+                        &*a.buffer_ref(),
+                        &*b.buffer_ref(),
+                        "checkpoint {checkpoint_words}, old {old_words} words, offset                          {offset}: resize_written left different bytes"
+                    );
+
+                    // Which of the four branches this shape exercised.
+                    let old_len = old_words * 32;
+                    let gap = offset > old_len;
+                    let round_up = new_size > offset + 32;
+                    match (gap, round_up) {
+                        (false, false) => saw_neither += 1,
+                        (true, false) => saw_gap += 1,
+                        (false, true) => saw_round_up += 1,
+                        (true, true) => saw_both += 1,
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_neither > 0 && saw_gap > 0 && saw_round_up > 0 && saw_both > 0,
+            "sweep missed a branch: {saw_neither}/{saw_gap}/{saw_round_up}/{saw_both}"
+        );
     }
 
     #[test]

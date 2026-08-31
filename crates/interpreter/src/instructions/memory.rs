@@ -103,7 +103,10 @@ pub fn mstore_at<WIRE: InterpreterTypes, H: ?Sized>(
     // SAFETY: depth checked above.
     let word = unsafe { *context.interpreter.stack.peek_at(sp, 0) };
     let offset = as_usize_or_fail_ret!(context.interpreter, word, (sp, u64::MAX));
-    resize_memory!(context.interpreter, offset, 32, (sp, u64::MAX));
+    // The `set_u256_ptr` below writes all 32 bytes of `offset..offset + 32` unconditionally
+    // and before anything can read them, so the grow does not have to zero that part of the
+    // new tail. Same gas, same word count - see `resize_memory_written!`.
+    resize_memory_written!(context.interpreter, offset, 32, (sp, u64::MAX));
     // SAFETY: depth checked above; `resize_memory!` does not touch the stack. The stack
     // buffer and the memory buffer are distinct allocations, so the write cannot disturb
     // the limbs still to be read.

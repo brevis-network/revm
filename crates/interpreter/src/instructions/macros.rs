@@ -149,6 +149,33 @@ macro_rules! resize_memory {
     };
 }
 
+/// [`resize_memory!`], for an instruction that overwrites every byte of
+/// `$offset..$offset + $len` before anything can read it.
+///
+/// Charges exactly the same gas - the memory-expansion cost is consensus and is computed
+/// from the new word count, which is unchanged - and only skips zeroing bytes the
+/// instruction is about to write anyway. See [`MemoryTr::resize_written`].
+#[macro_export]
+#[collapse_debuginfo(yes)]
+macro_rules! resize_memory_written {
+    ($interpreter:expr, $offset:expr, $len:expr, $ret:expr) => {
+        #[cfg(feature = "memory_limit")]
+        if $interpreter.memory.limit_reached($offset, $len) {
+            $interpreter.halt_memory_limit_oog();
+            return $ret;
+        }
+        if !$crate::interpreter::resize_memory_written(
+            &mut $interpreter.gas,
+            &mut $interpreter.memory,
+            $offset,
+            $len,
+        ) {
+            $interpreter.halt_memory_oog();
+            return $ret;
+        }
+    };
+}
+
 /// Pops n values from the stack. Fails the instruction if n values can't be popped.
 #[macro_export]
 #[collapse_debuginfo(yes)]

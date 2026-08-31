@@ -273,6 +273,23 @@ pub trait MemoryTr {
     /// It checks if the memory allocation fits under gas cap.
     fn resize(&mut self, new_size: usize) -> bool;
 
+    /// [`resize`][MemoryTr::resize], for a caller that overwrites every byte of
+    /// `wr_off..wr_off + wr_len` before anything can read the memory.
+    ///
+    /// An implementation may skip zeroing that part of the new tail, because nothing can
+    /// observe the difference. The default ignores the promise and forwards to `resize`.
+    ///
+    /// # Correctness
+    ///
+    /// This is not `unsafe` - breaking the promise leaves stale EVM memory, not undefined
+    /// behaviour - but it *is* a contract, and `wr_off + wr_len` has to be within
+    /// `new_size`.
+    #[inline]
+    fn resize_written(&mut self, new_size: usize, wr_off: usize, wr_len: usize) -> bool {
+        let _ = (wr_off, wr_len);
+        self.resize(new_size)
+    }
+
     /// Returns `true` if the `new_size` for the current context memory will
     /// make the shared buffer length exceed the `memory_limit`.
     #[cfg(feature = "memory_limit")]
