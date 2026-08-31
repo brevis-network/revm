@@ -434,8 +434,23 @@ impl EthFrame<EthInterpreter> {
             InterpreterAction::Return(result) => result,
         };
 
-        // Handle return from frame
-        let result = match &self.data {
+        // Handle return from frame.
+        //
+        // `is_finished` is set here rather than in the caller because the caller has to be
+        // able to tail-call this function, or LLVM copies the returned `ItemOrResult` out of
+        // the callee's sret slot; see `EvmTr::frame_run`. It is set *before* the result is
+        // built, not after, because the same call-slot optimisation applies one level down: a
+        // store LLVM cannot prove disjoint from the return slot, sitting between the
+        // construction and the `Ok(..)`, made the ~96-byte `ItemOrResult` be built in a fresh
+        // stack slot and `memcpy`d into the sret one, 20,024 times per mainnet block
+        // 24006677 at ~74 retired instructions a call.
+        self.is_finished = true;
+
+        // Each arm returns rather than yielding a value the tail wraps in `Ok(..)`: a `match`
+        // whose result is bound and then wrapped gives the ~96-byte `ItemOrResult` a stack
+        // slot of its own, which is then `memcpy`d into the sret slot. Returning from the arm
+        // lets it be built in the sret slot directly.
+        match &self.data {
             FrameData::Call(frame) => {
                 // return_call
                 // Revert changes or not.
@@ -444,10 +459,11 @@ impl EthFrame<EthInterpreter> {
                 } else {
                     context.journal_mut().checkpoint_revert(self.checkpoint);
                 }
-                ItemOrResult::Result(FrameResult::Call(CallOutcome::new(
-                    interpreter_result,
-                    frame.return_memory_range.clone(),
-                )))
+                let memory_offset = frame.return_memory_range.clone();
+                Ok(ItemOrResult::Result(FrameResult::Call(CallOutcome {
+                    result: interpreter_result,
+                    memory_offset,
+                })))
             }
             FrameData::Create(frame) => {
                 let max_code_size = context.cfg().max_code_size();
@@ -462,19 +478,12 @@ impl EthFrame<EthInterpreter> {
                     spec,
                 );
 
-                ItemOrResult::Result(FrameResult::Create(CreateOutcome::new(
+                Ok(ItemOrResult::Result(FrameResult::Create(CreateOutcome::new(
                     interpreter_result,
                     Some(frame.created_address),
-                )))
+                ))))
             }
-        };
-
-        // Set here rather than in the caller: the caller has to be able to tail-call
-        // this function, or LLVM copies the returned `ItemOrResult` out of the sret
-        // slot. See `EvmTr::frame_run`.
-        self.is_finished = true;
-
-        Ok(result)
+        }
     }
 
     /// Processes a frame result and updates the interpreter state accordingly.

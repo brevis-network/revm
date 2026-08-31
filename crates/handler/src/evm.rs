@@ -186,16 +186,29 @@ where
 
         let ctx = &mut self.ctx;
         let precompiles = &mut self.precompiles;
-        let res = Self::Frame::init_with_context(new_frame, ctx, precompiles, frame_input)?;
+        // Spelled out with `match` rather than `?` plus `map_frame`. `Try::branch` takes the
+        // `Result` by value and hands the payload back inside a `ControlFlow`, and
+        // `map_frame` takes `self` by value and rebuilds the enum around it; each is a real
+        // copy of the ~96-byte `FrameResult` through a fresh stack slot, and since the
+        // payload carries align-1 fields that copy is a `memcpy` libcall. The two of them
+        // were 40,156 of the guest's 324,718 `memcpy` calls on mainnet block 24006677, at
+        // ~74 retired instructions each.
+        //
+        // The one copy left is the unavoidable one: the returned type differs from
+        // `init_with_context`'s in its item variant, so the result variant has to be moved
+        // from one enum into the other.
+        let token = match Self::Frame::init_with_context(new_frame, ctx, precompiles, frame_input) {
+            Err(e) => return Err(e),
+            Ok(ItemOrResult::Result(result)) => return Ok(ItemOrResult::Result(result)),
+            Ok(ItemOrResult::Item(token)) => token,
+        };
 
-        Ok(res.map_frame(|token| {
-            if is_first_init {
-                unsafe { self.frame_stack.end_init(token) };
-            } else {
-                unsafe { self.frame_stack.push(token) };
-            }
-            self.frame_stack.get()
-        }))
+        if is_first_init {
+            unsafe { self.frame_stack.end_init(token) };
+        } else {
+            unsafe { self.frame_stack.push(token) };
+        }
+        Ok(ItemOrResult::Item(self.frame_stack.get()))
     }
 
     /// Run the frame from the top of the stack. Returns the frame init or result.
