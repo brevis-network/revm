@@ -112,8 +112,19 @@ impl Eq for AccountCache {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct JournalInner<ENTRY> {
-    /// The current state
-    pub state: EvmState,
+    /// The current state.
+    ///
+    /// Private, and reachable from outside this module only through [`Self::state`] and
+    /// [`Self::state_ref`]. `account_cache` holds a `hashbrown` bucket pointer into this
+    /// map, and that pointer does not survive a growth or an in-place rehash - neither of
+    /// which is observable from outside the table - so every path that can restructure the
+    /// map has to empty the cache first. [`Self::state`] does; a `pub` field would let a
+    /// caller insert without going past it, and the result of that is not a panic but a
+    /// wrong state root. Keeping the field private is what makes the outside half of the
+    /// [`AccountCache`] contract a compile-time property rather than a convention: the name
+    /// appears only in its declaration, in the two accessors, and in this module's own uses,
+    /// which are audited in the [`AccountCache`] safety note.
+    state: EvmState,
     /// Transient storage that is discarded after every transaction.
     ///
     /// See [EIP-1153](https://eips.ethereum.org/EIPS/eip-1153).
@@ -304,6 +315,15 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     pub fn state(&mut self) -> &mut EvmState {
         self.account_cache.clear();
         &mut self.state
+    }
+
+    /// Return a shared reference to state.
+    ///
+    /// Does not touch the account cache, and does not need to: a `&EvmState` cannot insert,
+    /// so no bucket can move while it lives.
+    #[inline]
+    pub fn state_ref(&self) -> &EvmState {
+        &self.state
     }
 
     /// Sets SpecId.

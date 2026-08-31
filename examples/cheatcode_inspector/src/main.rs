@@ -606,7 +606,7 @@ where
     // Persist the changes to the original backend.
     backend.journaled_state.database.commit(state);
     update_state(
-        &mut backend.journaled_state.inner.state,
+        backend.journaled_state.inner.state(),
         &mut backend.journaled_state.database,
     )?;
 
