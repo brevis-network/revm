@@ -192,26 +192,62 @@ pub unsafe fn copy_u256(dst: *mut U256, src: *const U256) {
     }
 }
 
+/// A `Some(Address)` whose layout the code below reads instead of assuming.
+///
+/// See [`write_some_address`] for what it is for. It is an immutable `static` with a
+/// constant initializer, so both the discriminant load and the payload-offset subtraction
+/// fold at compile time.
+static SOME_ADDRESS_PROBE: Option<Address> = Some(Address::ZERO);
+
+/// Twenty payload bytes plus one tag byte *is* the whole of an `Option<Address>`, so it has
+/// no padding and every byte of [`SOME_ADDRESS_PROBE`] is initialized - which is what makes
+/// copying the tag out of it byte-wise well defined. If a layout change ever breaks that,
+/// the build fails here instead of silently reading uninitialized padding.
+const _: () = assert!(core::mem::size_of::<Option<Address>>() == 21);
+
 /// Writes `Some(<the 20 bytes at `src`>)` into `dst`.
 ///
-/// `Option<Address>` has no niche, so it is a tag byte plus a 20-byte payload - and building
-/// one with `Some(addr)` copies the payload with a `memcpy` libcall, for the reason in
+/// `Option<Address>` has no niche, so it is a tag byte plus a 20-byte payload, and building
+/// one with `Some(addr)` copies the payload with a `memcpy` libcall for the reason in
 /// [`copy_address_bytes`]. Where the payload sits inside the `Option` is not something this
-/// code may assume, so instead a `Some` with a throwaway payload is stored and the compiler
-/// is asked where that payload landed: the offset folds to a constant and the throwaway
-/// stores are dead.
+/// code may assume, so it asks: [`SOME_ADDRESS_PROBE`] is a `Some`, and the distance from
+/// its base to the `Address` its `as_ref` yields is the offset.
+///
+/// The previous spelling asked the same question of the *destination* - store
+/// `Some(Address::ZERO)` there, then find and overwrite the payload - on the assumption that
+/// the throwaway payload store would be dead. It was not: LLVM lowered it to
+/// `__wrap_memset(payload, 0, 20)` and DSE will not remove a libcall it cannot see through,
+/// so it ran 20,024 times on mainnet block 24006677 - 45.6 % of every `memset` the guest
+/// made. Reading the layout off a constant instead stores only the tag byte.
 ///
 /// # Safety
 /// `dst` must point at a writable (possibly uninitialized) `Option<Address>` slot, and `src`
 /// at 20 readable bytes that do not overlap it.
 #[inline(always)]
 pub unsafe fn write_some_address(dst: *mut Option<Address>, src: *const u8) {
-    // SAFETY: `dst` is writable per the contract; after the store it holds an initialized
-    // `Some`, so `as_mut().unwrap_unchecked()` is a valid `&mut Address`.
+    const N: usize = core::mem::size_of::<Option<Address>>();
+    let probe = core::ptr::addr_of!(SOME_ADDRESS_PROBE).cast::<u8>();
+    // SAFETY: `SOME_ADDRESS_PROBE` is a `Some` by construction, so `as_ref` is `Some` too;
+    // the pointer it yields is inside the probe, so the difference is in `0..N`.
+    let off = unsafe {
+        (SOME_ADDRESS_PROBE.as_ref().unwrap_unchecked() as *const Address).cast::<u8>() as usize
+            - probe as usize
+    };
+    // SAFETY: `dst` is writable for `N` bytes per the contract, `probe` is readable for `N`
+    // and has no padding (asserted above), and the two do not overlap - the probe is a
+    // read-only static. Every byte of `dst` is written exactly once: the tag bytes here and
+    // the payload by `copy_address_bytes`.
     unsafe {
-        dst.write(Some(Address::ZERO));
-        let payload = (*dst).as_mut().unwrap_unchecked() as *mut Address;
-        copy_address_bytes(payload.cast::<u8>(), src);
+        let d = dst.cast::<u8>();
+        // `off` is a compile-time constant, so this is the one tag byte, not a loop.
+        let mut i = 0;
+        while i < N {
+            if i < off || i >= off + 20 {
+                d.add(i).write(probe.add(i).read());
+            }
+            i += 1;
+        }
+        copy_address_bytes(d.add(off), src);
     }
 }
 
@@ -588,6 +624,40 @@ mod fast_key_tests {
             let k = key(i);
             assert_eq!(map.get(FastU256::new(&k)).copied(), map.get(&k).copied());
         }
+    }
+
+    /// `write_some_address` has to produce exactly what `Some(addr)` produces, from every
+    /// start alignment of both ends. Non-vacuous: the destination starts as `None`, so a
+    /// helper that wrote nothing at all would fail the very first assertion.
+    #[test]
+    fn write_some_address_matches_some() {
+        for od in 0..8usize {
+            for os in 0..8usize {
+                let mut bytes = [0u8; 20];
+                for (k, b) in bytes.iter_mut().enumerate() {
+                    *b = (k as u8).wrapping_mul(11).wrapping_add(3);
+                }
+                let src = Address::from(bytes);
+                let mut store = vec![0u8; 96];
+                let pad = store.as_ptr().align_offset(8);
+                // SAFETY: `Option<Address>` is align 1, so any offset past `pad` is a valid
+                // place to hold one, and there is room for it plus a 20-byte source window.
+                unsafe {
+                    let pd = store.as_mut_ptr().add(pad + od).cast::<Option<Address>>();
+                    pd.write(None);
+                    let ps = store.as_mut_ptr().add(pad + 40 + os);
+                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), ps, 20);
+                    write_some_address(pd, ps);
+                    assert_eq!(pd.read(), Some(src), "od={od} os={os}");
+                }
+            }
+        }
+        // And it overwrites a previous `Some` rather than merging with it.
+        let mut slot = Some(Address::repeat_byte(0xff));
+        let want = Address::repeat_byte(0x5a);
+        // SAFETY: `slot` is a live, initialized `Option<Address>`; `want` is distinct.
+        unsafe { write_some_address(&mut slot, want.as_ptr()) };
+        assert_eq!(slot, Some(want));
     }
 
     /// A `FastAddress` query has to hash into the bucket an `Address` key was stored in, and
