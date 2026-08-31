@@ -1,4 +1,4 @@
-use super::{Immediates, Jumps, LegacyBytecode};
+use super::{Immediates, JumpCtx, Jumps, LegacyBytecode};
 use crate::{interpreter_types::LoopControl, InterpreterAction};
 use bytecode::{utils::read_u16, Bytecode};
 use core::ops::Deref;
@@ -178,6 +178,36 @@ impl Jumps for ExtBytecode {
             .legacy_jump_table()
             .expect("Panic if not legacy")
             .is_valid(offset)
+    }
+
+    #[inline]
+    fn jump_ctx(&self) -> JumpCtx {
+        // A non-legacy bytecode has no bitmap. `table_len == 0` rejects every target, which
+        // is what `is_valid_legacy_jump` would have meant if it did not panic; `run_plain`
+        // reads this once per frame, including for frames that never execute a jump, so
+        // panicking here would fire for bytecode the old path never asked about.
+        match self.base.legacy_jump_table() {
+            Some(table) => JumpCtx {
+                table_ptr: table.table_ptr(),
+                table_len: table.len(),
+                code_base: self.base.bytes_ref().as_ptr(),
+            },
+            None => JumpCtx::EMPTY,
+        }
+    }
+
+    #[inline]
+    fn is_valid_legacy_jump_with(&mut self, ctx: JumpCtx, offset: usize) -> bool {
+        // Same expression as `JumpTable::is_valid`, off the hoisted copy.
+        offset < ctx.table_len
+            && unsafe { *ctx.table_ptr.add(offset >> 3) & (1 << (offset & 7)) != 0 }
+    }
+
+    #[inline]
+    fn absolute_ip_with(&self, ctx: JumpCtx, offset: usize) -> *const u8 {
+        // SAFETY: the caller has checked `offset` against the bitmap, whose length is the
+        // unpadded bytecode length, so `code_base + offset` is inside the padded bytes.
+        unsafe { ctx.code_base.add(offset) }
     }
 
     #[inline]

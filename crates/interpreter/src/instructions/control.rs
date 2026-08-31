@@ -1,6 +1,6 @@
 use crate::{
     interpreter::Interpreter,
-    interpreter_types::{InterpreterTypes, Jumps, MemoryTr, RuntimeFlag, StackTr},
+    interpreter_types::{InterpreterTypes, JumpCtx, Jumps, MemoryTr, RuntimeFlag, StackTr},
     InstructionResult, InterpreterAction,
 };
 use primitives::{Bytes, U256};
@@ -18,6 +18,7 @@ pub fn jump<const FUSE_JUMPDEST: bool, ITy: InterpreterTypes, H: ?Sized>(
     let ip = interpreter.bytecode.ip();
     let sp = interpreter.stack.sp();
     // `jump_at` returns `ip` unchanged when it did not jump.
+    let jctx = interpreter.bytecode.jump_ctx();
     let (next, sp) = jump_at::<FUSE_JUMPDEST, _, _>(
         InstructionContext {
             interpreter: &mut *interpreter,
@@ -25,6 +26,7 @@ pub fn jump<const FUSE_JUMPDEST: bool, ITy: InterpreterTypes, H: ?Sized>(
         },
         ip,
         sp,
+        jctx,
     );
     // SAFETY: `sp` came back from a threaded instruction handed this stack's own cursor.
     unsafe { interpreter.stack.set_sp(sp) };
@@ -43,11 +45,12 @@ pub fn jump_at<const FUSE_JUMPDEST: bool, ITy: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, ITy>,
     ip: *const u8,
     mut sp: usize,
+    jctx: JumpCtx,
 ) -> (*const u8, usize) {
     //gas!(context.interpreter, gas::MID);
     popn_at!([target], context.interpreter, sp, (ip, sp));
     (
-        jump_inner::<FUSE_JUMPDEST, _>(context.interpreter, target, ip),
+        jump_inner::<FUSE_JUMPDEST, _>(context.interpreter, target, ip, jctx),
         sp,
     )
 }
@@ -62,6 +65,7 @@ pub fn jumpi<const FUSE_JUMPDEST: bool, WIRE: InterpreterTypes, H: ?Sized>(
     let InstructionContext { interpreter, host } = context;
     let ip = interpreter.bytecode.ip();
     let sp = interpreter.stack.sp();
+    let jctx = interpreter.bytecode.jump_ctx();
     let (next, sp) = jumpi_at::<FUSE_JUMPDEST, _, _>(
         InstructionContext {
             interpreter: &mut *interpreter,
@@ -69,6 +73,7 @@ pub fn jumpi<const FUSE_JUMPDEST: bool, WIRE: InterpreterTypes, H: ?Sized>(
         },
         ip,
         sp,
+        jctx,
     );
     // SAFETY: `sp` came back from a threaded instruction handed this stack's own cursor.
     unsafe { interpreter.stack.set_sp(sp) };
@@ -81,6 +86,7 @@ pub fn jumpi_at<const FUSE_JUMPDEST: bool, WIRE: InterpreterTypes, H: ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
     ip: *const u8,
     mut sp: usize,
+    jctx: JumpCtx,
 ) -> (*const u8, usize) {
     //gas!(context.interpreter, gas::HIGH);
     popn_at!([target, cond], context.interpreter, sp, (ip, sp));
@@ -89,7 +95,7 @@ pub fn jumpi_at<const FUSE_JUMPDEST: bool, WIRE: InterpreterTypes, H: ?Sized>(
         return (ip, sp);
     }
     (
-        jump_inner::<FUSE_JUMPDEST, _>(context.interpreter, target, ip),
+        jump_inner::<FUSE_JUMPDEST, _>(context.interpreter, target, ip, jctx),
         sp,
     )
 }
@@ -102,9 +108,10 @@ fn jump_inner<const FUSE_JUMPDEST: bool, WIRE: InterpreterTypes>(
     interpreter: &mut Interpreter<WIRE>,
     target: U256,
     ip: *const u8,
+    jctx: JumpCtx,
 ) -> *const u8 {
     let target = as_usize_or_fail_ret!(interpreter, target, InstructionResult::InvalidJump, ip);
-    if !interpreter.bytecode.is_valid_legacy_jump(target) {
+    if !interpreter.bytecode.is_valid_legacy_jump_with(jctx, target) {
         interpreter.halt(InstructionResult::InvalidJump);
         return ip;
     }
@@ -132,10 +139,10 @@ fn jump_inner<const FUSE_JUMPDEST: bool, WIRE: InterpreterTypes>(
         }
         // SAFETY: `is_valid_jump` ensures that `dest` is in bounds, and the analysis pads
         // the bytecode so that one byte past a trailing JUMPDEST still exists.
-        interpreter.bytecode.absolute_ip(target + 1)
+        interpreter.bytecode.absolute_ip_with(jctx, target + 1)
     } else {
         // SAFETY: `is_valid_jump` ensures that `dest` is in bounds.
-        interpreter.bytecode.absolute_ip(target)
+        interpreter.bytecode.absolute_ip_with(jctx, target)
     }
 }
 

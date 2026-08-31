@@ -62,8 +62,58 @@ pub trait LegacyBytecode {
     fn bytecode_slice(&self) -> &[u8];
 }
 
+/// The frame-invariant half of the jump path, hoisted out of the dispatch loop.
+///
+/// `JUMP`/`JUMPI` reach the jump-destination bitmap and the code base through
+/// `&mut Interpreter`, and the EVM stack writes go through a pointer LLVM cannot prove
+/// disjoint from them, so every jump re-loads the same five words: the `Bytecode`
+/// discriminant, the jump table's pointer and its bit length, and the two hops to the
+/// bytecode's data pointer. None of them can change while one frame runs -- only the
+/// instruction *pointer* moves -- so `Interpreter::run_plain` reads them once into a local
+/// and hands that local to the two arms that need it.
+#[derive(Clone, Copy, Debug)]
+pub struct JumpCtx {
+    /// Base of the jump-destination bitmap, one bit per byte of the original bytecode.
+    pub table_ptr: *const u8,
+    /// Number of bits in the bitmap, i.e. the original (unpadded) bytecode length.
+    pub table_len: usize,
+    /// Base of the (padded) bytecode bytes.
+    pub code_base: *const u8,
+}
+
+impl JumpCtx {
+    /// A context whose bitmap rejects every target.
+    ///
+    /// This is what the default [`Jumps::jump_ctx`] hands back, and what a non-legacy
+    /// bytecode gets: `table_len == 0` makes every offset out of range, so the jump halts
+    /// with `InvalidJump`.
+    pub const EMPTY: Self = Self {
+        table_ptr: core::ptr::null(),
+        table_len: 0,
+        code_base: core::ptr::null(),
+    };
+}
+
 /// Trait for Interpreter to be able to jump
 pub trait Jumps {
+    /// The frame-invariant jump inputs, read once per `run_plain` call.
+    ///
+    /// The default hands back [`JumpCtx::EMPTY`], which the `*_with` methods below ignore:
+    /// an implementation that does not override all three is unaffected.
+    fn jump_ctx(&self) -> JumpCtx {
+        JumpCtx::EMPTY
+    }
+
+    /// [`Jumps::is_valid_legacy_jump`] answered from a hoisted [`JumpCtx`].
+    fn is_valid_legacy_jump_with(&mut self, _ctx: JumpCtx, offset: usize) -> bool {
+        self.is_valid_legacy_jump(offset)
+    }
+
+    /// [`Jumps::absolute_ip`] answered from a hoisted [`JumpCtx`].
+    fn absolute_ip_with(&self, _ctx: JumpCtx, offset: usize) -> *const u8 {
+        self.absolute_ip(offset)
+    }
+
     /// Relative jumps does not require checking for overflow.
     fn relative_jump(&mut self, offset: isize);
     /// Absolute jumps require checking for overflow and if target is a jump destination

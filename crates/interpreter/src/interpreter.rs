@@ -520,6 +520,14 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
         // dispatch tails of this function, which the good arrangement has 13 of and the bad
         // one ~150 -- so check that before believing any future win here.
         let mut rem = self.gas.remaining();
+        // The jump-destination bitmap and the code base live in a loop-local too, for the
+        // same reason as the three above: they sit behind the same `&mut Interpreter` as
+        // the stack words, so `JUMP`/`JUMPI` re-load the `Bytecode` discriminant, the
+        // table's pointer and length and the two hops to the bytecode's data pointer every
+        // time. Unlike the cursor and the counter, nothing in the loop *writes* them --
+        // one `run_plain` call is one frame and one bytecode -- so this is a plain
+        // loop-invariant hoist and the arms take it by value without handing it back.
+        let jctx = self.bytecode.jump_ctx();
         // The bump of `ip` lives in the arms, past the opcode read, rather than in the loop
         // header. In the header the backend schedules the `addi` ahead of the `lbu` and has to
         // copy the pre-bump pointer into a second register; from the arm it is an in-place
@@ -605,6 +613,7 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
                     },
                     ip,
                     sp,
+                    jctx,
                 );
                 ip = next_ip;
                 sp = next_sp;
