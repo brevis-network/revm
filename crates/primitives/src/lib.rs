@@ -340,12 +340,24 @@ pub fn address_eq(a: &Address, b: &Address) -> bool {
 ///
 /// `Hash` forwards to `Address`'s, so a `FastAddress` query hashes to exactly the bucket an
 /// `Address` key was stored in; `hash_agrees_with_address` pins that.
+///
+/// `TAG` carries no information and is never read. It is there so that each call site can ask
+/// for its own monomorphisation of the lookup: hashbrown's `RawTable::find` is generic over
+/// the query type, and with one query type shared between two call sites LLVM decides the
+/// probe is worth outlining - at which point the call costs more than the `memcmp` it saved.
+/// Measured, on mainnet block 24006677: making `JournalInner::transfer_loaded` share
+/// `sload_slot`'s query type outlined `HashMap::get_inner_mut` and cost +1,351,731 retired
+/// instructions, against the ~1.3 M of `memcmp` it removed. Distinct tags keep both copies
+/// inline. Pick a tag per call site and say which in a comment there.
 #[derive(Debug, Eq)]
 #[repr(transparent)]
-pub struct FastAddress(Address);
+pub struct FastAddressAt<const TAG: usize>(Address);
 
-impl FastAddress {
-    /// Borrows an [`Address`] as a [`FastAddress`].
+/// [`FastAddressAt`] with the tag `JournalInner::sload_slot` uses.
+pub type FastAddress = FastAddressAt<0>;
+
+impl<const TAG: usize> FastAddressAt<TAG> {
+    /// Borrows an [`Address`] as a [`FastAddressAt`].
     #[inline(always)]
     pub fn new(address: &Address) -> &Self {
         // SAFETY: `#[repr(transparent)]` over `Address`, so the two have the same layout and
@@ -354,24 +366,24 @@ impl FastAddress {
     }
 }
 
-impl PartialEq for FastAddress {
+impl<const TAG: usize> PartialEq for FastAddressAt<TAG> {
     #[inline(always)]
     fn eq(&self, other: &Self) -> bool {
         address_eq(&self.0, &other.0)
     }
 }
 
-impl core::hash::Hash for FastAddress {
+impl<const TAG: usize> core::hash::Hash for FastAddressAt<TAG> {
     #[inline(always)]
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.0.hash(state);
     }
 }
 
-impl core::borrow::Borrow<FastAddress> for Address {
+impl<const TAG: usize> core::borrow::Borrow<FastAddressAt<TAG>> for Address {
     #[inline(always)]
-    fn borrow(&self) -> &FastAddress {
-        FastAddress::new(self)
+    fn borrow(&self) -> &FastAddressAt<TAG> {
+        FastAddressAt::new(self)
     }
 }
 

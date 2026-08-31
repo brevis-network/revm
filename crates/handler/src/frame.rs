@@ -496,10 +496,16 @@ impl EthFrame<EthInterpreter> {
         result: &mut FrameResult,
     ) -> Result<(), ERROR> {
         self.interpreter.memory.free_child_context();
-        match core::mem::replace(ctx.error(), Ok(())) {
-            Err(ContextError::Db(e)) => return Err(e.into()),
-            Err(ContextError::Custom(e)) => return Err(ERROR::from_string(e)),
-            Ok(_) => (),
+        // Guarded on `is_err`: `mem::replace` reads the old value out and writes `Ok(())`
+        // back whatever it was, and the slot is `Ok` on every one of the 19,975 frame returns
+        // of mainnet block 24006677. Worth only 3 instructions a call (-59,925) - the load and
+        // branch replace most of what the replace cost - but it is 3 instructions.
+        if ctx.error().is_err() {
+            match core::mem::replace(ctx.error(), Ok(())) {
+                Err(ContextError::Db(e)) => return Err(e.into()),
+                Err(ContextError::Custom(e)) => return Err(ERROR::from_string(e)),
+                Ok(_) => (),
+            }
         }
 
         // Insert result to the top frame.

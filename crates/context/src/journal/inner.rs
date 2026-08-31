@@ -430,8 +430,29 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         to: AlignedAddress,
         balance: U256,
     ) -> Option<TransferError> {
+        // Keyed by `FastAddressAt` so the bucket comparison is word-wise rather than the
+        // 20-byte `memcmp` libcall `Address: PartialEq` lowers to; this function made 32,852
+        // of them on mainnet block 24006677, at ~39 retired instructions inside `memcmp`
+        // each.
+        //
+        // One lookup site per account, and its own tag for each, because the inline
+        // comparison makes the probe big enough for LLVM to want to outline it and the call
+        // then costs more than the `memcmp` did. Four sites sharing one tag measured at
+        // +586,870, and sharing `sload_slot`'s tag 0 at +1,351,731; see `FastAddressAt`.
+        // `to` is wanted on all three paths, so it is resolved up front.
+        //
+        // A raw pointer for the same reason as in `sload_slot`: the borrow would have to
+        // cover the `from` lookup and the journal pushes below. Nothing inserts into
+        // `self.state` here, so the bucket cannot move.
+        let to_account: *mut Account = self
+            .state
+            .get_mut(primitives::FastAddressAt::<1>::new(&to.0))
+            .unwrap();
+
         if from.same(&to) {
-            let from_balance = self.state.get_mut(&to.0).unwrap().info.balance;
+            // SAFETY: just derived from a live `&mut Account`; nothing has touched
+            // `self.state` since.
+            let from_balance = unsafe { (*to_account).info.balance };
             // Check if from balance is enough to transfer the balance.
             if balance > from_balance {
                 return Some(TransferError::OutOfFunds);
@@ -440,12 +461,16 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         }
 
         if balance.is_zero() {
-            Self::touch_account(&mut self.journal, to.0, self.state.get_mut(&to.0).unwrap());
+            // SAFETY: as above.
+            Self::touch_account(&mut self.journal, to.0, unsafe { &mut *to_account });
             return None;
         }
 
         // sub balance from
-        let from_account = self.state.get_mut(&from.0).unwrap();
+        let from_account = self
+            .state
+            .get_mut(primitives::FastAddressAt::<2>::new(&from.0))
+            .unwrap();
         Self::touch_account(&mut self.journal, from.0, from_account);
         let from_balance = &mut from_account.info.balance;
         let Some(from_balance_decr) = from_balance.checked_sub(balance) else {
@@ -454,7 +479,8 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         *from_balance = from_balance_decr;
 
         // add balance to
-        let to_account = self.state.get_mut(&to.0).unwrap();
+        // SAFETY: as above - the `from` lookup above is a lookup, so no bucket moved.
+        let to_account = unsafe { &mut *to_account };
         Self::touch_account(&mut self.journal, to.0, to_account);
         let to_balance = &mut to_account.info.balance;
         let Some(to_balance_incr) = to_balance.checked_add(balance) else {
