@@ -111,6 +111,21 @@ fn jump_inner<const FUSE_JUMPDEST: bool, WIRE: InterpreterTypes>(
     jctx: JumpCtx,
 ) -> *const u8 {
     let target = as_usize_or_fail_ret!(interpreter, target, InstructionResult::InvalidJump, ip);
+    jump_to::<FUSE_JUMPDEST, _>(interpreter, target, ip, jctx)
+}
+
+/// [`jump_inner`] once the destination is already a `usize`.
+///
+/// Split out for the fused `PUSH2; JUMP`/`PUSH2; JUMPI` arms, whose destination comes
+/// straight from the two immediate bytes and so is known to fit in a `usize` -- the four
+/// limb tests `as_usize_or_fail_ret!` does are dead there.
+#[inline(always)]
+pub fn jump_to<const FUSE_JUMPDEST: bool, WIRE: InterpreterTypes>(
+    interpreter: &mut Interpreter<WIRE>,
+    target: usize,
+    ip: *const u8,
+    jctx: JumpCtx,
+) -> *const u8 {
     if !interpreter.bytecode.is_valid_legacy_jump_with(jctx, target) {
         interpreter.halt(InstructionResult::InvalidJump);
         return ip;
@@ -144,6 +159,76 @@ fn jump_inner<const FUSE_JUMPDEST: bool, WIRE: InterpreterTypes>(
         // SAFETY: `is_valid_jump` ensures that `dest` is in bounds.
         interpreter.bytecode.absolute_ip_with(jctx, target)
     }
+}
+
+/// Fused `PUSH<N>; JUMP`: the destination comes from the `N` immediate bytes of the `PUSH`
+/// instead of a round trip through the stack.
+///
+/// `ip` points at the `PUSH` opcode. The pointer handed back on a not-taken path is the one
+/// the unfused pair would have left behind, i.e. just past the `JUMP` byte.
+///
+/// Semantically the two arms it replaces, in their order: the `PUSH`'s own gas and its
+/// overflow check are done by the caller (the `(2, N)` arm), then the `JUMP`'s own charge
+/// here -- through the gas field rather than the caller's loop-carried register, see the
+/// comment at the call site -- and then the jump. The push-then-pop of the destination word cancels, so
+/// the stack is only *read* here -- there is nothing to bound-check that the caller's
+/// overflow check has not already covered.
+#[inline(always)]
+pub fn jump_imm_at<const N: usize, WIRE: InterpreterTypes>(
+    interpreter: &mut Interpreter<WIRE>,
+    ip: *const u8,
+    sp: usize,
+    jctx: JumpCtx,
+) -> (*const u8, usize) {
+    // The `PUSH` opcode, its `N` immediate bytes, and the `JUMP` byte.
+    let next = unsafe { ip.add(N + 2) };
+    if interpreter.gas.record_cost_unsafe(crate::gas::MID) {
+        interpreter.halt_oog();
+        return (next, sp);
+    }
+    let target = unsafe { read_be_usize::<N>(ip.add(1)) };
+    (jump_to::<true, _>(interpreter, target, next, jctx), sp)
+}
+
+/// Fused `PUSH<N>; JUMPI`. See [`jump_imm_at`].
+///
+/// The condition is the top of the stack -- the destination the `JUMPI` would have popped
+/// first is the one the `PUSH` would have pushed, and neither happens.
+#[inline(always)]
+pub fn jumpi_imm_at<const N: usize, WIRE: InterpreterTypes>(
+    interpreter: &mut Interpreter<WIRE>,
+    ip: *const u8,
+    mut sp: usize,
+    jctx: JumpCtx,
+) -> (*const u8, usize) {
+    let next = unsafe { ip.add(N + 2) };
+    if interpreter.gas.record_cost_unsafe(crate::gas::HIGH) {
+        interpreter.halt_oog();
+        return (next, sp);
+    }
+    popn_at!([cond], interpreter, sp, (next, sp));
+    if super::u256_is_zero(&cond) {
+        return (next, sp);
+    }
+    let target = unsafe { read_be_usize::<N>(ip.add(1)) };
+    (jump_to::<true, _>(interpreter, target, next, jctx), sp)
+}
+
+/// The `N` big-endian bytes at `src` as a `usize`.
+///
+/// # Safety
+///
+/// `src` must be readable for `N` bytes, and `N` at most 8.
+#[inline(always)]
+unsafe fn read_be_usize<const N: usize>(src: *const u8) -> usize {
+    debug_assert!(N >= 1 && N <= 8);
+    let mut v = 0usize;
+    let mut i = 0;
+    while i < N {
+        v = (v << 8) | (unsafe { *src.add(i) } as usize);
+        i += 1;
+    }
+    v
 }
 
 /// Implements the JUMPDEST instruction.

@@ -682,9 +682,110 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
                 // analysis pads the bytecode past the last opcode, so the $n immediate bytes
                 // of a trailing `PUSH` are readable.
                 if sp != byte_limit {
-                    unsafe { self.stack.push_slice_const_at::<$n>(sp, ip.add(1)) };
-                    sp = sp.wrapping_add(WORD);
-                    ip = unsafe { ip.add(1 + $n) };
+                    // Fused `PUSH2; JUMPI` and `PUSH2; JUMP`.
+                    //
+                    // # What it removes
+                    //
+                    // A whole dispatch, and -- worth more than the dispatch -- the jump
+                    // destination's round trip through the stack. The two immediate bytes go
+                    // straight to `control::jump_to`, so the word's four limbs are never
+                    // written and never read back, and the four limb tests of
+                    // `as_usize_or_fail_ret!` fold away because two bytes always fit in a
+                    // `usize`. On block 24006677: 392,863,911 -> 385,061,320, -7,802,591,
+                    // all of it inside this function (242,561,931 -> 234,756,213). Only
+                    // 0.59 M of that is the dispatch itself -- `jr` and the table `lw` each
+                    // go 8,067,167 -> 7,474,991, i.e. exactly the 592,176 fused pairs -- the
+                    // rest is the stack round trip: `sd` -2.33 M, `ld` -1.87 M, `add`
+                    // -1.35 M, `addi` -1.31 M, `or` -1.05 M, `slli` -0.73 M.
+                    //
+                    // # Why this pair and no other
+                    //
+                    // Measured over the executed opcode stream, per *ordered pair* of
+                    // consecutive dispatches. solc emits a jump destination as a `PUSH2`
+                    // for any contract longer than 256 bytes, so on block 24006677 every
+                    // one of the 423,710 executed `JUMPI`s follows a `PUSH2`, and
+                    // `JUMPI`/`JUMP` are 79.5 % of all 745,071 `PUSH2`s -- 63-80 % across
+                    // all nine benchmark blocks. Nothing else comes close: the next
+                    // candidates are `ISZERO; PUSH2` (78 % of `ISZERO`) and `EQ; PUSH2`
+                    // (97 % of `EQ`), and they are worth ~0.4 M each *at best*, because
+                    // they save only the dispatch -- there is no shared work between the
+                    // two bodies to cancel. `PUSH2; JUMP*` is the one hot pair where the
+                    // first opcode's whole output is the second's whole input.
+                    //
+                    // The peek costs one instruction on every dispatch of the arm that
+                    // carries it, so it must not go on a cold predecessor: `PUSH1` reaches
+                    // `JUMP`/`JUMPI` 16 times in 1,178,271 dispatches, so peeking there
+                    // would cost ~1.2 M to save ~200. Hence `$n == 2` only, const-folded
+                    // away in the other 31 `PUSH` arms.
+                    //
+                    // # Why the fused paths must *fall through*
+                    //
+                    // No `continue` out of the middle of the arm: the fused paths join the
+                    // unfused one at the bottom, so the loop header keeps exactly the
+                    // incoming edges it had. This is not a style point, it is the whole
+                    // difference between a win and a regression. Written with a `continue`
+                    // -- which is the obvious way, and reads identically -- the extra back
+                    // edge tips the loop over the register-allocation cliff described in the
+                    // note on `rem` above: the counter stops being charged in place and
+                    // every arm gets `addi <scratch>, <carried>, -cost` on entry and a `mv`
+                    // back before its dispatch. Measured on block 24006677:
+                    //
+                    //                                  fall-through   `continue`   baseline
+                    //     `mv` in `run_plain`                    149          302        137
+                    //     `mv` retired in `run_plain`        880,744    6,808,725    594,916
+                    //     `li`/`lui` retired                            +1.80 M
+                    //     retired, whole guest          385,061,320  392,229,587  392,863,911
+                    //
+                    // i.e. the same fusion is -7.80 M one way and -0.63 M the other, and the
+                    // toll is *fixed*, not proportional: fusing only `JUMPI` with a
+                    // `continue` still paid it in full and came out at 393,823,921, +0.96 M
+                    // **worse than baseline**. Charging the second opcode's gas on `rem`
+                    // here rather than through the gas field made no difference either way
+                    // (-618,250 vs -634,324), so the arithmetic on the counter is not the
+                    // trigger -- the back edge is. If a future edit to this arm loses the
+                    // win, check those two `mv` counts before anything else.
+                    //
+                    // # What is left on the table
+                    //
+                    // The successor test compiles to `li`/`beq`/`li`/`bne` and LLVM orders
+                    // the two constants numerically, so `JUMP` (0x56) is tested before the
+                    // 2.5x more frequent `JUMPI` (0x57): four instructions on a `JUMPI` hit
+                    // where two would do. Getting the order right is worth ~0.51 M and
+                    // getting the constants into loop-resident registers another ~1.07 M
+                    // (2.64 M of test today against a 1.07 M floor), but every attempt to
+                    // steer either one is another roll of the dice against the cliff above.
+                    //
+                    // SAFETY of the peek: the byte just past the immediate is the next
+                    // opcode, which the unfused path reads in the loop header on the very
+                    // next iteration.
+                    if $n == 2 && unsafe { *ip.add(1 + $n) }
+                        == $crate::instructions::opcode_consts::JUMPI
+                    {
+                        self.gas.set_remaining(rem);
+                        let (next_ip, next_sp) =
+                            $crate::instructions::control::jumpi_imm_at::<$n, _>(
+                                self, ip, sp, jctx,
+                            );
+                        ip = next_ip;
+                        sp = next_sp;
+                        rem = self.gas.remaining();
+                    } else if $n == 2
+                        && unsafe { *ip.add(1 + $n) }
+                            == $crate::instructions::opcode_consts::JUMP
+                    {
+                        self.gas.set_remaining(rem);
+                        let (next_ip, next_sp) =
+                            $crate::instructions::control::jump_imm_at::<$n, _>(
+                                self, ip, sp, jctx,
+                            );
+                        ip = next_ip;
+                        sp = next_sp;
+                        rem = self.gas.remaining();
+                    } else {
+                        unsafe { self.stack.push_slice_const_at::<$n>(sp, ip.add(1)) };
+                        sp = sp.wrapping_add(WORD);
+                        ip = unsafe { ip.add(1 + $n) };
+                    }
                 } else {
                     // `push` leaves the instruction pointer just past the opcode on
                     // overflow, and the halt is what ends the loop -- which means handing
