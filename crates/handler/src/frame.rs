@@ -120,14 +120,14 @@ impl EthFrame<EthInterpreter> {
     /// Clear and initialize a frame.
     #[allow(clippy::too_many_arguments)]
     ///
-    /// The interpreter's [`InputsImpl`] is not a parameter; see [`Interpreter::clear`].
+    /// Neither the interpreter's [`InputsImpl`] nor its [`ExtBytecode`] is a parameter; see
+    /// [`Interpreter::clear`].
     pub fn clear(
         &mut self,
         data: FrameData,
         input: FrameInput,
         depth: usize,
         memory: SharedMemory,
-        bytecode: ExtBytecode,
         is_static: bool,
         spec_id: SpecId,
         gas_limit: u64,
@@ -145,7 +145,7 @@ impl EthFrame<EthInterpreter> {
         *input_ref = input;
         *depth_ref = depth;
         *is_finished_ref = false;
-        interpreter.clear(memory, bytecode, is_static, spec_id, gas_limit);
+        interpreter.clear(memory, is_static, spec_id, gas_limit);
         *checkpoint_ref = checkpoint;
     }
 
@@ -257,6 +257,10 @@ impl EthFrame<EthInterpreter> {
         ii.input = inputs.input.clone();
         ii.call_value = inputs.value.get();
 
+        // In place, for the reason in `Interpreter::clear`: by value this is a 184-byte
+        // `memcpy` libcall per frame.
+        ExtBytecode::replace_with_hash(&mut frame.interpreter.bytecode, bytecode, bytecode_hash);
+
         frame.clear(
             FrameData::Call(CallFrame {
                 return_memory_range: inputs.return_memory_offset.clone(),
@@ -264,7 +268,6 @@ impl EthFrame<EthInterpreter> {
             FrameInput::Call(inputs),
             depth,
             memory,
-            ExtBytecode::new_with_hash(bytecode, bytecode_hash),
             is_static,
             spec_id,
             gas_limit,
@@ -342,14 +345,15 @@ impl EthFrame<EthInterpreter> {
             Err(e) => return return_error(e.into()),
         };
 
-        let bytecode = ExtBytecode::new_with_optional_hash(
-            Bytecode::new_legacy(inputs.init_code.clone()),
-            init_code_hash,
-        );
-
         let gas_limit = inputs.gas_limit;
 
         let frame = this.get(EthFrame::invalid);
+        // In place; see `make_call_frame`.
+        ExtBytecode::replace_with_optional_hash(
+            &mut frame.interpreter.bytecode,
+            Bytecode::new_legacy(inputs.init_code.clone()),
+            init_code_hash,
+        );
         // In place; see `make_call_frame`.
         let ii = &mut frame.interpreter.input;
         // SAFETY: each pair below is two live, distinct 20-byte objects.
@@ -369,7 +373,6 @@ impl EthFrame<EthInterpreter> {
             FrameInput::Create(inputs),
             depth,
             memory,
-            bytecode,
             false,
             spec,
             gas_limit,

@@ -168,16 +168,19 @@ impl<EXT: Default> Interpreter<EthInterpreter<EXT>> {
     /// one over by value costs two `memcpy` calls per frame (one into the argument slot,
     /// one out of it). Callers write [`Interpreter::input`] in place instead, which also
     /// lets each `Address` in it go through `copy_address_bytes`.
+    ///
+    /// `bytecode` is not a parameter for the same reason - an `ExtBytecode` is 184 bytes, and
+    /// `*bytecode_ref = bytecode` was one `memcpy` libcall per frame. Callers use
+    /// [`ExtBytecode::replace_with_hash`], which writes the interpreter's own field.
     pub fn clear(
         &mut self,
         memory: SharedMemory,
-        bytecode: ExtBytecode,
         is_static: bool,
         spec_id: SpecId,
         gas_limit: u64,
     ) {
         let Self {
-            bytecode: bytecode_ref,
+            bytecode: _,
             gas,
             stack,
             return_data,
@@ -187,7 +190,6 @@ impl<EXT: Default> Interpreter<EthInterpreter<EXT>> {
             extend,
             gas_stash,
         } = self;
-        *bytecode_ref = bytecode;
         *gas = Gas::new(gas_limit);
         stack.clear();
         return_data.0.clear();

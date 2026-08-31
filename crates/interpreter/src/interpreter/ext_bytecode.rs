@@ -52,13 +52,29 @@ impl ExtBytecode {
     /// Creates new `ExtBytecode` with the given hash.
     #[inline]
     pub fn new_with_hash(base: Bytecode, hash: B256) -> Self {
-        // Not `new_with_optional_hash(base, Some(hash))`: building that `Some` is a 32-byte
-        // copy into a 1-aligned payload, i.e. a `memcpy` libcall, once per call frame.
-        let instruction_pointer = base.bytecode_ptr();
-        // SAFETY: every field is initialized exactly once below.
+        // SAFETY: `write_with_hash` initializes every field, so `assume_init` sees a fully
+        // initialized `Self`.
         unsafe {
             let mut me = core::mem::MaybeUninit::<Self>::uninit();
-            let p = me.as_mut_ptr();
+            Self::write_with_hash(me.as_mut_ptr(), base, hash);
+            me.assume_init()
+        }
+    }
+
+    /// Writes a fresh `ExtBytecode` over `base` into `p`, one field at a time.
+    ///
+    /// Not `write_with_optional_hash(p, base, Some(hash))`: building that `Some` is a
+    /// 32-byte copy into a 1-aligned payload, i.e. a `memcpy` libcall, once per call frame.
+    ///
+    /// # Safety
+    /// `p` must point at writable, properly aligned storage for a `Self` that holds no live
+    /// value - uninitialized, or already dropped.
+    #[inline(always)]
+    unsafe fn write_with_hash(p: *mut Self, base: Bytecode, hash: B256) {
+        let instruction_pointer = base.bytecode_ptr();
+        // SAFETY: `p` is writable storage for a `Self` per the contract, and every field is
+        // initialized exactly once below.
+        unsafe {
             primitives::write_some_b256(
                 core::ptr::addr_of_mut!((*p).bytecode_hash),
                 core::ptr::addr_of!(hash).cast::<u8>(),
@@ -67,21 +83,33 @@ impl ExtBytecode {
             core::ptr::addr_of_mut!((*p).instruction_pointer).write(instruction_pointer);
             core::ptr::addr_of_mut!((*p).action).write(None);
             core::ptr::addr_of_mut!((*p).continue_execution).write(true);
-            me.assume_init()
         }
     }
 
     /// Creates new `ExtBytecode` with the given hash.
     #[inline]
     pub fn new_with_optional_hash(base: Bytecode, hash: Option<B256>) -> Self {
-        let instruction_pointer = base.bytecode_ptr();
-        // Written field by field so the `Option<B256>` payload goes through
-        // `write_some_b256` rather than a `memcpy` libcall; this runs once per call frame.
-        // SAFETY: every field is initialized exactly once below, so `assume_init` sees a
+        // SAFETY: `write_with_optional_hash` initializes every field, so `assume_init` sees a
         // fully initialized `Self`.
         unsafe {
             let mut me = core::mem::MaybeUninit::<Self>::uninit();
-            let p = me.as_mut_ptr();
+            Self::write_with_optional_hash(me.as_mut_ptr(), base, hash);
+            me.assume_init()
+        }
+    }
+
+    /// Writes a fresh `ExtBytecode` over `base` into `p`, one field at a time, so the
+    /// `Option<B256>` payload goes through `write_some_b256` rather than a `memcpy` libcall.
+    ///
+    /// # Safety
+    /// `p` must point at writable, properly aligned storage for a `Self` that holds no live
+    /// value - uninitialized, or already dropped.
+    #[inline(always)]
+    unsafe fn write_with_optional_hash(p: *mut Self, base: Bytecode, hash: Option<B256>) {
+        let instruction_pointer = base.bytecode_ptr();
+        // SAFETY: `p` is writable storage for a `Self` per the contract, and every field is
+        // initialized exactly once below.
+        unsafe {
             match hash {
                 Some(h) => primitives::write_some_b256(
                     core::ptr::addr_of_mut!((*p).bytecode_hash),
@@ -93,7 +121,34 @@ impl ExtBytecode {
             core::ptr::addr_of_mut!((*p).instruction_pointer).write(instruction_pointer);
             core::ptr::addr_of_mut!((*p).action).write(None);
             core::ptr::addr_of_mut!((*p).continue_execution).write(true);
-            me.assume_init()
+        }
+    }
+
+    /// Replaces the `ExtBytecode` at `dst` with a fresh one over `base`.
+    ///
+    /// `Interpreter::clear` used to take the new value by parameter and assign it, which is a
+    /// 184-byte `memcpy` libcall per call frame - and a pointless one, because
+    /// [`Self::new_with_hash`] already writes every field one at a time and only the
+    /// destination was a stack slot rather than the interpreter's own field. Same reasoning
+    /// as the `input` parameter `Interpreter::clear` does not have.
+    #[inline]
+    pub fn replace_with_hash(dst: &mut Self, base: Bytecode, hash: B256) {
+        // SAFETY: `dst` is a live, aligned `Self`; it is dropped and then every one of its
+        // fields is written again before this returns, with nothing fallible in between, so
+        // it holds exactly one live value at every point an observer could look.
+        unsafe {
+            core::ptr::drop_in_place(dst);
+            Self::write_with_hash(dst, base, hash);
+        }
+    }
+
+    /// [`Self::replace_with_hash`] for a hash that may not have been calculated yet.
+    #[inline]
+    pub fn replace_with_optional_hash(dst: &mut Self, base: Bytecode, hash: Option<B256>) {
+        // SAFETY: as in `replace_with_hash`.
+        unsafe {
+            core::ptr::drop_in_place(dst);
+            Self::write_with_optional_hash(dst, base, hash);
         }
     }
 
