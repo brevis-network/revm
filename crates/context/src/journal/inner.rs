@@ -787,7 +787,9 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         //
         // SAFETY: `account` was just derived from a live `&mut Account`, and no other access
         // to `state` happens before it is used.
-        if let Some(slot) = unsafe { (*account).storage.get_mut(&key) } {
+        // Keyed by `FastU256` so the bucket comparison is limb-wise rather than a 32-byte
+        // `memcmp` libcall; see there.
+        if let Some(slot) = unsafe { (*account).storage.get_mut(primitives::FastU256::new(&key)) } {
             let is_cold = slot.is_cold_transaction_id(transaction_id);
             if is_cold {
                 if skip_cold_load {

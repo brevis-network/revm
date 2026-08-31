@@ -375,6 +375,53 @@ impl core::borrow::Borrow<FastAddress> for Address {
     }
 }
 
+/// A lookup key for `HashMap<U256, _>` that compares limb-wise.
+///
+/// The [`FastAddress`] story for the storage maps. A storage lookup ends in comparing the
+/// query with the key in the bucket it landed on, and that comparison is `U256: PartialEq`,
+/// so `[u64; 4]` equality, so - for the reason in [`u256_eq`] - a 32-byte `memcmp` libcall.
+/// `JournalInner::sload_slot` alone makes one per SLOAD and per SSTORE.
+///
+/// Same mechanism as [`FastAddress`]: a `#[repr(transparent)]` wrapper with its own
+/// `PartialEq`, reached through `Borrow`, so `map.get_mut(&key)` becomes
+/// `map.get_mut(FastU256::new(&key))` and neither the map type nor a stored key changes.
+/// `Hash` forwards to `U256`'s, so the query hashes into the bucket the key was stored in;
+/// `fast_u256_finds_what_u256_stored` pins that.
+#[derive(Debug, Eq)]
+#[repr(transparent)]
+pub struct FastU256(U256);
+
+impl FastU256 {
+    /// Borrows a [`U256`] as a [`FastU256`].
+    #[inline(always)]
+    pub fn new(value: &U256) -> &Self {
+        // SAFETY: `#[repr(transparent)]` over `U256`, so the two have the same layout and
+        // the same validity invariant.
+        unsafe { &*(value as *const U256).cast::<Self>() }
+    }
+}
+
+impl PartialEq for FastU256 {
+    #[inline(always)]
+    fn eq(&self, other: &Self) -> bool {
+        u256_eq(&self.0, &other.0)
+    }
+}
+
+impl core::hash::Hash for FastU256 {
+    #[inline(always)]
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+impl core::borrow::Borrow<FastU256> for U256 {
+    #[inline(always)]
+    fn borrow(&self) -> &FastU256 {
+        FastU256::new(self)
+    }
+}
+
 /// Type alias for EVM storage keys (256-bit unsigned integers).
 /// Used to identify storage slots within smart contract storage.
 pub type StorageKey = U256;
@@ -503,6 +550,31 @@ mod fast_key_tests {
             for b in cases {
                 assert_eq!(u256_eq(&a, &b), a == b);
             }
+        }
+    }
+
+    /// Same contract as `fast_address_finds_what_address_stored`, for the storage maps.
+    #[test]
+    fn fast_u256_finds_what_u256_stored() {
+        let mut map: HashMap<U256, u32, FixedKeyBuildHasher> = HashMap::default();
+        let key = |i: u32| {
+            U256::from_limbs([
+                u64::from(i),
+                u64::from(i).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                0,
+                u64::from(i) << 40,
+            ])
+        };
+        for i in 0..256u32 {
+            map.insert(key(i), i);
+        }
+        for i in 0..256u32 {
+            let k = key(i);
+            assert_eq!(map.get(FastU256::new(&k)).copied(), Some(i), "i={i}");
+        }
+        for i in 256..320u32 {
+            let k = key(i);
+            assert_eq!(map.get(FastU256::new(&k)).copied(), map.get(&k).copied());
         }
     }
 
