@@ -153,7 +153,15 @@ pub fn eq_at<WIRE: InterpreterTypes, H: ?Sized>(
     //gas!(context.interpreter, gas::VERYLOW);
     popn_top_at!([op1], op2, context.interpreter, sp, rem);
 
-    *op2 = U256::from(super::u256_eq(&op1, op2));
+    // Most `EQ`s are a function-selector test against a `PUSH4`, so the two words differ in
+    // their low limb and the other three loads and the xor/or reduce are wasted. Deciding
+    // on the low limb first costs one extra compare when they do match.
+    let (x, y) = (op1.as_limbs(), op2.as_limbs());
+    if x[0] != y[0] {
+        *op2 = U256::ZERO;
+        return (sp, rem);
+    }
+    *op2 = U256::from(((x[1] ^ y[1]) | (x[2] ^ y[2]) | (x[3] ^ y[3])) == 0);
     (sp, rem)
 }
 
