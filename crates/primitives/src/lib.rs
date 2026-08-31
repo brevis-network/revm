@@ -28,7 +28,9 @@ pub mod hardfork;
 mod once_lock;
 
 pub use constants::*;
-pub use fixed_key_hash::{AddressMap, AddressSet, B256Map, FixedKeyBuildHasher, FixedKeyHasher};
+pub use fixed_key_hash::{
+    AddressMap, AddressSet, B256Map, FixedKeyBuildHasher, FixedKeyHasher, StorageKeyMap,
+};
 pub use once_lock::OnceLock;
 
 // Reexport alloy primitives.

@@ -280,7 +280,7 @@ fn run_test_file(
 #[derive(Debug, Clone)]
 struct DebugInfo {
     /// Initial pre-state before any execution
-    pre_state: HashMap<Address, (AccountInfo, HashMap<U256, U256>)>,
+    pre_state: HashMap<Address, (AccountInfo, revm::primitives::StorageKeyMap<U256>)>,
     /// Transaction environment
     tx_env: Option<revm::context::tx::TxEnv>,
     /// Block environment
