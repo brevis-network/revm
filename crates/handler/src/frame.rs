@@ -122,6 +122,11 @@ impl EthFrame<EthInterpreter> {
     ///
     /// Neither the interpreter's [`InputsImpl`] nor its [`ExtBytecode`] is a parameter; see
     /// [`Interpreter::clear`].
+    ///
+    /// `#[inline]`: out of line this is ten callee-saved registers saved and restored, 37
+    /// retired instructions per call frame, around a body that assigns six fields. Both
+    /// call sites are inside `init_with_context`, which already has the frame pointer live.
+    #[inline]
     pub fn clear(
         &mut self,
         data: FrameData,
