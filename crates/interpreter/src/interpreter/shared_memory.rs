@@ -138,6 +138,84 @@ pub(crate) fn bswap64_halves_shared(x: u64, m1: u64, m2: u64) -> u64 {
     bswap64_halves_masked(x, m1, m2)
 }
 
+/// Reads the 20-byte big-endian address at `p` into a `U256`.
+///
+/// `Address::into_word().into()` builds a 32-byte `B256` first -- a 12-byte zero fill and a
+/// 20-byte copy out of an align-1 field -- and then byte-reverses all four limbs of it. An
+/// address has three non-zero limbs and the top one is 32 bits wide, so what the conversion
+/// actually needs is three scalar loads, two funnels and two-and-a-bit reversals. Measured
+/// on mainnet block 24006677: `ADDRESS` 85.0 -> 69.1 retired per dispatch, `CALLER` 78.0 ->
+/// 63.0.
+///
+/// `Address` is `[u8; 20]` with alignment 1 and RV64 has no misaligned scalar load, so the
+/// ladder is the same shape as [`primitives::copy_address_bytes`]: 8-aligned, 4-aligned,
+/// then bytes. `InputsImpl`'s two address fields land 8- and 4-aligned, and the byte arm is
+/// never reached from the interpreter -- both offsets are compile-time multiples of 4.
+///
+/// # Safety
+///
+/// `p` must point at 20 readable bytes.
+#[inline(always)]
+pub(crate) unsafe fn u256_from_be_address(p: *const u8) -> U256 {
+    let (m1, m2) = bswap_masks();
+    let a = p as usize;
+    // Big-endian bytes 0..4, 4..12 and 12..20 are limbs 2, 1 and 0; limb 3 is always zero.
+    // Where a word is assembled out of two halves it is assembled *swapped*, which is stage
+    // 3 of the reversal already done - see `bswap64_halves_masked`.
+    // SAFETY: 20 readable bytes per the contract, and each arm only takes accesses as wide
+    // as `p` is known to be aligned for.
+    unsafe {
+        if a.is_multiple_of(8) {
+            let q = p.cast::<u64>();
+            let w0 = q.read();
+            let w1 = q.add(1).read();
+            let w2 = u64::from(p.add(16).cast::<u32>().read());
+            U256::from_limbs([
+                bswap64_masked((w1 >> 32) | (w2 << 32), m1, m2),
+                bswap64_masked((w0 >> 32) | (w1 << 32), m1, m2),
+                // Bytes 0..4 are the low half of `w0`; the reversal's stage 3 lifts them.
+                bswap64_halves_masked(w0 & 0xFFFF_FFFF, m1, m2),
+                0,
+            ])
+        } else if a.is_multiple_of(4) {
+            let q = p.cast::<u32>();
+            let u0 = u64::from(q.read());
+            let u1 = u64::from(q.add(1).read());
+            let u2 = u64::from(q.add(2).read());
+            let u3 = u64::from(q.add(3).read());
+            let u4 = u64::from(q.add(4).read());
+            U256::from_limbs([
+                bswap64_halves_masked(u4 | (u3 << 32), m1, m2),
+                bswap64_halves_masked(u2 | (u1 << 32), m1, m2),
+                bswap64_halves_masked(u0, m1, m2),
+                0,
+            ])
+        } else {
+            let b = |i: usize| u64::from(p.add(i).read());
+            U256::from_limbs([
+                (b(12) << 56)
+                    | (b(13) << 48)
+                    | (b(14) << 40)
+                    | (b(15) << 32)
+                    | (b(16) << 24)
+                    | (b(17) << 16)
+                    | (b(18) << 8)
+                    | b(19),
+                (b(4) << 56)
+                    | (b(5) << 48)
+                    | (b(6) << 40)
+                    | (b(7) << 32)
+                    | (b(8) << 24)
+                    | (b(9) << 16)
+                    | (b(10) << 8)
+                    | b(11),
+                (b(0) << 24) | (b(1) << 16) | (b(2) << 8) | b(3),
+                0,
+            ])
+        }
+    }
+}
+
 /// Reads the 32-byte big-endian word at `p` into a `U256`.
 ///
 /// The four limb loads are plain `ld`, which is only possible when the caller can prove the

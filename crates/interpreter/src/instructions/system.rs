@@ -1,8 +1,8 @@
 use crate::{
     gas,
     interpreter::{
-        bswap64_halves_shared, bswap64_shared, bswap_masks_shared, u256_from_be_aligned,
-        Interpreter,
+        bswap64_halves_shared, bswap64_shared, bswap_masks_shared, u256_from_be_address,
+        u256_from_be_aligned, Interpreter,
     },
     interpreter_types::{
         InputsTr, InterpreterTypes, LegacyBytecode, MemoryTr, ReturnData, RuntimeFlag, StackTr,
@@ -84,17 +84,11 @@ pub fn address_at<WIRE: InterpreterTypes, H: ?Sized>(
     rem: u64,
 ) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
-    push_at!(
-        context.interpreter,
-        sp,
-        rem,
-        context
-            .interpreter
-            .input
-            .target_address()
-            .into_word()
-            .into()
-    );
+    // SAFETY: `target_address` is 20 readable bytes of a live `InputsImpl`.
+    let word = unsafe {
+        u256_from_be_address(context.interpreter.input.target_address_ptr())
+    };
+    push_at!(context.interpreter, sp, rem, word);
     (sp, rem)
 }
 
@@ -118,17 +112,11 @@ pub fn caller_at<WIRE: InterpreterTypes, H: ?Sized>(
     rem: u64,
 ) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
-    push_at!(
-        context.interpreter,
-        sp,
-        rem,
-        context
-            .interpreter
-            .input
-            .caller_address()
-            .into_word()
-            .into()
-    );
+    // SAFETY: `caller_address` is 20 readable bytes of a live `InputsImpl`.
+    let word = unsafe {
+        u256_from_be_address(context.interpreter.input.caller_address_ptr())
+    };
+    push_at!(context.interpreter, sp, rem, word);
     (sp, rem)
 }
 

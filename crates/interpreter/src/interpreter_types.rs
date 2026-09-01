@@ -46,6 +46,19 @@ pub trait InputsTr {
     fn bytecode_address(&self) -> Option<&Address>;
     /// Returns caller address of the call.
     fn caller_address(&self) -> Address;
+
+    /// Pointer to the 20 bytes of [`target_address`](Self::target_address), without copying
+    /// them out.
+    ///
+    /// `Address` is `[u8; 20]` with alignment 1, so returning one *by value* means a copy
+    /// into a byte-aligned slot and every reader then pays for the alignment it lost. The
+    /// two instructions that want the bytes in place -- `ADDRESS` and `CALLER`, which
+    /// byte-reverse them straight onto the stack -- take the pointer instead.
+    fn target_address_ptr(&self) -> *const u8;
+
+    /// Pointer to the 20 bytes of [`caller_address`](Self::caller_address). See
+    /// [`target_address_ptr`](Self::target_address_ptr).
+    fn caller_address_ptr(&self) -> *const u8;
     /// Returns input of the call.
     fn input(&self) -> &CallInput;
     /// Returns call value of the call.

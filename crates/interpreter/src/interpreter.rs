@@ -16,7 +16,8 @@ pub use return_data::ReturnDataImpl;
 pub use runtime_flags::RuntimeFlags;
 pub(crate) use shared_memory::store_be_word;
 pub(crate) use shared_memory::{
-    bswap64_halves_shared, bswap64_shared, bswap_masks_shared, u256_from_be_aligned,
+    bswap64_halves_shared, bswap64_shared, bswap_masks_shared, u256_from_be_address,
+    u256_from_be_aligned,
 };
 pub use shared_memory::{num_words, resize_memory, resize_memory_written, SharedMemory};
 pub use stack::{too_shallow_for, Stack, BYTE_LIMIT, STACK_LIMIT, WORD};
