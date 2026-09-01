@@ -1418,8 +1418,22 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // new value is same as present, we don't need to do anything.
         // `!=` on `U256` is a memcmp libcall on the guest target; see `primitives::u256_eq`.
         if !primitives::u256_eq(&present, &new) {
+            // The entry's `Address` field sits at an 8-aligned offset -- see the note on
+            // `JournalEntry`'s discriminant -- but `address` arrives by value in a slot LLVM
+            // has to treat as byte-aligned, so the field copy stays a 20-byte `memcpy`
+            // libcall for want of a source it can prove. Re-homing it makes both ends
+            // provably 8-aligned and the copy three word accesses; 11,154 storage writes are
+            // journalled on mainnet block 24006677.
+            // Through the words rather than through `AlignedAddress::new`, for the reason
+            // `load_account_mut_optional_code` gives: `new` reads the source at an alignment
+            // it cannot know, and LLVM lowers even its aligned arm as 32-bit halves that it
+            // then reassembles.
+            let address = match AccountCache::address_words(&address) {
+                Some((w0, w1, w2)) => primitives::AlignedAddress::from_words(w0, w1, w2),
+                None => rehome_misaligned_address(&address).0,
+            };
             self.journal
-                .push(ENTRY::storage_changed(address, key, present));
+                .push(ENTRY::storage_changed(address.0, key, present));
             // insert value into present state.
             slot.present_value = new;
         }
