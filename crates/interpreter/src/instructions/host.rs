@@ -573,10 +573,15 @@ pub fn log<const N: usize, H: Host + ?Sized>(
         resize_memory!(context.interpreter, offset, len);
         Bytes::copy_from_slice(context.interpreter.memory.slice_len(offset, len).as_ref())
     };
-    let Some(topics) = context.interpreter.stack.popn::<N>() else {
+    // The topics are read out of the stack buffer in place. `popn::<N>()` would move
+    // `N * 32` bytes into a local array that the loop below immediately reads back again --
+    // 34 of the 380 retired instructions a `LOG3` costs on block 24006677, for a copy whose
+    // only consumer is four `ld`s per topic.
+    let stack_len = context.interpreter.stack.len();
+    if stack_len < N {
         context.interpreter.halt_underflow();
         return;
-    };
+    }
 
     // `topics.into_iter().map(B256::from).collect()` goes through `U256::to_be_bytes`, and
     // `B256` is align-1, so LLVM cannot hold the result in registers: it splits each digest
@@ -587,20 +592,26 @@ pub fn log<const N: usize, H: Host + ?Sized>(
     // often a small integer or an address, both of which have zero limbs.
     let mut topic_vec: Vec<B256> = Vec::with_capacity(N);
     // SAFETY: `with_capacity(N)` owns at least `N * 32` writable bytes (`B256` is 32 bytes
-    // wide), `topics` holds `N` initialized `U256`s, and each `store_be_word` writes exactly
-    // the 32 bytes of element `i`. The `set_len` follows the last of those writes.
+    // wide), the `N` topmost stack words are initialized `U256`s and `stack_len >= N` was
+    // checked above, and each `store_be_word` writes exactly the 32 bytes of element `i`.
+    // The `set_len` follows the last of those writes.
     unsafe {
         let dst = topic_vec.as_mut_ptr().cast::<u8>();
+        let stack = context.interpreter.stack.data();
         let mut i = 0;
         while i < N {
+            // `data[stack_len - 1]` is the topmost word, which is topic 0; `popn::<N>()`
+            // hands back the same range in the same reversed order.
             crate::interpreter::store_be_word(
                 dst.add(i * 32),
-                topics.get_unchecked(i).as_limbs().as_ptr(),
+                stack.get_unchecked(stack_len - 1 - i).as_limbs().as_ptr(),
             );
             i += 1;
         }
         topic_vec.set_len(N);
     }
+    // SAFETY: `stack_len` is the length read above, and `stack_len >= N` was checked there.
+    unsafe { context.interpreter.stack.popn_discard::<N>(stack_len) };
 
     let log = Log {
         address: context.interpreter.input.target_address(),
