@@ -394,6 +394,7 @@ impl EthFrame<EthInterpreter> {
     }
 
     /// Initializes a frame with the given context and precompiles.
+    #[inline(always)]
     pub fn init_with_context<
         CTX: ContextTr,
         PRECOMPILES: PrecompileProvider<CTX, Output = InterpreterResult>,
