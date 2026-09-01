@@ -331,6 +331,30 @@ pub fn byte_at<WIRE: InterpreterTypes, H: ?Sized>(
     (sp, rem)
 }
 
+/// The bit stage of a left shift: the `b` low bits of `hi` moved up, with the `b` high bits
+/// of `lo` moved in under them, for `b == shift % 64`.
+///
+/// The `m` mask is what keeps it branch-free: `b == 0` would otherwise need `lo >> 64`,
+/// which is not a shift. Written as a call rather than three values hoisted above the
+/// word-offset arms so that the arm that needs no funnel at all does not compute them; see
+/// [`u256_shl`].
+#[inline(always)]
+fn funnel_left(hi: u64, lo: u64, shift: usize) -> u64 {
+    let b = (shift & 63) as u32;
+    let c = (64 - b) & 63;
+    let m = if b == 0 { 0 } else { u64::MAX };
+    (hi << b) | ((lo >> c) & m)
+}
+
+/// [`funnel_left`], the other way.
+#[inline(always)]
+fn funnel_right(lo: u64, hi: u64, shift: usize) -> u64 {
+    let b = (shift & 63) as u32;
+    let c = (64 - b) & 63;
+    let m = if b == 0 { 0 } else { u64::MAX };
+    (lo >> b) | ((hi << c) & m)
+}
+
 /// `x << shift` for `shift < 256`, computed entirely in registers.
 ///
 /// `U256`'s `Shl` goes through ruint's `overflowing_shl`, which builds the result with
@@ -358,28 +382,25 @@ pub fn byte_at<WIRE: InterpreterTypes, H: ?Sized>(
 fn u256_shl(x: &U256, shift: usize) -> U256 {
     let l = x.as_limbs();
     let b = (shift & 63) as u32;
-    let c = (64 - b) & 63;
-    // `b == 0` would otherwise need `x >> 64`, which is not a shift.
-    let m = if b == 0 { 0 } else { u64::MAX };
     if shift & 128 != 0 {
         if shift & 64 != 0 {
             U256::from_limbs([0, 0, 0, l[0] << b])
         } else {
-            U256::from_limbs([0, 0, l[0] << b, (l[1] << b) | ((l[0] >> c) & m)])
+            U256::from_limbs([0, 0, l[0] << b, funnel_left(l[1], l[0], shift)])
         }
     } else if shift & 64 != 0 {
         U256::from_limbs([
             0,
             l[0] << b,
-            (l[1] << b) | ((l[0] >> c) & m),
-            (l[2] << b) | ((l[1] >> c) & m),
+            funnel_left(l[1], l[0], shift),
+            funnel_left(l[2], l[1], shift),
         ])
     } else {
         U256::from_limbs([
             l[0] << b,
-            (l[1] << b) | ((l[0] >> c) & m),
-            (l[2] << b) | ((l[1] >> c) & m),
-            (l[3] << b) | ((l[2] >> c) & m),
+            funnel_left(l[1], l[0], shift),
+            funnel_left(l[2], l[1], shift),
+            funnel_left(l[3], l[2], shift),
         ])
     }
 }
@@ -389,26 +410,24 @@ fn u256_shl(x: &U256, shift: usize) -> U256 {
 fn u256_shr(x: &U256, shift: usize) -> U256 {
     let l = x.as_limbs();
     let b = (shift & 63) as u32;
-    let c = (64 - b) & 63;
-    let m = if b == 0 { 0 } else { u64::MAX };
     if shift & 128 != 0 {
         if shift & 64 != 0 {
             U256::from_limbs([l[3] >> b, 0, 0, 0])
         } else {
-            U256::from_limbs([(l[2] >> b) | ((l[3] << c) & m), l[3] >> b, 0, 0])
+            U256::from_limbs([funnel_right(l[2], l[3], shift), l[3] >> b, 0, 0])
         }
     } else if shift & 64 != 0 {
         U256::from_limbs([
-            (l[1] >> b) | ((l[2] << c) & m),
-            (l[2] >> b) | ((l[3] << c) & m),
+            funnel_right(l[1], l[2], shift),
+            funnel_right(l[2], l[3], shift),
             l[3] >> b,
             0,
         ])
     } else {
         U256::from_limbs([
-            (l[0] >> b) | ((l[1] << c) & m),
-            (l[1] >> b) | ((l[2] << c) & m),
-            (l[2] >> b) | ((l[3] << c) & m),
+            funnel_right(l[0], l[1], shift),
+            funnel_right(l[1], l[2], shift),
+            funnel_right(l[2], l[3], shift),
             l[3] >> b,
         ])
     }
