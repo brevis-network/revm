@@ -172,7 +172,7 @@ where
     }
 
     /// Initializes the frame for the given frame input. Frame is pushed to the frame stack.
-    #[inline]
+    #[inline(always)]
     fn frame_init(
         &mut self,
         frame_input: <Self::Frame as FrameTr>::FrameInit,
