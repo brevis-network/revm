@@ -289,8 +289,12 @@ pub unsafe fn write_some_b256(dst: *mut Option<B256>, src: *const u8) {
 /// construction, so `copy_address_bytes` sees a destination it can prove and takes its three
 /// word accesses.
 #[repr(C, align(8))]
-#[derive(Clone, Copy, Debug, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    serde(from = "Option<Address>", into = "Option<Address>")
+)]
 pub struct MaybeAddress {
     present: bool,
     _pad: [u8; 7],
@@ -306,11 +310,48 @@ impl Default for MaybeAddress {
     }
 }
 
+/// Serialised as the `Option<Address>` it replaces, so `InputsImpl`'s wire format does not
+/// move -- and the padding, which is not part of the value, stays off the wire. `ExtBytecode`
+/// does the same for [`MaybeB256`] through its own serde shim.
+impl From<Option<Address>> for MaybeAddress {
+    #[inline]
+    fn from(value: Option<Address>) -> Self {
+        match value {
+            Some(address) => Self {
+                present: true,
+                _pad: [0; 7],
+                address,
+            },
+            None => Self::NONE,
+        }
+    }
+}
+
+impl From<MaybeAddress> for Option<Address> {
+    #[inline]
+    fn from(value: MaybeAddress) -> Self {
+        value.present.then_some(value.address)
+    }
+}
+
 /// Only the tag, and the address when the tag is set: the padding is not part of the value.
 impl PartialEq for MaybeAddress {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        self.present == other.present && (!self.present || address_eq(&self.address, &other.address))
+        self.present == other.present
+            && (!self.present || address_eq(&self.address, &other.address))
+    }
+}
+
+/// Mirrors [`PartialEq`]: a derived `Hash` would fold the padding and the stale address of an
+/// absent value, so two equal values could hash differently.
+impl core::hash::Hash for MaybeAddress {
+    #[inline]
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        core::hash::Hash::hash(&self.present, state);
+        if self.present {
+            core::hash::Hash::hash(&self.address, state);
+        }
     }
 }
 
@@ -728,31 +769,43 @@ mod fast_key_tests {
     fn b256_helpers_match_derived_eq_at_every_alignment() {
         for oa in 0..8usize {
             for ob in 0..8usize {
-                for diff in 0..=32usize {
-                    let mut a_bytes = [0u8; 32];
-                    for (k, b) in a_bytes.iter_mut().enumerate() {
-                        *b = (k as u8).wrapping_mul(13).wrapping_add(2);
-                    }
-                    let mut b_bytes = a_bytes;
-                    if diff < 32 {
-                        b_bytes[diff] ^= 0x80;
-                    }
-                    let mut store = vec![0u8; 96];
-                    let pad = store.as_ptr().align_offset(8);
-                    // SAFETY: as above, for 32-byte windows.
-                    unsafe {
-                        let pa = store.as_mut_ptr().add(pad + oa);
-                        let pb = store.as_mut_ptr().add(pad + 40 + ob);
-                        core::ptr::copy_nonoverlapping(a_bytes.as_ptr(), pa, 32);
-                        core::ptr::copy_nonoverlapping(b_bytes.as_ptr(), pb, 32);
-                        let a = &*pa.cast::<B256>();
-                        let b = &*pb.cast::<B256>();
-                        assert_eq!(
-                            b256_eq(a, b),
-                            a_bytes == b_bytes,
-                            "oa={oa} ob={ob} diff={diff}"
-                        );
-                        assert_eq!(b256_is_zero(a), a_bytes == [0u8; 32]);
+                // `zero_a` is what makes the `b256_is_zero` assertion below discriminate: with
+                // the pattern alone it answers `false` in every iteration, and the `true`
+                // answer was reached only once, on an 8-aligned `B256::ZERO` -- so the wide
+                // arm's zero case was never tested at the misalignments this sweep exists for.
+                for zero_a in [false, true] {
+                    for diff in 0..=32usize {
+                        let mut a_bytes = [0u8; 32];
+                        if !zero_a {
+                            for (k, b) in a_bytes.iter_mut().enumerate() {
+                                *b = (k as u8).wrapping_mul(13).wrapping_add(2);
+                            }
+                        }
+                        let mut b_bytes = a_bytes;
+                        if diff < 32 {
+                            b_bytes[diff] ^= 0x80;
+                        }
+                        let mut store = vec![0u8; 96];
+                        let pad = store.as_ptr().align_offset(8);
+                        // SAFETY: as above, for 32-byte windows.
+                        unsafe {
+                            let pa = store.as_mut_ptr().add(pad + oa);
+                            let pb = store.as_mut_ptr().add(pad + 40 + ob);
+                            core::ptr::copy_nonoverlapping(a_bytes.as_ptr(), pa, 32);
+                            core::ptr::copy_nonoverlapping(b_bytes.as_ptr(), pb, 32);
+                            let a = &*pa.cast::<B256>();
+                            let b = &*pb.cast::<B256>();
+                            assert_eq!(
+                                b256_eq(a, b),
+                                a_bytes == b_bytes,
+                                "oa={oa} ob={ob} diff={diff}"
+                            );
+                            assert_eq!(
+                                b256_is_zero(a),
+                                a_bytes == [0u8; 32],
+                                "oa={oa} zero_a={zero_a}"
+                            );
+                        }
                     }
                 }
             }
@@ -863,7 +916,11 @@ mod fast_key_tests {
                 let src = &*ps.cast::<B256>();
                 assert_eq!(MaybeB256::some(src).get(), Some(want), "some os={os}");
                 assert!(MaybeB256::some(src).is_some());
-                assert_eq!(MaybeB256::from(Some(*src)).get(), Some(want), "from os={os}");
+                assert_eq!(
+                    MaybeB256::from(Some(*src)).get(),
+                    Some(want),
+                    "from os={os}"
+                );
                 let mut slot = MaybeB256::NONE;
                 MaybeB256::write_some(&mut slot, ps);
                 assert_eq!(slot.get(), Some(want), "write_some os={os}");
@@ -873,9 +930,15 @@ mod fast_key_tests {
             }
         }
         let mut slot = MaybeB256::NONE;
-        assert_eq!(slot.get_or_insert_with(|| B256::repeat_byte(7)), B256::repeat_byte(7));
+        assert_eq!(
+            slot.get_or_insert_with(|| B256::repeat_byte(7)),
+            B256::repeat_byte(7)
+        );
         assert_eq!(slot.get(), Some(B256::repeat_byte(7)));
-        assert_eq!(slot.get_or_insert_with(|| B256::repeat_byte(9)), B256::repeat_byte(7));
+        assert_eq!(
+            slot.get_or_insert_with(|| B256::repeat_byte(9)),
+            B256::repeat_byte(7)
+        );
     }
 
     /// `MaybeAddress` has to behave exactly like the `Option<Address>` it replaces, from
@@ -961,9 +1024,22 @@ mod fast_key_tests {
             let k = key(i);
             assert_eq!(map.get(FastAddress::new(&k)).copied(), Some(i), "i={i}");
         }
-        for i in 256..320u32 {
-            let k = key(i);
-            assert_eq!(map.get(FastAddress::new(&k)).copied(), map.get(&k).copied());
+        // `key` leaves byte 0 zero, and it aliases mod 256 in all three bytes it does set --
+        // `key(256) == key(0)` exactly -- so continuing the same series would have queried
+        // keys that are all present and never reached the miss path.
+        let absent = |i: u32| {
+            let mut b = [0u8; 20];
+            b[0] = 0xff;
+            b[19] = i as u8;
+            Address::from(b)
+        };
+        for i in 0..64u32 {
+            let k = absent(i);
+            assert!(
+                !map.contains_key(&k),
+                "the miss sweep must query absent keys, i={i}"
+            );
+            assert_eq!(map.get(FastAddress::new(&k)).copied(), None, "i={i}");
         }
     }
 }

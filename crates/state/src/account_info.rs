@@ -26,11 +26,18 @@ pub struct AccountInfo {
     pub code: Option<Bytecode>,
 }
 
-/// [`AccountInfo::code_hash`] reads the field as four aligned `u64`s. `AccountInfo` has
-/// alignment 8 (it contains a `U256`), so that is sound exactly while the field's offset is a
-/// multiple of 8 -- which `repr(Rust)` happens to give it, but does not promise. Fail the
-/// build if a field is ever added or reordered in a way that moves it.
-const _: () = assert!(core::mem::offset_of!(AccountInfo, code_hash).is_multiple_of(8));
+/// [`AccountInfo::code_hash`] reads the field as four aligned `u64`s and writes 32 bytes into
+/// a `MaybeUninit<B256>`. That is sound exactly while the struct itself is 8-aligned, the
+/// field's offset is a multiple of 8, and `B256` is 32 bytes wide -- all three of which
+/// `repr(Rust)` happens to give it today but none of which it promises. Assert all three:
+/// checking only the offset would let a change that drops the struct's alignment (say
+/// `balance` ceasing to be a `U256`) through, leaving `code_hash()` doing misaligned `ld` on a
+/// target that has no misaligned scalar access.
+const _: () = assert!(
+    core::mem::align_of::<AccountInfo>().is_multiple_of(8)
+        && core::mem::offset_of!(AccountInfo, code_hash).is_multiple_of(8)
+        && core::mem::size_of::<B256>() == 32
+);
 
 impl Default for AccountInfo {
     fn default() -> Self {
