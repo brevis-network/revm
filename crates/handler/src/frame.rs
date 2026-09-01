@@ -481,10 +481,9 @@ impl EthFrame<EthInterpreter> {
                     spec,
                 );
 
-                Ok(ItemOrResult::Result(FrameResult::Create(CreateOutcome::new(
-                    interpreter_result,
-                    Some(frame.created_address),
-                ))))
+                Ok(ItemOrResult::Result(FrameResult::Create(
+                    CreateOutcome::new(interpreter_result, Some(frame.created_address)),
+                )))
             }
         }
     }

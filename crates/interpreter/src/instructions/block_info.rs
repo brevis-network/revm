@@ -141,7 +141,12 @@ pub fn difficulty_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
         .is_enabled_in(MERGE)
     {
         // Unwrap is safe as this fields is checked in validation handler.
-        push_at!(context.interpreter, sp, rem, context.host.prevrandao().unwrap());
+        push_at!(
+            context.interpreter,
+            sp,
+            rem,
+            context.host.prevrandao().unwrap()
+        );
     } else {
         push_at!(context.interpreter, sp, rem, context.host.difficulty());
     }

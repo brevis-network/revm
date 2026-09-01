@@ -769,26 +769,25 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
                     // SAFETY of the peek: the byte just past the immediate is the next
                     // opcode, which the unfused path reads in the loop header on the very
                     // next iteration.
-                    if $n == 2 && unsafe { *ip.add(1 + $n) }
-                        == $crate::instructions::opcode_consts::JUMPI
+                    if $n == 2
+                        && unsafe { *ip.add(1 + $n) } == $crate::instructions::opcode_consts::JUMPI
                     {
                         self.gas.set_remaining(rem);
-                        let (next_ip, next_sp) =
-                            $crate::instructions::control::jumpi_imm_at::<$n, _>(
-                                self, ip, sp, jctx,
-                            );
+                        // SAFETY: `ip` is the `PUSH2` of the pair the peek above matched.
+                        let (next_ip, next_sp) = unsafe {
+                            $crate::instructions::control::jumpi_imm_at::<$n, _>(self, ip, sp, jctx)
+                        };
                         ip = next_ip;
                         sp = next_sp;
                         rem = self.gas.remaining();
                     } else if $n == 2
-                        && unsafe { *ip.add(1 + $n) }
-                            == $crate::instructions::opcode_consts::JUMP
+                        && unsafe { *ip.add(1 + $n) } == $crate::instructions::opcode_consts::JUMP
                     {
                         self.gas.set_remaining(rem);
-                        let (next_ip, next_sp) =
-                            $crate::instructions::control::jump_imm_at::<$n, _>(
-                                self, ip, sp, jctx,
-                            );
+                        // SAFETY: `ip` is the `PUSH2` of the pair the peek above matched.
+                        let (next_ip, next_sp) = unsafe {
+                            $crate::instructions::control::jump_imm_at::<$n, _>(self, ip, sp, jctx)
+                        };
                         ip = next_ip;
                         sp = next_sp;
                         rem = self.gas.remaining();

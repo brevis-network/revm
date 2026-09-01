@@ -27,7 +27,12 @@ pub fn gasprice_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
     rem: u64,
 ) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
-    push_at!(context.interpreter, sp, rem, context.host.effective_gas_price());
+    push_at!(
+        context.interpreter,
+        sp,
+        rem,
+        context.host.effective_gas_price()
+    );
     (sp, rem)
 }
 

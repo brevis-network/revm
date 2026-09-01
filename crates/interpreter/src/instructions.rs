@@ -384,12 +384,6 @@ pub(crate) fn u256_is_zero(value: &U256) -> bool {
     primitives::u256_is_zero(value)
 }
 
-/// Whether two `U256` are equal, without going through `memcmp`. See [`u256_is_zero`].
-#[inline(always)]
-pub(crate) fn u256_eq(a: &U256, b: &U256) -> bool {
-    primitives::u256_eq(a, b)
-}
-
 #[cfg(test)]
 mod tests {
     use super::instruction_table;

@@ -173,8 +173,13 @@ pub fn jump_to<const FUSE_JUMPDEST: bool, WIRE: InterpreterTypes>(
 /// comment at the call site -- and then the jump. The push-then-pop of the destination word cancels, so
 /// the stack is only *read* here -- there is nothing to bound-check that the caller's
 /// overflow check has not already covered.
+///
+/// # Safety
+///
+/// `ip` must point at the `PUSH<N>` opcode of a `PUSH<N>; JUMP` pair inside the analysed
+/// bytecode, so that `ip[1..1 + N]` is the immediate and `ip + N + 2` is one past the `JUMP`.
 #[inline(always)]
-pub fn jump_imm_at<const N: usize, WIRE: InterpreterTypes>(
+pub unsafe fn jump_imm_at<const N: usize, WIRE: InterpreterTypes>(
     interpreter: &mut Interpreter<WIRE>,
     ip: *const u8,
     sp: usize,
@@ -194,8 +199,12 @@ pub fn jump_imm_at<const N: usize, WIRE: InterpreterTypes>(
 ///
 /// The condition is the top of the stack -- the destination the `JUMPI` would have popped
 /// first is the one the `PUSH` would have pushed, and neither happens.
+///
+/// # Safety
+///
+/// As [`jump_imm_at`], for a `PUSH<N>; JUMPI` pair.
 #[inline(always)]
-pub fn jumpi_imm_at<const N: usize, WIRE: InterpreterTypes>(
+pub unsafe fn jumpi_imm_at<const N: usize, WIRE: InterpreterTypes>(
     interpreter: &mut Interpreter<WIRE>,
     ip: *const u8,
     mut sp: usize,

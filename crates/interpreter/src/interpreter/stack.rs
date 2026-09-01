@@ -257,7 +257,7 @@ impl StackTr for Stack {
     #[inline(always)]
     unsafe fn set_sp(&mut self, sp: usize) {
         let byte_len = sp.wrapping_add(WORD);
-        debug_assert!(byte_len % WORD == 0 && byte_len <= BYTE_LIMIT);
+        debug_assert!(byte_len.is_multiple_of(WORD) && byte_len <= BYTE_LIMIT);
         self.byte_len = byte_len;
     }
 
@@ -424,7 +424,7 @@ impl Stack {
         let bl = self.byte_len;
         // SAFETY: type invariant of `Stack`; every write to `byte_len` moves it by a whole
         // `WORD` and is bounds-checked against `BYTE_LIMIT` first.
-        unsafe { core::hint::assert_unchecked(bl % WORD == 0 && bl <= BYTE_LIMIT) };
+        unsafe { core::hint::assert_unchecked(bl.is_multiple_of(WORD) && bl <= BYTE_LIMIT) };
         bl
     }
 

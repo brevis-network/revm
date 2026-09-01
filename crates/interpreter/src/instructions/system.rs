@@ -40,7 +40,11 @@ pub fn keccak256_at<WIRE: InterpreterTypes, H: ?Sized>(
     // up holding. See `sync_gas_at!`.
     sync_gas_at!(context.interpreter, rem);
     let len = as_usize_or_fail_ret!(context.interpreter, top, (sp, u64::MAX));
-    gas_or_fail!(context.interpreter, gas::keccak256_cost(len), (sp, u64::MAX));
+    gas_or_fail!(
+        context.interpreter,
+        gas::keccak256_cost(len),
+        (sp, u64::MAX)
+    );
     // Built in an 8-aligned slot so the `B256` -> `U256` byte reversal below can load limbs
     // with `ld` instead of 32 `lbu`.
     #[repr(align(8))]
