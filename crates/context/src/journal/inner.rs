@@ -1512,6 +1512,44 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     }
 }
 
+/// Resolves an account the [`AccountCache`] does not hold, and records it.
+///
+/// Null when it is not in the map at all; [`sload_slot_warm`]'s caller panics on that, which
+/// is what keeps `sload_slot_warm` free of calls.
+///
+/// Out of line and `cold` for the register pressure: the address hash, hashbrown's control
+/// word and the bucket compare want a different set of values live from the storage probe
+/// that follows, and with both in one body the caller saves the union of them on every call.
+///
+/// Keyed by `FastAddress` - tag 0 - so the bucket comparison is word-wise; see there. This is
+/// the only site that uses tag 0: a second caller of one instantiation pushes
+/// `RawTable::find` past the inliner and it outlines, which costs more than it saves.
+#[inline(never)]
+#[cold]
+fn resolve_account(
+    state: &mut EvmState,
+    account_cache: &mut AccountCache,
+    words: Option<(u64, u64, u32)>,
+    address: &Address,
+) -> *mut Account {
+    match state.get_mut(primitives::FastAddress::new(address)) {
+        Some(found) => {
+            let found: *mut Account = found;
+            match words {
+                // SAFETY: `found` is the account stored under `w` in `state`, and this module
+                // empties the cache everywhere `state` can restructure.
+                Some(w) => account_cache.put(w, found),
+                // Not cacheable: the address cannot be compared word-wise. Clears rather than
+                // keeps the previous addresses' entries -- a pessimisation, not a required
+                // clear; see the note on `AccountCache`.
+                None => account_cache.clear(),
+            }
+            found
+        }
+        None => core::ptr::null_mut(),
+    }
+}
+
 /// The warm path of a storage access: the account is in the state map, the slot is in the
 /// account's map, and the slot is already warm.
 ///
@@ -1556,25 +1594,14 @@ fn sload_slot_warm(
     let words = AccountCache::address_words(address);
     let account: *mut Account = match words.and_then(|w| account_cache.get(w)) {
         Some(cached) => cached,
-        None => match state.get_mut(primitives::FastAddress::new(address)) {
-            Some(found) => {
-                let found: *mut Account = found;
-                match words {
-                    // SAFETY: `found` is the account stored under `w` in `state`, and this
-                    // module empties the cache everywhere `state` can restructure.
-                    Some(w) => account_cache.put(w, found),
-                    // Not cacheable: the address cannot be compared word-wise. Clears rather
-                    // than keeps the previous addresses' entries -- a pessimisation, not a
-                    // required clear; see the note on `AccountCache`.
-                    None => account_cache.clear(),
-                }
-                found
-            }
-            // The cold path panics. Returning instead of panicking here is what keeps this
-            // function free of calls, and so free of a saved `ra`.
-            None => return core::ptr::null_mut(),
-        },
+        // Out of line: the probe is a hash, an unaligned control-word read and a bucket
+        // compare, and the values it wants alive are not the ones the storage probe below
+        // wants. 1,873 of 76,821 accesses take it.
+        None => resolve_account(state, account_cache, words, address),
     };
+    if account.is_null() {
+        return core::ptr::null_mut();
+    }
 
     // SAFETY: `account` was just derived from a live `&mut Account`, and no other access to
     // `state` happens before it is used.
