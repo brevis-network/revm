@@ -197,6 +197,12 @@ impl Gas {
         core::mem::replace(&mut self.remaining, u64::MAX)
     }
 
+    /// Overwrites the remaining-gas counter.
+    #[inline]
+    pub fn set_remaining(&mut self, remaining: u64) {
+        self.remaining = remaining;
+    }
+
     /// Restores the value returned by [`Gas::poison`].
     #[inline]
     pub fn unpoison(&mut self, stash: u64) {

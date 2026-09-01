@@ -62,8 +62,58 @@ pub trait LegacyBytecode {
     fn bytecode_slice(&self) -> &[u8];
 }
 
+/// The frame-invariant half of the jump path, hoisted out of the dispatch loop.
+///
+/// `JUMP`/`JUMPI` reach the jump-destination bitmap and the code base through
+/// `&mut Interpreter`, and the EVM stack writes go through a pointer LLVM cannot prove
+/// disjoint from them, so every jump re-loads the same five words: the `Bytecode`
+/// discriminant, the jump table's pointer and its bit length, and the two hops to the
+/// bytecode's data pointer. None of them can change while one frame runs -- only the
+/// instruction *pointer* moves -- so `Interpreter::run_plain` reads them once into a local
+/// and hands that local to the two arms that need it.
+#[derive(Clone, Copy, Debug)]
+pub struct JumpCtx {
+    /// Base of the jump-destination bitmap, one bit per byte of the original bytecode.
+    pub table_ptr: *const u8,
+    /// Number of bits in the bitmap, i.e. the original (unpadded) bytecode length.
+    pub table_len: usize,
+    /// Base of the (padded) bytecode bytes.
+    pub code_base: *const u8,
+}
+
+impl JumpCtx {
+    /// A context whose bitmap rejects every target.
+    ///
+    /// This is what the default [`Jumps::jump_ctx`] hands back, and what a non-legacy
+    /// bytecode gets: `table_len == 0` makes every offset out of range, so the jump halts
+    /// with `InvalidJump`.
+    pub const EMPTY: Self = Self {
+        table_ptr: core::ptr::null(),
+        table_len: 0,
+        code_base: core::ptr::null(),
+    };
+}
+
 /// Trait for Interpreter to be able to jump
 pub trait Jumps {
+    /// The frame-invariant jump inputs, read once per `run_plain` call.
+    ///
+    /// The default hands back [`JumpCtx::EMPTY`], which the `*_with` methods below ignore:
+    /// an implementation that does not override all three is unaffected.
+    fn jump_ctx(&self) -> JumpCtx {
+        JumpCtx::EMPTY
+    }
+
+    /// [`Jumps::is_valid_legacy_jump`] answered from a hoisted [`JumpCtx`].
+    fn is_valid_legacy_jump_with(&mut self, _ctx: JumpCtx, offset: usize) -> bool {
+        self.is_valid_legacy_jump(offset)
+    }
+
+    /// [`Jumps::absolute_ip`] answered from a hoisted [`JumpCtx`].
+    fn absolute_ip_with(&self, _ctx: JumpCtx, offset: usize) -> *const u8 {
+        self.absolute_ip(offset)
+    }
+
     /// Relative jumps does not require checking for overflow.
     fn relative_jump(&mut self, offset: isize);
     /// Absolute jumps require checking for overflow and if target is a jump destination
@@ -223,6 +273,23 @@ pub trait MemoryTr {
     /// It checks if the memory allocation fits under gas cap.
     fn resize(&mut self, new_size: usize) -> bool;
 
+    /// [`resize`][MemoryTr::resize], for a caller that overwrites every byte of
+    /// `wr_off..wr_off + wr_len` before anything can read the memory.
+    ///
+    /// An implementation may skip zeroing that part of the new tail, because nothing can
+    /// observe the difference. The default ignores the promise and forwards to `resize`.
+    ///
+    /// # Correctness
+    ///
+    /// This is not `unsafe` - breaking the promise leaves stale EVM memory, not undefined
+    /// behaviour - but it *is* a contract, and `wr_off + wr_len` has to be within
+    /// `new_size`.
+    #[inline]
+    fn resize_written(&mut self, new_size: usize, wr_off: usize, wr_len: usize) -> bool {
+        let _ = (wr_off, wr_len);
+        self.resize(new_size)
+    }
+
     /// Returns `true` if the `new_size` for the current context memory will
     /// make the shared buffer length exceed the `memory_limit`.
     #[cfg(feature = "memory_limit")]
@@ -310,6 +377,150 @@ pub trait StackTr {
     #[must_use]
     fn top(&mut self) -> Option<&mut U256> {
         self.popn_top().map(|([], top)| top)
+    }
+
+    /// The **threaded stack cursor**: the byte offset of the topmost word, i.e. the
+    /// byte-scaled length of the stack less one word, and `-WORD` (wrapped) when it is empty.
+    ///
+    /// [`Interpreter::run_plain`](crate::Interpreter::run_plain) keeps this in a loop-local
+    /// for the whole dispatch loop and hands it to the `*_at` operations below, instead of
+    /// letting each of them re-load it out of the stack and store it back. The stack writes
+    /// go through a pointer LLVM cannot prove disjoint from the length field, so the reload
+    /// is one it can not remove: on block 24006677 the `ld`/`sd` pair is on the order of two
+    /// retired instructions per dispatched opcode, and the loop dispatches 8.07 M of them.
+    ///
+    /// The cursor is scaled to bytes for the same reason `Stack::byte_len` is, and biased
+    /// down by one word so that the one- and two-word depth tests branch against zero; both
+    /// notes are on `Stack`'s implementation of `sp` below. An arm updates it by whole `size_of::<U256>()` steps and hands the new value to
+    /// the next arm, and the single loop exit writes it back with [`StackTr::set_sp`].
+    ///
+    /// # Implementing
+    ///
+    /// The default bodies of the `*_at` methods **ignore the cursor** and go through the
+    /// ordinary length-carrying operations. That is always correct, because those keep the
+    /// stack's own length in step, so the cursor an arm computes stays equal to `sp()` and
+    /// `set_sp` has nothing to do. An implementation that wants the win overrides all of
+    /// them together, as [`Stack`](crate::interpreter::Stack) does; overriding only some is
+    /// what would break, so they are documented as one group.
+    #[inline]
+    fn sp(&self) -> usize {
+        (self.len() * core::mem::size_of::<U256>()).wrapping_sub(core::mem::size_of::<U256>())
+    }
+
+    /// Writes the threaded cursor back into the stack, so that everything reached from
+    /// outside the dispatch loop sees the right length again.
+    ///
+    /// # Safety
+    ///
+    /// `sp` must be a cursor of this stack: [`StackTr::sp`] plus the net effect of the
+    /// `*_at` calls made since, and every one of those calls' own preconditions met.
+    #[inline]
+    unsafe fn set_sp(&mut self, sp: usize) {
+        let _ = sp;
+    }
+
+    /// Pops `N` values at the cursor. `[0]` is the topmost. New cursor is `sp - N * 32`.
+    ///
+    /// # Safety
+    ///
+    /// `sp` must be the current cursor, and at least `(N - 1) * 32`.
+    #[must_use]
+    #[inline]
+    unsafe fn popn_at<const N: usize>(&mut self, sp: usize) -> [U256; N] {
+        let _ = sp;
+        // SAFETY: the caller checked the depth.
+        unsafe { self.popn::<N>().unwrap_unchecked() }
+    }
+
+    /// Pops `N` values at the cursor and returns the word that becomes the new top.
+    /// New cursor is `sp - N * 32`.
+    ///
+    /// # Safety
+    ///
+    /// `sp` must be the current cursor, and at least `N * 32`.
+    #[must_use]
+    #[inline]
+    unsafe fn popn_top_at<const N: usize>(&mut self, sp: usize) -> ([U256; N], &mut U256) {
+        let _ = sp;
+        // SAFETY: the caller checked the depth.
+        unsafe { self.popn_top::<N>().unwrap_unchecked() }
+    }
+
+    /// The topmost word at the cursor. The cursor does not move.
+    ///
+    /// # Safety
+    ///
+    /// `sp` must be the current cursor, and at least zero.
+    #[must_use]
+    #[inline]
+    unsafe fn top_at(&mut self, sp: usize) -> &mut U256 {
+        let _ = sp;
+        // SAFETY: the caller checked the depth.
+        unsafe { self.top().unwrap_unchecked() }
+    }
+
+    /// A pointer to the `depth`-th word from the top at the cursor (`0` is the topmost).
+    /// The cursor does not move.
+    ///
+    /// # Safety
+    ///
+    /// `sp` must be the current cursor, and at least `depth * 32`.
+    #[must_use]
+    #[inline]
+    unsafe fn peek_at(&self, sp: usize, depth: usize) -> *const U256 {
+        let _ = sp;
+        let data = self.data();
+        // SAFETY: the caller checked the depth.
+        unsafe { data.as_ptr().add(data.len() - 1 - depth) }
+    }
+
+    /// Writes `value` at the cursor. New cursor is `sp + 32`.
+    ///
+    /// # Safety
+    ///
+    /// `sp` must be the current cursor, and below the stack limit in bytes less one word.
+    #[inline]
+    unsafe fn push_at(&mut self, sp: usize, value: U256) {
+        let _ = sp;
+        let _ = self.push(value);
+    }
+
+    /// Copies the `n`-th word from the top to the cursor. New cursor is `sp + 32`.
+    ///
+    /// # Safety
+    ///
+    /// `sp` must be the current cursor, at least `(n - 1) * 32`, and below the stack limit in
+    /// bytes. `n` must be non-zero.
+    #[inline]
+    unsafe fn dup_at(&mut self, sp: usize, n: usize) {
+        let _ = sp;
+        let _ = self.dup(n);
+    }
+
+    /// Exchanges the `n`-th and `(n + m)`-th words from the top. The cursor does not move.
+    ///
+    /// # Safety
+    ///
+    /// `sp` must be the current cursor and at least `(n + m) * 32`. `m` must be
+    /// non-zero.
+    #[inline]
+    unsafe fn exchange_at(&mut self, sp: usize, n: usize, m: usize) {
+        let _ = sp;
+        let _ = self.exchange(n, m);
+    }
+
+    /// Pushes the `N` big-endian bytes at `src` as one word at the cursor, zero-padded on
+    /// the left. New cursor is `sp + 32`.
+    ///
+    /// # Safety
+    ///
+    /// `sp` must be the current cursor and below the stack limit in bytes less one word. `src` must be
+    /// valid for reads of `N` bytes, and `N` must be in `1..=32`.
+    #[inline]
+    unsafe fn push_slice_const_at<const N: usize>(&mut self, sp: usize, src: *const u8) {
+        let _ = sp;
+        // SAFETY: forwarded from the caller's contract.
+        let _ = unsafe { self.push_slice_const::<N>(src) };
     }
 
     /// Pops one value from the stack.

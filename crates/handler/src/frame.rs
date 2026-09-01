@@ -18,8 +18,8 @@ use interpreter::{
     interpreter::{EthInterpreter, ExtBytecode},
     interpreter_types::ReturnData,
     CallInput, CallInputs, CallOutcome, CallValue, CreateInputs, CreateOutcome, CreateScheme,
-    FrameInput, Gas, InputsImpl, InstructionResult, Interpreter, InterpreterAction,
-    InterpreterResult, InterpreterTypes, SharedMemory,
+    FrameInput, Gas, InstructionResult, Interpreter, InterpreterAction, InterpreterResult,
+    InterpreterTypes, SharedMemory,
 };
 use primitives::{
     constants::CALL_STACK_LIMIT,
@@ -119,14 +119,15 @@ pub type ContextTrDbError<CTX> = <<CTX as ContextTr>::Db as Database>::Error;
 impl EthFrame<EthInterpreter> {
     /// Clear and initialize a frame.
     #[allow(clippy::too_many_arguments)]
+    ///
+    /// Neither the interpreter's [`InputsImpl`] nor its [`ExtBytecode`] is a parameter; see
+    /// [`Interpreter::clear`].
     pub fn clear(
         &mut self,
         data: FrameData,
         input: FrameInput,
         depth: usize,
         memory: SharedMemory,
-        bytecode: ExtBytecode,
-        inputs: InputsImpl,
         is_static: bool,
         spec_id: SpecId,
         gas_limit: u64,
@@ -144,7 +145,7 @@ impl EthFrame<EthInterpreter> {
         *input_ref = input;
         *depth_ref = depth;
         *is_finished_ref = false;
-        interpreter.clear(memory, bytecode, inputs, is_static, spec_id, gas_limit);
+        interpreter.clear(memory, is_static, spec_id, gas_limit);
         *checkpoint_ref = checkpoint;
     }
 
@@ -186,38 +187,16 @@ impl EthFrame<EthInterpreter> {
         if let CallValue::Transfer(value) = inputs.value {
             // Transfer value from caller to called account
             // Target will get touched even if balance transferred is zero.
-            if let Some(i) =
-                ctx.journal_mut()
-                    .transfer_loaded(inputs.caller, inputs.target_address, value)
-            {
+            if let Some(i) = ctx.journal_mut().transfer_loaded(
+                primitives::AlignedAddress::new(&inputs.caller),
+                primitives::AlignedAddress::new(&inputs.target_address),
+                value,
+            ) {
                 ctx.journal_mut().checkpoint_revert(checkpoint);
                 return return_result(i.into());
             }
         }
 
-        // Field by field rather than a struct literal, so that each address goes through
-        // `copy_address_bytes` instead of a `memcpy` libcall (see there).
-        // SAFETY: every field is initialized exactly once below, so `assume_init` sees a
-        // fully initialized `InputsImpl`.
-        let interpreter_input = unsafe {
-            let mut ii = core::mem::MaybeUninit::<InputsImpl>::uninit();
-            let p = ii.as_mut_ptr();
-            primitives::copy_address_bytes(
-                core::ptr::addr_of_mut!((*p).target_address).cast::<u8>(),
-                core::ptr::addr_of!(inputs.target_address).cast::<u8>(),
-            );
-            primitives::copy_address_bytes(
-                core::ptr::addr_of_mut!((*p).caller_address).cast::<u8>(),
-                core::ptr::addr_of!(inputs.caller).cast::<u8>(),
-            );
-            primitives::write_some_address(
-                core::ptr::addr_of_mut!((*p).bytecode_address),
-                core::ptr::addr_of!(inputs.bytecode_address).cast::<u8>(),
-            );
-            core::ptr::addr_of_mut!((*p).input).write(inputs.input.clone());
-            core::ptr::addr_of_mut!((*p).call_value).write(inputs.value.get());
-            ii.assume_init()
-        };
         let is_static = inputs.is_static;
         let gas_limit = inputs.gas_limit;
 
@@ -255,17 +234,42 @@ impl EthFrame<EthInterpreter> {
         }
 
         // Create interpreter and executes call and push new CallStackFrame.
-        this.get(EthFrame::invalid).clear(
+        let spec_id = ctx.cfg().spec().into();
+        let frame = this.get(EthFrame::invalid);
+
+        // Written in place, field by field, rather than built on the stack and handed to
+        // `clear` by value: an `InputsImpl` is 128 bytes, so by value it is two `memcpy`
+        // calls per frame, and each `Address` in it goes through `copy_address_bytes`
+        // instead of the byte-wise field copy a struct literal would emit.
+        let ii = &mut frame.interpreter.input;
+        // SAFETY: each pair below is two live, distinct 20-byte objects.
+        unsafe {
+            primitives::copy_address_bytes(
+                ii.target_address.as_mut_ptr(),
+                inputs.target_address.as_ptr(),
+            );
+            primitives::copy_address_bytes(ii.caller_address.as_mut_ptr(), inputs.caller.as_ptr());
+            primitives::MaybeAddress::write_some(
+                &mut ii.bytecode_address,
+                inputs.bytecode_address.as_ptr(),
+            );
+        }
+        ii.input = inputs.input.clone();
+        ii.call_value = inputs.value.get();
+
+        // In place, for the reason in `Interpreter::clear`: by value this is a 184-byte
+        // `memcpy` libcall per frame.
+        ExtBytecode::replace_with_hash(&mut frame.interpreter.bytecode, bytecode, bytecode_hash);
+
+        frame.clear(
             FrameData::Call(CallFrame {
                 return_memory_range: inputs.return_memory_offset.clone(),
             }),
             FrameInput::Call(inputs),
             depth,
             memory,
-            ExtBytecode::new_with_hash(bytecode, bytecode_hash),
-            interpreter_input,
             is_static,
-            ctx.cfg().spec().into(),
+            spec_id,
             gas_limit,
             checkpoint,
         );
@@ -341,27 +345,34 @@ impl EthFrame<EthInterpreter> {
             Err(e) => return return_error(e.into()),
         };
 
-        let bytecode = ExtBytecode::new_with_optional_hash(
+        let gas_limit = inputs.gas_limit;
+
+        let frame = this.get(EthFrame::invalid);
+        // In place; see `make_call_frame`.
+        ExtBytecode::replace_with_optional_hash(
+            &mut frame.interpreter.bytecode,
             Bytecode::new_legacy(inputs.init_code.clone()),
             init_code_hash,
         );
+        // In place; see `make_call_frame`.
+        let ii = &mut frame.interpreter.input;
+        // SAFETY: each pair below is two live, distinct 20-byte objects.
+        unsafe {
+            primitives::copy_address_bytes(
+                ii.target_address.as_mut_ptr(),
+                created_address.as_ptr(),
+            );
+            primitives::copy_address_bytes(ii.caller_address.as_mut_ptr(), inputs.caller.as_ptr());
+        }
+        ii.bytecode_address = primitives::MaybeAddress::NONE;
+        ii.input = CallInput::Bytes(Bytes::new());
+        ii.call_value = inputs.value;
 
-        let interpreter_input = InputsImpl {
-            target_address: created_address,
-            caller_address: inputs.caller,
-            bytecode_address: None,
-            input: CallInput::Bytes(Bytes::new()),
-            call_value: inputs.value,
-        };
-        let gas_limit = inputs.gas_limit;
-
-        this.get(EthFrame::invalid).clear(
+        frame.clear(
             FrameData::Create(CreateFrame { created_address }),
             FrameInput::Create(inputs),
             depth,
             memory,
-            bytecode,
-            interpreter_input,
             false,
             spec,
             gas_limit,
@@ -426,8 +437,23 @@ impl EthFrame<EthInterpreter> {
             InterpreterAction::Return(result) => result,
         };
 
-        // Handle return from frame
-        let result = match &self.data {
+        // Handle return from frame.
+        //
+        // `is_finished` is set here rather than in the caller because the caller has to be
+        // able to tail-call this function, or LLVM copies the returned `ItemOrResult` out of
+        // the callee's sret slot; see `EvmTr::frame_run`. It is set *before* the result is
+        // built, not after, because the same call-slot optimisation applies one level down: a
+        // store LLVM cannot prove disjoint from the return slot, sitting between the
+        // construction and the `Ok(..)`, made the ~96-byte `ItemOrResult` be built in a fresh
+        // stack slot and `memcpy`d into the sret one, 20,024 times per mainnet block
+        // 24006677 at ~74 retired instructions a call.
+        self.is_finished = true;
+
+        // Each arm returns rather than yielding a value the tail wraps in `Ok(..)`: a `match`
+        // whose result is bound and then wrapped gives the ~96-byte `ItemOrResult` a stack
+        // slot of its own, which is then `memcpy`d into the sret slot. Returning from the arm
+        // lets it be built in the sret slot directly.
+        match &self.data {
             FrameData::Call(frame) => {
                 // return_call
                 // Revert changes or not.
@@ -436,10 +462,11 @@ impl EthFrame<EthInterpreter> {
                 } else {
                     context.journal_mut().checkpoint_revert(self.checkpoint);
                 }
-                ItemOrResult::Result(FrameResult::Call(CallOutcome::new(
-                    interpreter_result,
-                    frame.return_memory_range.clone(),
-                )))
+                let memory_offset = frame.return_memory_range.clone();
+                Ok(ItemOrResult::Result(FrameResult::Call(CallOutcome {
+                    result: interpreter_result,
+                    memory_offset,
+                })))
             }
             FrameData::Create(frame) => {
                 let max_code_size = context.cfg().max_code_size();
@@ -454,27 +481,30 @@ impl EthFrame<EthInterpreter> {
                     spec,
                 );
 
-                ItemOrResult::Result(FrameResult::Create(CreateOutcome::new(
-                    interpreter_result,
-                    Some(frame.created_address),
+                Ok(ItemOrResult::Result(FrameResult::Create(
+                    CreateOutcome::new(interpreter_result, Some(frame.created_address)),
                 )))
             }
-        };
-
-        Ok(result)
+        }
     }
 
     /// Processes a frame result and updates the interpreter state accordingly.
     pub fn return_result<CTX: ContextTr, ERROR: From<ContextTrDbError<CTX>> + FromStringError>(
         &mut self,
         ctx: &mut CTX,
-        result: FrameResult,
+        result: &mut FrameResult,
     ) -> Result<(), ERROR> {
         self.interpreter.memory.free_child_context();
-        match core::mem::replace(ctx.error(), Ok(())) {
-            Err(ContextError::Db(e)) => return Err(e.into()),
-            Err(ContextError::Custom(e)) => return Err(ERROR::from_string(e)),
-            Ok(_) => (),
+        // Guarded on `is_err`: `mem::replace` reads the old value out and writes `Ok(())`
+        // back whatever it was, and the slot is `Ok` on every one of the 19,975 frame returns
+        // of mainnet block 24006677. Worth only 3 instructions a call (-59,925) - the load and
+        // branch replace most of what the replace cost - but it is 3 instructions.
+        if ctx.error().is_err() {
+            match core::mem::replace(ctx.error(), Ok(())) {
+                Err(ContextError::Db(e)) => return Err(e.into()),
+                Err(ContextError::Custom(e)) => return Err(ERROR::from_string(e)),
+                Ok(_) => (),
+            }
         }
 
         // Insert result to the top frame.
@@ -487,7 +517,9 @@ impl EthFrame<EthInterpreter> {
                 let interpreter = &mut self.interpreter;
                 let mem_length = outcome.memory_length();
                 let mem_start = outcome.memory_start();
-                interpreter.return_data.set_buffer(outcome.result.output);
+                interpreter
+                    .return_data
+                    .set_buffer(core::mem::take(&mut outcome.result.output));
 
                 let target_len = min(mem_length, returned_len);
 

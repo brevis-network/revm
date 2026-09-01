@@ -116,6 +116,14 @@ pub type AddressSet = HashSet<Address, FixedKeyBuildHasher>;
 /// [`HashMap`] keyed by [`B256`], hashed with [`FixedKeyHasher`].
 pub type B256Map<V> = HashMap<B256, V, FixedKeyBuildHasher>;
 
+/// [`HashMap`] keyed by a storage slot, hashed with [`FixedKeyHasher`].
+///
+/// The slot is a `U256`, whose `Hash` impl hands its four limbs to the hasher as 32 bytes.
+/// foldhash serves that from its long-input path: 190 retired instructions in the zkVM
+/// guest, plus another 68 of `<[T; N] as Hash>::hash` and `hash_one` glue, for a key that
+/// is already either a small integer or a keccak output.
+pub type StorageKeyMap<V> = HashMap<crate::StorageKey, V, FixedKeyBuildHasher>;
+
 #[cfg(test)]
 mod tests {
     use super::*;

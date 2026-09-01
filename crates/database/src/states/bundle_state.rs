@@ -7,7 +7,8 @@ use super::{
 use bytecode::Bytecode;
 use core::{mem, ops::RangeInclusive};
 use primitives::{
-    hash_map::Entry, Address, HashMap, HashSet, StorageKey, StorageValue, B256, KECCAK_EMPTY,
+    hash_map::Entry, Address, AddressMap, HashMap, HashSet, StorageKey, StorageValue, B256,
+    KECCAK_EMPTY,
 };
 use state::AccountInfo;
 use std::{
@@ -404,7 +405,9 @@ impl BundleRetention {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BundleState {
     /// Account state
-    pub state: HashMap<Address, BundleAccount>,
+    ///
+    /// Keyed by `Address`; see [`TransitionState::transitions`] for the hasher.
+    pub state: AddressMap<BundleAccount>,
     /// All created contracts in this block.
     pub contracts: HashMap<B256, Bytecode>,
     /// Changes to revert
@@ -512,7 +515,7 @@ impl BundleState {
     }
 
     /// Returns reference to the state.
-    pub fn state(&self) -> &HashMap<Address, BundleAccount> {
+    pub fn state(&self) -> &AddressMap<BundleAccount> {
         &self.state
     }
 
@@ -681,7 +684,7 @@ impl BundleState {
     /// Extends the bundle with other state.
     ///
     /// Updates the `other` state only if `other` is not flagged as destroyed.
-    pub fn extend_state(&mut self, other_state: HashMap<Address, BundleAccount>) {
+    pub fn extend_state(&mut self, other_state: AddressMap<BundleAccount>) {
         for (address, other_account) in other_state {
             match self.state.entry(address) {
                 Entry::Occupied(mut entry) => {

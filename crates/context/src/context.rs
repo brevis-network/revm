@@ -535,7 +535,12 @@ impl<
             .ok()
     }
 
-    #[inline]
+    // `#[inline]` alone did not take here, and the call is not cheap: the return type is a
+    // `Result<StateLoad<_>, LoadError>` wide enough to come back through memory, so the
+    // out-of-line wrapper spends 34 of its 58 retired instructions per call on a prologue and
+    // epilogue that exist only to forward. `SLOAD` is 62,040 calls on mainnet block
+    // 24006677 and `SSTORE` 14,781.
+    #[inline(always)]
     fn sstore_skip_cold_load(
         &mut self,
         address: Address,
@@ -554,7 +559,8 @@ impl<
             })
     }
 
-    #[inline]
+    /// See [`Self::sstore_skip_cold_load`] for why this is `inline(always)`.
+    #[inline(always)]
     fn sload_skip_cold_load(
         &mut self,
         address: Address,
@@ -572,7 +578,9 @@ impl<
             })
     }
 
-    #[inline]
+    /// See [`Self::sstore_skip_cold_load`] for why this is `inline(always)`. 32,581 calls on
+    /// mainnet block 24006677.
+    #[inline(always)]
     fn load_account_info_skip_cold_load(
         &mut self,
         address: Address,

@@ -6,6 +6,7 @@
 //! advanced cheatcode use-case.
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
+use revm::primitives::AlignedAddress;
 use revm::{
     context::{
         journaled_state::{AccountInfoLoad, JournalLoadError},
@@ -149,8 +150,8 @@ impl JournalTr for Backend {
 
     fn transfer_loaded(
         &mut self,
-        from: Address,
-        to: Address,
+        from: AlignedAddress,
+        to: AlignedAddress,
         balance: U256,
     ) -> Option<TransferError> {
         self.journaled_state.transfer_loaded(from, to, balance)
@@ -605,7 +606,7 @@ where
     // Persist the changes to the original backend.
     backend.journaled_state.database.commit(state);
     update_state(
-        &mut backend.journaled_state.inner.state,
+        backend.journaled_state.inner.state(),
         &mut backend.journaled_state.database,
     )?;
 

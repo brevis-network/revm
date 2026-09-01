@@ -150,11 +150,8 @@ where
     #[doc = " Consumes the frame result or returns it if there is more frames to run."]
     fn frame_return_result(
         &mut self,
-        result: <Self::Frame as FrameTr>::FrameResult,
-    ) -> Result<
-        Option<<Self::Frame as FrameTr>::FrameResult>,
-        ContextError<<<Self::Context as ContextTr>::Db as Database>::Error>,
-    > {
+        result: &mut <Self::Frame as FrameTr>::FrameResult,
+    ) -> Result<bool, ContextError<<<Self::Context as ContextTr>::Db as Database>::Error>> {
         self.0.frame_return_result(result)
     }
 }

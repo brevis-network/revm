@@ -110,11 +110,8 @@ where
 
     fn frame_return_result(
         &mut self,
-        frame_result: <Self::Frame as FrameTr>::FrameResult,
-    ) -> Result<
-        Option<<Self::Frame as FrameTr>::FrameResult>,
-        ContextError<<<Self::Context as ContextTr>::Db as Database>::Error>,
-    > {
+        frame_result: &mut <Self::Frame as FrameTr>::FrameResult,
+    ) -> Result<bool, ContextError<<<Self::Context as ContextTr>::Db as Database>::Error>> {
         self.0.frame_return_result(frame_result)
     }
 }

@@ -152,6 +152,24 @@ unsafe fn store_be_word_aligned(q: *mut u64, src: *const u64) {
     }
 }
 
+/// Writes the four little-endian limbs at `src` as a 32-byte big-endian word at `p`, taking
+/// the word path when `p` happens to be 8-aligned. For callers whose destination is a
+/// `B256`-shaped buffer, whose alignment is 1 as far as the compiler is concerned.
+///
+/// # Safety
+///
+/// `p` must point at 32 writable bytes and `src` at four readable `u64`s.
+#[inline(always)]
+pub(crate) unsafe fn store_be_word(p: *mut u8, src: *const u64) {
+    if (p as usize).is_multiple_of(core::mem::align_of::<u64>()) {
+        // SAFETY: 32 writable bytes per the contract, 8-aligned as just checked.
+        unsafe { store_be_word_aligned(p.cast::<u64>(), src) };
+        return;
+    }
+    // SAFETY: 32 writable bytes per the contract; needs no alignment.
+    unsafe { store_be_word_bytes(p, src) };
+}
+
 /// Scatters the four little-endian limbs at `src` as a 32-byte big-endian word at `p`, one
 /// byte at a time. Needs no alignment; used for the offsets that are not 8-aligned.
 ///
@@ -296,20 +314,171 @@ impl<T> RefcellExt<T> for RefCell<T> {
 /// a `Vec` for internal representation.
 /// A [SharedMemory] instance should always be obtained using
 /// the `new` static method to ensure memory safety.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "SharedMemoryDe"))]
 pub struct SharedMemory {
     /// The underlying buffer.
     buffer: Option<Rc<RefCell<Vec<u8>>>>,
     /// Memory checkpoints for each depth.
     /// Invariant: these are always in bounds of `data`.
     my_checkpoint: usize,
+    /// Cached address of byte 0 of *this* context's memory.
+    ///
+    /// # Invariant (INV-B)
+    ///
+    /// `base == buffer.as_ptr().add(my_checkpoint)` whenever `buffer` is `Some`, and
+    /// `base` is null when it is `None`. Unlike a length, there is no safe fallback value:
+    /// every read of `base` turns straight into a load or a store, so it has to be exactly
+    /// right, and the three things that can break it each have to restore it:
+    ///
+    /// 1. **`my_checkpoint` changes.** Only ever at construction, so every constructor and
+    ///    [`new_child_context`](Self::new_child_context) sets `base` from the buffer.
+    /// 2. **The buffer reallocates.** Only [`grow_zeroed`] can do that - it is the one
+    ///    place that grows the `Vec` past its capacity - and [`resize`](Self::resize)
+    ///    recomputes `base` immediately after calling it.
+    /// 3. **A *different* `SharedMemory` on the same buffer reallocates it.** Only a child
+    ///    context can run while this one is suspended, and a child is always handed back
+    ///    through [`free_child_context`](Self::free_child_context), which recomputes
+    ///    `base`. Nesting cascades: each frame refreshes its own on the way out.
+    /// 4. **The value arrives from the wire.** A pointer cannot be serialised, so `base` is
+    ///    skipped and has to be rebuilt from `buffer` and `my_checkpoint`;
+    ///    [`SharedMemoryDe`] is what `Deserialize` goes through to do that. Deriving
+    ///    `Deserialize` straight onto this struct left `base` null beside a real buffer,
+    ///    i.e. INV-B broken from the moment the value existed.
+    /// 5. **Someone else holding the same `Rc` reallocates the `Vec`.** This one has no
+    ///    restore site, because there is no hook: `LocalContextTr::shared_memory_buffer`
+    ///    is a public trait method handing out `&Rc<RefCell<Vec<u8>>>`, and anything that
+    ///    clones it can `borrow_mut().reserve(..)` behind this struct's back.
+    ///
+    ///    It does not happen in tree, and that was checked rather than assumed: the only
+    ///    two uses of that buffer are `LocalContext::clear`, which is `set_len(0)` and
+    ///    cannot reallocate, and `Handler::first_frame_input`, which clones the `Rc` into
+    ///    [`new_with_buffer`](Self::new_with_buffer) and so computes `base` at that moment.
+    ///    rsp does not touch it at all. A consumer that grows the buffer through that
+    ///    trait method while a `SharedMemory` is live would break INV-B, and the only thing
+    ///    standing there is `check_base` -- which is a panic in a native build and nothing
+    ///    at all in the guest. Closing it properly means not exposing the `Rc`, which is an
+    ///    upstream API change.
+    ///
+    /// Checked on every access in non-guest builds, which is where the test suite runs;
+    /// see the `assert_eq!` in [`get_u256`](Self::get_u256) and friends.
+    ///
+    /// It is derived state, so it is excluded from `PartialEq` and is not serialised.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    base: *mut u8,
     /// Child checkpoint that we need to free context to.
     child_checkpoint: Option<usize>,
     /// Memory limit. See [`Cfg`](context_interface::Cfg).
     #[cfg(feature = "memory_limit")]
     memory_limit: u64,
 }
+
+/// What a [`SharedMemory`] deserialises through, so that `base` is rebuilt rather than left
+/// null.
+///
+/// `base` is a pointer, so it cannot be carried on the wire and has to be recomputed from
+/// the two fields it is derived from. Deriving `Deserialize` straight onto `SharedMemory`
+/// left it null while `buffer` came back as a real allocation -- INV-B broken from the
+/// moment the value existed. In a native build the `check_base` assertion catches that on
+/// the first access, but the guest compiles those out, so there it was a store through
+/// `null + offset`. It was not reachable from the guest (nothing deserialises a
+/// `SharedMemory` there, and the guest ELF carries no such symbol), but "not reachable
+/// today" is not what INV-B says, and the field's own documentation claimed a fix-up that
+/// nothing performed.
+///
+/// The field set is exactly `SharedMemory`'s minus the skipped `base`, so the wire format
+/// is unchanged.
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+struct SharedMemoryDe {
+    buffer: Option<Rc<RefCell<Vec<u8>>>>,
+    my_checkpoint: usize,
+    child_checkpoint: Option<usize>,
+    #[cfg(feature = "memory_limit")]
+    memory_limit: u64,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<SharedMemoryDe> for SharedMemory {
+    type Error = &'static str;
+
+    fn try_from(de: SharedMemoryDe) -> Result<Self, Self::Error> {
+        // INV-B: restored here, which is the only way a deserialised value can reach a
+        // caller. Null when there is no buffer, exactly as `invalid()` leaves it.
+        let base = match &de.buffer {
+            Some(b) => {
+                let mut buf = b.dbg_borrow_mut();
+                // The wire carries two offsets and an optional buffer, and every length
+                // here is derived from them. Checked against the invariant a live value
+                // satisfies, in full - both arms of this match, because the previous three
+                // attempts at this each enforced one clause and left a sibling open:
+                //
+                //     buffer.is_some() => my_checkpoint <= child_checkpoint <= buf.len()
+                //     buffer.is_none() => my_checkpoint == 0 && child_checkpoint.is_none()
+                //
+                // The upper bound because `free_child_context` hands `child_checkpoint`
+                // straight to `Vec::set_len`, and the region between the length and the
+                // capacity is inside the allocation but uninitialised. The lower bound
+                // because `new_child_context` takes the child's checkpoint from
+                // `full_len()`, which is never below this context's own; a smaller one
+                // shrinks the buffer under our own base and `len()`, being
+                // `full_len() - my_checkpoint`, underflows into a length that passes every
+                // subsequent bound test. Neither is caught later: overflow checks are off in
+                // the guest and `check_base` is compiled out.
+                //
+                // Rejected rather than clamped -- a clamp invents a value the sender did not
+                // send -- which is why this is `try_from`; `From` has no way to say no.
+                // Equality is legal at both ends: that is what an empty child produces.
+                if de.my_checkpoint > buf.len() {
+                    return Err("SharedMemory checkpoint is past the end of its buffer");
+                }
+                if de
+                    .child_checkpoint
+                    .is_some_and(|c| c > buf.len() || c < de.my_checkpoint)
+                {
+                    return Err("SharedMemory child checkpoint is outside its parent's range");
+                }
+                // SAFETY: bounded above, one-past-the-end at worst.
+                unsafe { buf.as_mut_ptr().add(de.my_checkpoint) }
+            }
+            None => {
+                // `invalid()` is the only value without a buffer and it carries neither
+                // offset, so this arm has an invariant too. A `child_checkpoint` here walks
+                // straight past `free_child_context`'s early return into `buffer()`, which
+                // unwraps the `None` - checked in a native build, undefined in the guest.
+                if de.my_checkpoint != 0 || de.child_checkpoint.is_some() {
+                    return Err("SharedMemory without a buffer carries a checkpoint");
+                }
+                core::ptr::null_mut()
+            }
+        };
+        Ok(Self {
+            buffer: de.buffer,
+            base,
+            my_checkpoint: de.my_checkpoint,
+            child_checkpoint: de.child_checkpoint,
+            #[cfg(feature = "memory_limit")]
+            memory_limit: de.memory_limit,
+        })
+    }
+}
+
+/// `base` is derived from `buffer` and `my_checkpoint`, so it never distinguishes two
+/// memories that those already agree on.
+impl PartialEq for SharedMemory {
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(feature = "memory_limit")]
+        if self.memory_limit != other.memory_limit {
+            return false;
+        }
+        self.buffer == other.buffer
+            && self.my_checkpoint == other.my_checkpoint
+            && self.child_checkpoint == other.child_checkpoint
+    }
+}
+
+impl Eq for SharedMemory {}
 
 impl fmt::Debug for SharedMemory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -409,6 +578,12 @@ impl MemoryTr for SharedMemory {
         true
     }
 
+    #[inline]
+    fn resize_written(&mut self, new_size: usize, wr_off: usize, wr_len: usize) -> bool {
+        self.resize_written(new_size, wr_off, wr_len);
+        true
+    }
+
     /// Returns `true` if the `new_size` for the current context memory will
     /// make the shared buffer length exceed the `memory_limit`.
     #[cfg(feature = "memory_limit")]
@@ -435,6 +610,8 @@ impl SharedMemory {
     pub fn invalid() -> Self {
         Self {
             buffer: None,
+            // INV-B: null while there is no buffer. `invalid()` may not be used for memory.
+            base: core::ptr::null_mut(),
             my_checkpoint: 0,
             child_checkpoint: None,
             #[cfg(feature = "memory_limit")]
@@ -443,9 +620,19 @@ impl SharedMemory {
     }
 
     /// Creates a new memory instance with a given shared buffer.
+    ///
+    /// # Precondition
+    ///
+    /// The caller must not reallocate `buffer` through any other handle to the same `Rc`
+    /// while the returned `SharedMemory` is alive -- growing it past its capacity moves the
+    /// allocation and leaves the cached `base` dangling. Shrinking, and growing within the
+    /// existing capacity, are both fine. See INV-B case 5 on the field.
     pub fn new_with_buffer(buffer: Rc<RefCell<Vec<u8>>>) -> Self {
+        // INV-B, case 1: `my_checkpoint` is 0, so `base` is the allocation itself.
+        let base = buffer.dbg_borrow_mut().as_mut_ptr();
         Self {
             buffer: Some(buffer),
+            base,
             my_checkpoint: 0,
             child_checkpoint: None,
             #[cfg(feature = "memory_limit")]
@@ -456,8 +643,12 @@ impl SharedMemory {
     /// Creates a new memory instance that can be shared between calls with the given `capacity`.
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
+        let buffer = Rc::new(RefCell::new(Vec::with_capacity(capacity)));
+        // INV-B, case 1.
+        let base = buffer.dbg_borrow_mut().as_mut_ptr();
         Self {
-            buffer: Some(Rc::new(RefCell::new(Vec::with_capacity(capacity)))),
+            buffer: Some(buffer),
+            base,
             my_checkpoint: 0,
             child_checkpoint: None,
             #[cfg(feature = "memory_limit")]
@@ -517,8 +708,37 @@ impl SharedMemory {
         }
         let new_checkpoint = self.full_len();
         self.child_checkpoint = Some(new_checkpoint);
+        // INV-B, case 1: the child has a checkpoint of its own.
+        // SAFETY: `new_checkpoint == buffer.len()`, which is in bounds of the allocation
+        // (one-past-the-end at worst), so the offset is a valid pointer to form.
+        let buf_start = self.buffer_ref_mut().as_mut_ptr();
+        // INV-B, case 5, checked here *in the guest too*.
+        //
+        // Case 5 is the one break with no restore site: something outside this type holding
+        // the same `Rc` can grow the `Vec` and move the allocation. `check_base` guards
+        // every access, but it is compiled out of the guest, which is the only build where
+        // a stale `base` is a wild store instead of a panic.
+        //
+        // This is the one place the true base is already in a register on the guest's own
+        // path -- `buf_start` is loaded either way -- so the check is a compare and a
+        // branch, ~2 instructions on 20,078 frame descents, against the 1.18 M that caching
+        // `base` saves. It does not cover a violation that happens *and* is used inside a
+        // single frame with no nested call; the cheap complete check is the three dependent
+        // loads this cache exists to remove.
+        //
+        // It aborts rather than reports: there is no log in the guest, and a corrupted
+        // memory image that keeps executing is worse than one that stops. A halt here means
+        // the block is rejected, which is the safe direction.
+        assert!(
+            self.base as usize == buf_start as usize + self.my_checkpoint,
+            "INV-B broken before a child frame: the shared memory buffer moved behind this \
+             context's back. See INV-B case 5 on SharedMemory::base -- something holding the \
+             same Rc grew the Vec."
+        );
+        let base = unsafe { buf_start.add(new_checkpoint) };
         SharedMemory {
             buffer: Some(self.buffer().clone()),
+            base,
             my_checkpoint: new_checkpoint,
             // child_checkpoint is same as my_checkpoint
             child_checkpoint: None,
@@ -533,9 +753,18 @@ impl SharedMemory {
         let Some(child_checkpoint) = self.child_checkpoint.take() else {
             return;
         };
-        unsafe {
-            self.buffer_ref_mut().set_len(child_checkpoint);
-        }
+        let my_checkpoint = self.my_checkpoint;
+        // SAFETY: single-threaded guest with no other live borrow; see `resize`.
+        let base = unsafe {
+            let buf = &mut *self.buffer().as_ptr();
+            buf.set_len(child_checkpoint);
+            // INV-B, case 3: the child - or anything it called - may have reallocated the
+            // shared buffer while this context was suspended, which is exactly the window
+            // `base` cannot see. This is the only point at which control comes back, so it
+            // is the only place the refresh can go.
+            buf.as_mut_ptr().add(my_checkpoint)
+        };
+        self.base = base;
     }
 
     /// Returns the length of the current memory range.
@@ -573,35 +802,98 @@ impl SharedMemory {
             let n = new_len - old_len;
             // SAFETY: `old_len + n == new_len <= capacity`, so the tail is in the allocation.
             unsafe {
-                let p = buf.as_mut_ptr().add(old_len);
-                if n == 32 && (p as usize).is_multiple_of(core::mem::align_of::<u64>()) {
-                    // The overwhelmingly common case: memory grew by one EVM word.
-                    let q = p.cast::<u64>();
-                    q.write_volatile(0);
-                    q.add(1).write_volatile(0);
-                    q.add(2).write_volatile(0);
-                    q.add(3).write_volatile(0);
-                } else if n.is_multiple_of(8)
-                    && (p as usize).is_multiple_of(core::mem::align_of::<u64>())
-                {
-                    // Also common (`CALLDATACOPY` and friends grow by several words at
-                    // once), so it stays inline: it needs two scratch registers and no call,
-                    // which costs `resize_memory_cold` nothing in its prologue.
-                    let mut q = p.cast::<u64>();
-                    let mut left = n / 8;
-                    while left != 0 {
-                        q.write_volatile(0);
-                        q = q.add(1);
-                        left -= 1;
-                    }
-                } else {
-                    zero_tail(p, n);
-                }
+                zero_span(buf.as_mut_ptr().add(old_len), n);
                 buf.set_len(new_len);
             }
             return;
         }
         grow_zeroed(buf, new_len);
+        // INV-B, case 2: `grow_zeroed` is the one place the `Vec` can outgrow its capacity
+        // and move. Everything above stays inside the existing allocation.
+        // SAFETY: `my_checkpoint <= buf.len()` by the checkpoint invariant.
+        self.base = unsafe { buf.as_mut_ptr().add(self.my_checkpoint) };
+    }
+
+    /// [`resize`](Self::resize), for a caller that overwrites `wr_off..wr_off + wr_len`
+    /// before anything can read the memory.
+    ///
+    /// The new tail is `old_len..new_len`, and the caller covers `wr_start..wr_end` of it,
+    /// so only a gap below and a round-up above are left to zero. For the shape that
+    /// dominates - `MSTORE` at the current memory top with a 32-aligned offset, 65 % of all
+    /// the grows on mainnet block 24006677 - both are empty and the grow is a `set_len` and
+    /// nothing else: the four `sd zero` it used to run were dead stores, overwritten by the
+    /// `set_u256_ptr` on the next line.
+    ///
+    /// The gas charged is unchanged: `resize_memory_written` computes the same word count
+    /// and calls the same `record_new_len`. This only skips stores nothing can observe.
+    ///
+    /// # Correctness
+    ///
+    /// See [`MemoryTr::resize_written`]. `wr_off + wr_len <= new_size` is required and is
+    /// asserted in debug builds.
+    #[inline]
+    pub fn resize_written(&mut self, new_size: usize, wr_off: usize, wr_len: usize) {
+        debug_assert!(
+            wr_off + wr_len <= new_size,
+            "the written range escapes the grow"
+        );
+        let new_len = self.my_checkpoint + new_size;
+        // SAFETY: as in `resize`.
+        let buf = unsafe { &mut *self.buffer().as_ptr() };
+        let old_len = buf.len();
+        if new_len > old_len && new_len <= buf.capacity() {
+            let wr_start = self.my_checkpoint + wr_off;
+            let wr_end = wr_start + wr_len;
+            let gap = wr_start > old_len;
+            let round_up = new_len > wr_end;
+            if gap | round_up {
+                // Both ends are rounded *outwards* to a multiple of 8. `zero_span` only
+                // has a word-at-a-time path when the span is 8-aligned and a multiple of 8,
+                // and splitting on an unaligned `wr_start`/`wr_end` otherwise drops the fill
+                // into the byte loop - measured at +1.23 M on block 24006677, which is more
+                // than the split saves. Rounding outwards only ever re-zeroes bytes inside
+                // the caller's own range, which the caller overwrites anyway.
+                //
+                // `old_len` and `new_len` are both multiples of 32 - EVM memory only grows
+                // to whole words from a whole-word checkpoint - so every span below is
+                // 8-aligned with a length that is a multiple of 8.
+                let (zlo, zhi) = if gap & round_up {
+                    // Both: an unaligned offset past the current top. Rare enough not to be
+                    // worth two fills, so zero the lot, the caller's part included.
+                    (old_len, new_len)
+                } else if gap {
+                    // Only the hole between the old top and where the caller writes. Rounding
+                    // `wr_start` up overshoots `new_len` when the caller writes fewer than 8
+                    // bytes, so clamp it: this is a `pub` method, and its bound should not
+                    // rest on a caller obligation nothing states or checks. Every in-tree
+                    // caller writes 32, for which the clamp never binds.
+                    (old_len, ((wr_start + 7) & !7).min(new_len))
+                } else {
+                    // Only the round-up to a whole word above what the caller writes. The
+                    // `max` also covers a caller that writes entirely below the old top.
+                    let hi_start = wr_end & !7;
+                    (
+                        if hi_start > old_len {
+                            hi_start
+                        } else {
+                            old_len
+                        },
+                        new_len,
+                    )
+                };
+                // SAFETY: `old_len <= zlo <= zhi <= new_len <= capacity`, so the span is
+                // inside the allocation.
+                unsafe { zero_span(buf.as_mut_ptr().add(zlo), zhi - zlo) };
+            }
+            // SAFETY: every byte below `new_len` is initialised - below `old_len` already,
+            // and above it either by the fill above or, where it was skipped, by the
+            // caller's own write, which the contract requires to happen before any read.
+            unsafe { buf.set_len(new_len) };
+            return;
+        }
+        grow_zeroed(buf, new_len);
+        // INV-B, case 2.
+        self.base = unsafe { buf.as_mut_ptr().add(self.my_checkpoint) };
     }
 
     /// Returns a byte slice of the memory region at the given offset.
@@ -713,16 +1005,19 @@ impl SharedMemory {
         // live while an instruction executes, so `RefCell::as_ptr` is the same access
         // `borrow()` would give, without the borrow-flag bookkeeping. The caller has
         // already grown memory to cover `offset + 32` through `resize_memory!`.
-        let buf = unsafe { &*self.buffer().as_ptr() };
-        let base = self.my_checkpoint + offset;
         // Only the guest may skip this: there every caller has already grown memory through
         // `resize_memory!`. Anywhere else a caller bug must stay a panic, not become UB.
         #[cfg(not(target_os = "zkvm"))]
-        assert!(base + 32 <= buf.len(), "get_u256 out of bounds");
-        debug_assert!(base + 32 <= buf.len(), "get_u256 OOB");
+        self.check_base(offset, 32, "get_u256");
+        debug_assert!(
+            self.my_checkpoint + offset + 32 <= self.full_len(),
+            "get_u256 OOB"
+        );
         // SAFETY: bounds established by the caller's `resize_memory!`, asserted above in
-        // debug builds.
-        let ptr = unsafe { buf.as_ptr().add(base) };
+        // debug builds; `base` is byte 0 of this context by INV-B, so `base + offset` is
+        // the same address `buffer.as_ptr().add(my_checkpoint + offset)` used to be - three
+        // dependent loads and an add fewer.
+        let ptr: *const u8 = unsafe { self.base.add(offset) };
         // EVM memory is a `Vec<u8>`, so a byte-slice conversion has alignment 1, and on a
         // target without misaligned scalar memory access LLVM assembles the word with 32
         // `lbu` and a shift/or chain. Solidity keeps memory 32-byte aligned, so the region
@@ -758,11 +1053,14 @@ impl SharedMemory {
     pub unsafe fn set_u256_ptr(&mut self, offset: usize, src: *const u64) {
         // SAFETY: see `get_u256` - single-threaded guest, no live borrow, bounds already
         // established by the caller's `resize_memory!`.
-        let buf = unsafe { &mut *self.buffer().as_ptr() };
-        let base = self.my_checkpoint + offset;
-        debug_assert!(base + 32 <= buf.len(), "set_u256_ptr OOB");
-        // SAFETY: bounds as above.
-        let ptr = unsafe { buf.as_mut_ptr().add(base) };
+        #[cfg(not(target_os = "zkvm"))]
+        self.check_base(offset, 32, "set_u256_ptr");
+        debug_assert!(
+            self.my_checkpoint + offset + 32 <= self.full_len(),
+            "set_u256_ptr OOB"
+        );
+        // SAFETY: bounds as above; `base + offset` by INV-B.
+        let ptr = unsafe { self.base.add(offset) };
         // EVM memory is a `Vec<u8>`, so nothing here is aligned as far as the compiler is
         // concerned, but the offsets Solidity uses almost always are: measured at 99.3 % of
         // `MLOAD`s on a mainnet block. Taking the aligned path lets a zero limb cost one
@@ -785,11 +1083,14 @@ impl SharedMemory {
     #[inline(always)]
     pub unsafe fn get_u256_to(&self, offset: usize, dst: *mut u64) {
         // SAFETY: as in `get_u256`.
-        let buf = unsafe { &*self.buffer().as_ptr() };
-        let base = self.my_checkpoint + offset;
-        debug_assert!(base + 32 <= buf.len(), "get_u256_to OOB");
-        // SAFETY: bounds as above.
-        let ptr = unsafe { buf.as_ptr().add(base) };
+        #[cfg(not(target_os = "zkvm"))]
+        self.check_base(offset, 32, "get_u256_to");
+        debug_assert!(
+            self.my_checkpoint + offset + 32 <= self.full_len(),
+            "get_u256_to OOB"
+        );
+        // SAFETY: bounds as above; `base + offset` by INV-B.
+        let ptr: *const u8 = unsafe { self.base.add(offset) };
         if (ptr as usize).is_multiple_of(core::mem::align_of::<u64>()) {
             // SAFETY: in bounds and 8-byte aligned. Memory is big-endian and `U256`'s limbs
             // are little-endian ordered.
@@ -809,6 +1110,28 @@ impl SharedMemory {
             unsafe { dst.add(3 - i).write(v) };
             i += 1;
         }
+    }
+
+    /// Bounds check *and* a full check of INV-B, on every word access, everywhere except
+    /// the zkVM guest.
+    ///
+    /// The guest is the only build that skips it, and the only one where a stale `base`
+    /// would be a wild store rather than a panic - so this runs over the whole test suite
+    /// and every native `revm` consumer, which is what makes the cache auditable at all.
+    #[cfg(not(target_os = "zkvm"))]
+    #[inline]
+    #[cfg_attr(debug_assertions, track_caller)]
+    fn check_base(&self, offset: usize, len: usize, what: &str) {
+        let buf = self.buffer_ref();
+        assert!(
+            self.my_checkpoint + offset + len <= buf.len(),
+            "{what} out of bounds"
+        );
+        assert_eq!(
+            self.base as usize,
+            buf.as_ptr() as usize + self.my_checkpoint,
+            "{what}: INV-B broken - the cached memory base is stale"
+        );
     }
 
     /// Sets the `byte` at the given `index`.
@@ -844,14 +1167,15 @@ impl SharedMemory {
     pub fn set_u256(&mut self, offset: usize, value: U256) {
         // SAFETY: see `get_u256` - single-threaded guest, no live borrow, bounds already
         // established by the caller's `resize_memory!`.
-        let buf = unsafe { &mut *self.buffer().as_ptr() };
-        let base = self.my_checkpoint + offset;
         // See `get_u256`.
         #[cfg(not(target_os = "zkvm"))]
-        assert!(base + 32 <= buf.len(), "set_u256 out of bounds");
-        debug_assert!(base + 32 <= buf.len(), "set_u256 OOB");
-        // SAFETY: bounds as above.
-        let ptr = unsafe { buf.as_mut_ptr().add(base) };
+        self.check_base(offset, 32, "set_u256");
+        debug_assert!(
+            self.my_checkpoint + offset + 32 <= self.full_len(),
+            "set_u256 OOB"
+        );
+        // SAFETY: bounds as above; `base + offset` by INV-B.
+        let ptr = unsafe { self.base.add(offset) };
         let limbs = value.as_limbs();
         // Scattering the 32 bytes costs 7 shifts + 8 `sb` per limb = 60 instructions, and
         // needs no alignment. Byte-swapping into four `sd` costs the same on the aligned
@@ -1016,6 +1340,81 @@ pub const fn num_words(len: usize) -> usize {
     len.saturating_add(31) / 32
 }
 
+/// Zeroes `n` bytes at `p`.
+///
+/// Volatile so that LLVM's loop-idiom pass cannot turn these back into a `memset` libcall,
+/// which is measured at 76.9 retired instructions to zero the 32 bytes of one EVM word.
+///
+/// # Safety
+///
+/// `p` must point at `n` writable bytes.
+#[inline(always)]
+unsafe fn zero_span(p: *mut u8, n: usize) {
+    // SAFETY: `n` writable bytes at `p`, per the contract.
+    unsafe {
+        if n == 32 && (p as usize).is_multiple_of(core::mem::align_of::<u64>()) {
+            // The overwhelmingly common case: memory grew by one EVM word.
+            let q = p.cast::<u64>();
+            q.write_volatile(0);
+            q.add(1).write_volatile(0);
+            q.add(2).write_volatile(0);
+            q.add(3).write_volatile(0);
+        } else if n.is_multiple_of(8) && (p as usize).is_multiple_of(core::mem::align_of::<u64>()) {
+            // Also common (`CALLDATACOPY` and friends grow by several words at once), so it
+            // stays inline: it needs two scratch registers and no call.
+            let mut q = p.cast::<u64>();
+            let mut left = n / 8;
+            while left != 0 {
+                q.write_volatile(0);
+                q = q.add(1);
+                left -= 1;
+            }
+        } else {
+            zero_tail(p, n);
+        }
+    }
+}
+
+/// [`resize_memory`], for an instruction that overwrites every byte of
+/// `offset..offset + len`. The gas is computed identically - same word count, same
+/// `record_new_len` - and only the dead part of the zero fill is skipped.
+#[inline]
+#[must_use]
+pub fn resize_memory_written<Memory: MemoryTr>(
+    gas: &mut crate::Gas,
+    memory: &mut Memory,
+    offset: usize,
+    len: usize,
+) -> bool {
+    let new_num_words = num_words(offset.saturating_add(len));
+    if new_num_words > gas.memory().words_num {
+        resize_memory_cold_written(gas, memory, new_num_words, offset, len)
+    } else {
+        true
+    }
+}
+
+/// [`resize_memory_cold`] for [`resize_memory_written`]; inlined for the same reason.
+#[inline(always)]
+fn resize_memory_cold_written<Memory: MemoryTr>(
+    gas: &mut crate::Gas,
+    memory: &mut Memory,
+    new_num_words: usize,
+    offset: usize,
+    len: usize,
+) -> bool {
+    let cost = unsafe {
+        gas.memory_mut()
+            .record_new_len(new_num_words)
+            .unwrap_unchecked()
+    };
+    if !gas.record_cost(cost) {
+        return false;
+    }
+    memory.resize_written(new_num_words * 32, offset, len);
+    true
+}
+
 /// Performs EVM memory resize.
 #[inline]
 #[must_use]
@@ -1145,6 +1544,208 @@ mod tests {
         assert_eq!(sm1.buffer_ref().len(), 32);
         assert_eq!(sm1.my_checkpoint, 0);
         assert_eq!(sm1.len(), 32);
+    }
+
+    /// INV-B, checked head-on rather than through `check_base`.
+    fn assert_inv_b(sm: &SharedMemory, what: &str) {
+        let buf = sm.buffer_ref();
+        assert_eq!(
+            sm.base as usize,
+            buf.as_ptr() as usize + sm.my_checkpoint,
+            "{what}: cached base is stale"
+        );
+    }
+
+    fn xorshift(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    /// The cached base has to survive everything that can move the buffer or move this
+    /// context inside it: growth past the capacity, nested child contexts, a *child*
+    /// reallocating while the parent is suspended, and the frees on the way back out.
+    ///
+    /// This cannot go vacuous. Every `set_u256`/`get_u256` below runs `check_base`, which
+    /// re-derives the address from the buffer and compares - so a stale base is a failure
+    /// even where the walk does not assert explicitly - and the values read back are
+    /// compared against a model, so a base that is stale *and* still points at mapped
+    /// memory is caught by the wrong bytes coming back. It is checked against that:
+    /// dropping either the `free_child_context` refresh or the `grow_zeroed` one makes it
+    /// fail.
+    #[test]
+    fn the_cached_base_survives_reallocation_and_nesting() {
+        // Deliberately tiny, so that ordinary growth reallocates over and over.
+        let mut cur = SharedMemory::with_capacity(32);
+        let mut parents: Vec<SharedMemory> = Vec::new();
+        let mut models: Vec<Vec<U256>> = Vec::new();
+        // One `U256` per 32-byte word of the active context.
+        let mut model: Vec<U256> = Vec::new();
+        let mut st: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut reallocs = 0usize;
+        let mut nested = 0usize;
+
+        for step in 0..2000u32 {
+            match xorshift(&mut st) % 10 {
+                0..=3 => {
+                    let words = (xorshift(&mut st) % 5) as usize + 1;
+                    let before = cur.buffer_ref().as_ptr();
+                    cur.resize((model.len() + words) * 32);
+                    if cur.buffer_ref().as_ptr() != before {
+                        reallocs += 1;
+                    }
+                    model.resize(model.len() + words, U256::ZERO);
+                }
+                4..=6 => {
+                    // Write and read back through the cached base.
+                    if !model.is_empty() {
+                        let i = xorshift(&mut st) as usize % model.len();
+                        let v = U256::from(xorshift(&mut st)) | U256::from(1u64);
+                        cur.set_u256(i * 32, v);
+                        model[i] = v;
+                    }
+                }
+                7 => {
+                    if parents.len() < 5 {
+                        let child = cur.new_child_context();
+                        parents.push(core::mem::replace(&mut cur, child));
+                        models.push(core::mem::take(&mut model));
+                        nested += 1;
+                    }
+                }
+                _ => {
+                    if let Some(mut parent) = parents.pop() {
+                        // Drop the child first, so `free_child_context` runs with only the
+                        // parent's handle live. Written as a `replace` because the plain
+                        // assignment reads as a dead store.
+                        drop(core::mem::replace(&mut cur, SharedMemory::invalid()));
+                        parent.free_child_context();
+                        cur = parent;
+                        model = models.pop().unwrap();
+                    }
+                }
+            }
+            assert_inv_b(&cur, "walk");
+            for (i, want) in model.iter().enumerate() {
+                assert_eq!(cur.get_u256(i * 32), *want, "step {step}, word {i}");
+            }
+        }
+        // The walk has to have hit the two interesting events, or it proves nothing.
+        assert!(reallocs > 5, "only {reallocs} reallocations");
+        assert!(nested > 20, "only {nested} child contexts");
+    }
+
+    /// The narrow case behind INV-B case 3: a *child* reallocates the shared buffer while
+    /// the parent is suspended, so the parent's cached base is dangling until it is handed
+    /// control back.
+    #[test]
+    fn a_child_reallocating_refreshes_the_parents_base() {
+        let mut parent = SharedMemory::with_capacity(64);
+        parent.resize(32);
+        parent.set_u256(0, U256::from(0xDEAD_BEEFu64));
+        let before = parent.buffer_ref().as_ptr();
+
+        let mut child = parent.new_child_context();
+        // Far past the 64-byte capacity: this reallocates the buffer out from under the
+        // parent's cached base.
+        child.resize(8192);
+        child.set_u256(0, U256::from(7u64));
+        assert_ne!(
+            child.buffer_ref().as_ptr(),
+            before,
+            "the child was supposed to reallocate"
+        );
+        drop(child);
+
+        parent.free_child_context();
+        assert_inv_b(&parent, "after a child reallocated");
+        // Reads and writes through the refreshed base still see the parent's own memory.
+        assert_eq!(parent.get_u256(0), U256::from(0xDEAD_BEEFu64));
+        parent.set_u256(0, U256::from(11u64));
+        assert_eq!(parent.get_u256(0), U256::from(11u64));
+    }
+
+    /// `resize_written` is only allowed to skip stores the caller is about to make, so for
+    /// every shape a caller can produce it has to leave the buffer *byte for byte* what
+    /// `resize` followed by the same write would have left.
+    ///
+    /// The sweep is over every combination of a starting length, a destination offset -
+    /// aligned, unaligned, below the old top, above it, in the gap - and a nesting
+    /// checkpoint, which is every case the four-way split in `resize_written` distinguishes.
+    /// It cannot go vacuous: it compares the whole buffer, both sides run the same write,
+    /// and it asserts that the sweep actually reached each of the four cases.
+    #[test]
+    fn resize_written_leaves_the_same_bytes_as_resize() {
+        let value = U256::from_limbs([0x0102_0304_0506_0708, 0x1112, 0, 0xAABB_CCDD]);
+        let mut saw_neither = 0usize;
+        let mut saw_gap = 0usize;
+        let mut saw_round_up = 0usize;
+        let mut saw_both = 0usize;
+
+        for checkpoint_words in [0usize, 1, 3] {
+            for old_words in 0..6usize {
+                for offset in [0usize, 1, 4, 31, 32, 33, 64, 96, 97, 128, 130, 160, 192] {
+                    let new_size = num_words(offset + 32) * 32;
+                    if new_size < old_words * 32 {
+                        // `resize_memory` never shrinks; skip what a caller cannot produce.
+                        continue;
+                    }
+
+                    // Two buffers with identical dirty history, so that anything left
+                    // un-zeroed shows up as a difference rather than as a lucky zero.
+                    let build = || {
+                        let mut parent = SharedMemory::with_capacity(4096);
+                        if checkpoint_words > 0 {
+                            parent.resize(checkpoint_words * 32);
+                            parent.set(0, &std::vec![0xC7u8; checkpoint_words * 32]);
+                        }
+                        let mut sm = parent.new_child_context();
+                        // Dirty the region this child is about to use and hand it back, so
+                        // the bytes above `old_words * 32` are non-zero garbage.
+                        sm.resize(256);
+                        sm.set(0, &[0x9Eu8; 256]);
+                        drop(sm);
+                        parent.free_child_context();
+                        let mut sm = parent.new_child_context();
+                        sm.resize(old_words * 32);
+                        (parent, sm)
+                    };
+
+                    let (_pa, mut a) = build();
+                    a.resize(new_size);
+                    a.set_u256(offset, value);
+
+                    let (_pb, mut b) = build();
+                    b.resize_written(new_size, offset, 32);
+                    b.set_u256(offset, value);
+
+                    assert_eq!(a.len(), b.len(), "offset {offset}: MSIZE diverged");
+                    assert_eq!(
+                        &*a.buffer_ref(),
+                        &*b.buffer_ref(),
+                        "checkpoint {checkpoint_words}, old {old_words} words, offset                          {offset}: resize_written left different bytes"
+                    );
+
+                    // Which of the four branches this shape exercised.
+                    let old_len = old_words * 32;
+                    let gap = offset > old_len;
+                    let round_up = new_size > offset + 32;
+                    match (gap, round_up) {
+                        (false, false) => saw_neither += 1,
+                        (true, false) => saw_gap += 1,
+                        (false, true) => saw_round_up += 1,
+                        (true, true) => saw_both += 1,
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_neither > 0 && saw_gap > 0 && saw_round_up > 0 && saw_both > 0,
+            "sweep missed a branch: {saw_neither}/{saw_gap}/{saw_round_up}/{saw_both}"
+        );
     }
 
     #[test]

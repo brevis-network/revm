@@ -118,11 +118,14 @@ pub trait EvmTr {
     ) -> Result<FrameInitOrResult<Self::Frame>, ContextDbError<Self::Context>>;
 
     /// Returns the result of the frame to the caller. Frame is popped from the frame stack.
-    /// Consumes the frame result or returns it if there is more frames to run.
+    ///
+    /// Takes the result by `&mut` and reports whether it was the outermost frame, rather
+    /// than taking it by value and handing it back: a `FrameResult` is ~96 bytes with
+    /// align-1 fields inside, so every by-value hand-off is a byte-wide stack copy.
     fn frame_return_result(
         &mut self,
-        result: <Self::Frame as FrameTr>::FrameResult,
-    ) -> Result<Option<<Self::Frame as FrameTr>::FrameResult>, ContextDbError<Self::Context>>;
+        result: &mut <Self::Frame as FrameTr>::FrameResult,
+    ) -> Result<bool, ContextDbError<Self::Context>>;
 }
 
 impl<CTX, INSP, I, P> EvmTr for Evm<CTX, INSP, I, P, EthFrame<EthInterpreter>>
@@ -183,16 +186,29 @@ where
 
         let ctx = &mut self.ctx;
         let precompiles = &mut self.precompiles;
-        let res = Self::Frame::init_with_context(new_frame, ctx, precompiles, frame_input)?;
+        // Spelled out with `match` rather than `?` plus `map_frame`. `Try::branch` takes the
+        // `Result` by value and hands the payload back inside a `ControlFlow`, and
+        // `map_frame` takes `self` by value and rebuilds the enum around it; each is a real
+        // copy of the ~96-byte `FrameResult` through a fresh stack slot, and since the
+        // payload carries align-1 fields that copy is a `memcpy` libcall. The two of them
+        // were 40,156 of the guest's 324,718 `memcpy` calls on mainnet block 24006677, at
+        // ~74 retired instructions each.
+        //
+        // The one copy left is the unavoidable one: the returned type differs from
+        // `init_with_context`'s in its item variant, so the result variant has to be moved
+        // from one enum into the other.
+        let token = match Self::Frame::init_with_context(new_frame, ctx, precompiles, frame_input) {
+            Err(e) => return Err(e),
+            Ok(ItemOrResult::Result(result)) => return Ok(ItemOrResult::Result(result)),
+            Ok(ItemOrResult::Item(token)) => token,
+        };
 
-        Ok(res.map_frame(|token| {
-            if is_first_init {
-                unsafe { self.frame_stack.end_init(token) };
-            } else {
-                unsafe { self.frame_stack.push(token) };
-            }
-            self.frame_stack.get()
-        }))
+        if is_first_init {
+            unsafe { self.frame_stack.end_init(token) };
+        } else {
+            unsafe { self.frame_stack.push(token) };
+        }
+        Ok(ItemOrResult::Item(self.frame_stack.get()))
     }
 
     /// Run the frame from the top of the stack. Returns the frame init or result.
@@ -206,28 +222,31 @@ where
             .interpreter
             .run_plain(instructions.instruction_table(), context);
 
-        frame.process_next_action(context, action).inspect(|i| {
-            if i.is_result() {
-                frame.set_finished(true);
-            }
-        })
+        // A plain tail call, deliberately. Anything between the call and the return -
+        // even just the `frame.set_finished(true)` that used to live here, which LLVM
+        // cannot prove does not alias the return slot - blocks the call-slot
+        // optimisation, and the ~104-byte `ItemOrResult` is then copied out of the
+        // callee sret slot into this function own one. That copy is byte-wide (the
+        // payload carries align-1 fields) and measured at 4.6 M retired instructions.
+        // `process_next_action` sets the frame finished flag itself instead.
+        frame.process_next_action(context, action)
     }
 
     /// Returns the result of the frame to the caller. Frame is popped from the frame stack.
     #[inline]
     fn frame_return_result(
         &mut self,
-        result: <Self::Frame as FrameTr>::FrameResult,
-    ) -> Result<Option<<Self::Frame as FrameTr>::FrameResult>, ContextDbError<Self::Context>> {
+        result: &mut <Self::Frame as FrameTr>::FrameResult,
+    ) -> Result<bool, ContextDbError<Self::Context>> {
         if self.frame_stack.get().is_finished() {
             self.frame_stack.pop();
         }
         if self.frame_stack.index().is_none() {
-            return Ok(Some(result));
+            return Ok(true);
         }
         self.frame_stack
             .get()
             .return_result::<_, ContextDbError<Self::Context>>(&mut self.ctx, result)?;
-        Ok(None)
+        Ok(false)
     }
 }

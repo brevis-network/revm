@@ -9,10 +9,39 @@ use super::StackTr;
 pub const STACK_LIMIT: usize = 1024;
 
 /// Size of one stack word in bytes.
-const WORD: usize = core::mem::size_of::<U256>();
+pub const WORD: usize = core::mem::size_of::<U256>();
 
 /// [`STACK_LIMIT`] expressed in bytes, i.e. the largest legal [`Stack::byte_len`].
-const BYTE_LIMIT: usize = STACK_LIMIT * WORD;
+pub const BYTE_LIMIT: usize = STACK_LIMIT * WORD;
+
+/// The largest cursor value that is **too shallow** to hold `words` operands.
+///
+/// The threaded cursor is the byte offset of the topmost word (see
+/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp)), so `words` operands need `sp >=
+/// (words - 1) * WORD` and the depth test is `sp <= (words - 2) * WORD`.
+///
+/// # Why the `words == 1` case is special
+///
+/// The point of the test being written this way is that a RISC-V branch against `x0` needs no
+/// constant materialised, and both `sp < 0` and `sp <= 0` are such a branch (`bltz`, `blez`).
+/// One operand wants `sp < 0`; `(1 - 2) * WORD` is `-WORD`, which is *equivalent* -- the
+/// cursor never goes below `-WORD` -- but LLVM materialises `-32` and compares against it
+/// instead of folding it to a sign test, so `-1` is returned and `sp <= -1` canonicalises to
+/// `sp < 0` on its own.
+///
+/// LLVM does not do the matching sharpening for the two-operand case either: it knows the
+/// cursor's low five bits are zero (`Interpreter::run_plain` says so) and still lowers `sp <
+/// WORD` as `li 32` plus a signed compare rather than `blez`. Handing it `sp <= 0` directly
+/// was 2.08 M retired instructions on block 24006677, because two operands is the commonest
+/// arity there is.
+#[inline(always)]
+pub const fn too_shallow_for(words: usize) -> isize {
+    if words >= 2 {
+        (words as isize - 2) * WORD as isize
+    } else {
+        -1
+    }
+}
 
 /// EVM stack with [STACK_LIMIT] capacity of words.
 ///
@@ -188,6 +217,175 @@ impl StackTr for Stack {
     unsafe fn push_slice_const<const N: usize>(&mut self, src: *const u8) -> bool {
         unsafe { self.push_slice_const::<N>(src) }
     }
+
+    // The threaded cursor. See `StackTr` for the contract and `Interpreter::run_plain` for
+    // where the cursor comes from; here it is `byte_len - WORD`, so every one of these is
+    // the ordinary operation with the load of `byte_len` (and, where the length changes,
+    // the store back) taken out.
+    //
+    // # The bias
+    //
+    // The cursor is the byte offset of the **topmost word**, i.e. `byte_len - WORD`, and is
+    // `-WORD` (wrapped, `usize::MAX - 31`) on an empty stack. The field is *not* biased --
+    // `byte_len` still means what it always did -- and `sp`/`set_sp` right here are the only
+    // two places the two representations meet.
+    //
+    // The bias exists to make the depth tests branch against zero. A RISC-V branch can only
+    // compare two registers, so `sp < N * WORD` costs an instruction to materialise `N *
+    // WORD` before the branch -- and the one threshold that costs nothing is the one that
+    // lands on `x0`. Unbiased, `byte_len` is unsigned and its only free threshold is
+    // `byte_len < WORD`, i.e. `byte_len == 0` (this is the trick `Stack::byte_len` records).
+    // Biased by one word the cursor goes *negative* on the empty stack, which makes two
+    // thresholds free at once, because `sp` is a multiple of `WORD`:
+    //
+    //     depth >= 1 word   <=>  sp <  0       `bltz`
+    //     depth >= 2 words  <=>  sp <  WORD  <=>  sp <= 0   `blez`
+    //
+    // and two words is the commonest arity there is -- every binary arithmetic, comparison
+    // and bitwise opcode pops one and rewrites the top. Measured on block 24006677 the
+    // `li 64`/`li 33`/`li 65` that this deletes were 2.18 M retired instructions.
+    //
+    // Everything else is unchanged: the deltas an arm applies are the same (a bias is
+    // additive), and `base + sp` picks up a constant `+ WORD` that folds into the 12-bit
+    // displacement of the load or store that follows, so the addressing costs nothing.
+
+    #[inline(always)]
+    fn sp(&self) -> usize {
+        self.byte_len().wrapping_sub(WORD)
+    }
+
+    #[inline(always)]
+    unsafe fn set_sp(&mut self, sp: usize) {
+        let byte_len = sp.wrapping_add(WORD);
+        debug_assert!(byte_len.is_multiple_of(WORD) && byte_len <= BYTE_LIMIT);
+        self.byte_len = byte_len;
+    }
+
+    #[inline(always)]
+    unsafe fn popn_at<const N: usize>(&mut self, sp: usize) -> [U256; N] {
+        // SAFETY: `sp` is a live cursor and at least `(N - 1) * WORD` by the caller's contract.
+        let end = unsafe { self.end_at(sp) };
+        // `[0]` is the topmost word, so the array is the popped range reversed.
+        core::array::from_fn(|i| unsafe { end.sub(1 + i).read() })
+    }
+
+    #[inline(always)]
+    unsafe fn popn_top_at<const N: usize>(&mut self, sp: usize) -> ([U256; N], &mut U256) {
+        // SAFETY: `sp` is a live cursor and at least `N * WORD`.
+        let end = unsafe { self.end_at(sp) };
+        let values = core::array::from_fn(|i| unsafe { end.sub(1 + i).read() });
+        (values, unsafe { &mut *end.sub(N + 1) })
+    }
+
+    #[inline(always)]
+    unsafe fn top_at(&mut self, sp: usize) -> &mut U256 {
+        // SAFETY: `sp` is a live cursor and at least zero.
+        unsafe { &mut *self.end_at(sp).sub(1) }
+    }
+
+    #[inline(always)]
+    unsafe fn peek_at(&self, sp: usize, depth: usize) -> *const U256 {
+        // SAFETY: `sp` is a live cursor and at least `depth * WORD`.
+        unsafe {
+            self.base()
+                .cast::<u8>()
+                .add(sp.wrapping_add(WORD))
+                .cast::<U256>()
+                .sub(1 + depth)
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn push_at(&mut self, sp: usize, value: U256) {
+        // SAFETY: `sp` is a live cursor below `BYTE_LIMIT - WORD`, so one more word fits.
+        unsafe { self.end_at(sp).write(value) };
+    }
+
+    #[inline(always)]
+    unsafe fn dup_at(&mut self, sp: usize, n: usize) {
+        // SAFETY: `(n - 1) * WORD <= sp < BYTE_LIMIT - WORD` by the caller's contract.
+        unsafe {
+            let end = self.end_at(sp);
+            ptr::copy_nonoverlapping(end.sub(n), end, 1);
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn exchange_at(&mut self, sp: usize, n: usize, m: usize) {
+        // SAFETY: `(n + m) * WORD <= sp` by the caller's contract, and `m > 0`, so the
+        // two words are in bounds and distinct.
+        unsafe {
+            let top = self.end_at(sp).sub(1);
+            swap_words(top.sub(n), top.sub(n + m));
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn push_slice_const_at<const N: usize>(&mut self, sp: usize, src: *const u8) {
+        // SAFETY: `sp < BYTE_LIMIT - WORD`, and `N` bytes at `src` are readable.
+        unsafe { write_be_word::<N>(self.end_at(sp), src) };
+    }
+}
+
+/// Writes the `N` big-endian bytes at `src` as one little-endian-limbed word at `dst`,
+/// zero-padded on the left.
+///
+/// Shared by [`Stack::push_slice_const`] and [`StackTr::push_slice_const_at`]. The limbs are
+/// built with shifts and ors rather than `u64::from_be_bytes`, because this target has no
+/// `rev8` and the byte reversal is ~19 instructions per limb.
+///
+/// # Safety
+///
+/// `dst` must be writable for one word, `src` readable for `N` bytes, and `N` in `1..=32`.
+#[inline(always)]
+unsafe fn write_be_word<const N: usize>(dst: *mut U256, src: *const u8) {
+    debug_assert!(N >= 1 && N <= 32);
+    let dst = dst.cast::<u64>();
+    let mut k = 0;
+    while k < 4 {
+        // Limb `k` holds bytes `N-1-8k ..= N-8k-8` of the big-endian value.
+        let mut v = 0u64;
+        let mut j = 0;
+        while j < 8 {
+            let from_end = k * 8 + j;
+            if from_end < N {
+                v |= (unsafe { *src.add(N - 1 - from_end) } as u64) << (8 * j);
+            }
+            j += 1;
+        }
+        unsafe { dst.add(k).write(v) };
+        k += 1;
+    }
+}
+
+/// Swaps two distinct, live stack words.
+///
+/// Four typed limb moves, not `ptr::swap_nonoverlapping`: that swaps through `*mut u8`,
+/// which loses `U256`'s 8-byte alignment. On a target without misaligned scalar memory
+/// access (pico's `riscv64im-pico-zkvm-elf`) LLVM then expands the 32-byte swap into 64
+/// `lbu` + 64 `sb`. Measured on block 24006677, that made `Stack::exchange` 140.3 M of
+/// 1018.2 M retired instructions, 91 % of them byte loads/stores. Moving the four limbs by
+/// hand also avoids the 32-byte frame slot a `U256` temporary reserves.
+///
+/// # Safety
+///
+/// Both pointers must be live, aligned stack words, and must not overlap.
+#[inline(always)]
+unsafe fn swap_words(p1: *mut U256, p2: *mut U256) {
+    unsafe {
+        let a = p1.cast::<u64>();
+        let b = p2.cast::<u64>();
+        let (a0, a1, a2, a3) = (a.read(), a.add(1).read(), a.add(2).read(), a.add(3).read());
+        let (b0, b1, b2, b3) = (b.read(), b.add(1).read(), b.add(2).read(), b.add(3).read());
+        a.write(b0);
+        a.add(1).write(b1);
+        a.add(2).write(b2);
+        a.add(3).write(b3);
+        b.write(a0);
+        b.add(1).write(a1);
+        b.add(2).write(a2);
+        b.add(3).write(a3);
+    }
 }
 
 impl Stack {
@@ -226,7 +424,7 @@ impl Stack {
         let bl = self.byte_len;
         // SAFETY: type invariant of `Stack`; every write to `byte_len` moves it by a whole
         // `WORD` and is bounds-checked against `BYTE_LIMIT` first.
-        unsafe { core::hint::assert_unchecked(bl % WORD == 0 && bl <= BYTE_LIMIT) };
+        unsafe { core::hint::assert_unchecked(bl.is_multiple_of(WORD) && bl <= BYTE_LIMIT) };
         bl
     }
 
@@ -252,6 +450,27 @@ impl Stack {
             self.base_mut()
                 .cast::<u8>()
                 .add(self.byte_len())
+                .cast::<U256>()
+        }
+    }
+
+    /// Pointer one past the topmost word, for a cursor the caller is carrying itself.
+    ///
+    /// Same `add` as [`Stack::top_mut`], but off the caller's register instead of a
+    /// re-loaded `byte_len`.
+    ///
+    /// # Safety
+    ///
+    /// `sp` must be a live cursor, i.e. `sp + WORD` a multiple of [`WORD`] no greater than
+    /// [`BYTE_LIMIT`].
+    #[inline(always)]
+    unsafe fn end_at(&mut self, sp: usize) -> *mut U256 {
+        // SAFETY: `sp + WORD` is within the inline buffer by the caller's contract, and the
+        // constant folds into the displacement of whatever load or store uses this.
+        unsafe {
+            self.base_mut()
+                .cast::<u8>()
+                .add(sp.wrapping_add(WORD))
                 .cast::<U256>()
         }
     }
@@ -458,31 +677,7 @@ impl Stack {
         // SAFETY: `n` and `n_m` are checked to be within bounds, and they don't overlap.
         unsafe {
             let top = self.top_mut().sub(1);
-            let (p1, p2) = (top.sub(n), top.sub(n_m_index));
-            // Three typed moves, not `ptr::swap_nonoverlapping`: that swaps through
-            // `*mut u8`, which loses `U256`'s 8-byte alignment. On a target without
-            // misaligned scalar memory access (pico's `riscv64im-pico-zkvm-elf`) LLVM then
-            // expands the 32-byte swap into 64 `lbu` + 64 `sb`. Measured on block 24006677,
-            // that made this function 140.3 M of 1018.2 M retired instructions, 91 % of them
-            // byte loads/stores. Reading and writing `U256` keeps the alignment, so the same
-            // swap is 4 `ld` + 4 `sd`. The pointers are known not to overlap, so the single
-            // temporary is the whole cost.
-            // Swapping through a `U256` temporary makes LLVM reserve a 32-byte frame slot
-            // that it then promotes away, leaving a dead `addi sp` pair (2 of the 25
-            // retired instructions of `SWAP1`). Moving the four limbs by hand keeps the
-            // 8 `ld` + 8 `sd` and drops the frame.
-            let a = p1.cast::<u64>();
-            let b = p2.cast::<u64>();
-            let (a0, a1, a2, a3) = (a.read(), a.add(1).read(), a.add(2).read(), a.add(3).read());
-            let (b0, b1, b2, b3) = (b.read(), b.add(1).read(), b.add(2).read(), b.add(3).read());
-            a.write(b0);
-            a.add(1).write(b1);
-            a.add(2).write(b2);
-            a.add(3).write(b3);
-            b.write(a0);
-            b.add(1).write(a1);
-            b.add(2).write(a2);
-            b.add(3).write(a3);
+            swap_words(top.sub(n), top.sub(n_m_index));
         }
         true
     }
@@ -509,23 +704,9 @@ impl Stack {
         // SAFETY: capacity is at least `STACK_LIMIT` and the length is below it, so one more
         // word fits; `N` bytes at `src` are readable by the caller's contract.
         unsafe {
-            let dst = self.top_mut().cast::<u64>();
+            let dst = self.top_mut();
             self.byte_len += WORD;
-            let mut k = 0;
-            while k < 4 {
-                // Limb `k` holds bytes `N-1-8k ..= N-8k-8` of the big-endian value.
-                let mut v = 0u64;
-                let mut j = 0;
-                while j < 8 {
-                    let from_end = k * 8 + j;
-                    if from_end < N {
-                        v |= (*src.add(N - 1 - from_end) as u64) << (8 * j);
-                    }
-                    j += 1;
-                }
-                dst.add(k).write(v);
-                k += 1;
-            }
+            write_be_word::<N>(dst, src);
         }
         true
     }
@@ -698,6 +879,74 @@ mod tests {
             core::ptr::write_bytes(stack.base_mut(), 0xff, STACK_LIMIT);
         }
         f(&mut stack);
+    }
+
+    /// The biased cursor: what `sp()` returns, what `set_sp` stores, and that the threaded
+    /// `*_at` operations agree with the length-carrying ones word for word.
+    ///
+    /// The two representations meet in exactly two places (`sp` and `set_sp`), and a cursor
+    /// that means something different in two places is a silent wrong answer rather than a
+    /// crash, so it is worth pinning down here. Every case runs on the 0xff-filled buffer, so
+    /// an `_at` operation that reads a word the length says is not there shows up as garbage.
+    #[test]
+    fn threaded_cursor_agrees_with_the_length() {
+        // Empty: the cursor is one word *below* the buffer, wrapped.
+        run(|stack| {
+            assert_eq!(stack.sp(), usize::MAX - (WORD - 1));
+            assert_eq!(stack.sp() as isize, -(WORD as isize));
+            assert!(stack.sp() % WORD == 0);
+            // Too shallow for one operand, which is the sign test.
+            assert!((stack.sp() as isize) <= too_shallow_for(1));
+        });
+
+        for len in 0..=STACK_LIMIT {
+            run(|stack| {
+                for i in 0..len {
+                    assert!(stack.push(U256::from(i)));
+                }
+                let sp = stack.sp();
+                // The cursor is the byte offset of the topmost word.
+                assert_eq!(sp, (len * WORD).wrapping_sub(WORD));
+                assert_eq!(sp % WORD, 0);
+                // The invariant `Interpreter::run_plain` asserts, and the range it holds.
+                assert!((sp as isize) >= -(WORD as isize));
+                assert!((sp as isize) <= (BYTE_LIMIT - WORD) as isize);
+                // Round trip.
+                unsafe { stack.set_sp(sp) };
+                assert_eq!(stack.len(), len);
+                assert_eq!(stack.sp(), sp);
+
+                // The depth tests, against the length they are standing in for.
+                for words in 1..=4 {
+                    assert_eq!(
+                        (sp as isize) <= too_shallow_for(words),
+                        len < words,
+                        "len {len}, words {words}"
+                    );
+                }
+                // "Full" is the cursor's own top, not the length's.
+                assert_eq!(sp == BYTE_LIMIT - WORD, len == STACK_LIMIT);
+
+                // `*_at` reads the same words the plain operations do.
+                if len >= 1 {
+                    assert_eq!(unsafe { *stack.peek_at(sp, 0) }, U256::from(len - 1));
+                    assert_eq!(*unsafe { stack.top_at(sp) }, U256::from(len - 1));
+                }
+                if len >= 2 {
+                    assert_eq!(unsafe { *stack.peek_at(sp, 1) }, U256::from(len - 2));
+                    let [a, b] = unsafe { stack.popn_at::<2>(sp) };
+                    assert_eq!((a, b), (U256::from(len - 1), U256::from(len - 2)));
+                    let ([c], top) = unsafe { stack.popn_top_at::<1>(sp) };
+                    assert_eq!((c, *top), (U256::from(len - 1), U256::from(len - 2)));
+                }
+                if len < STACK_LIMIT {
+                    unsafe { stack.push_at(sp, U256::MAX) };
+                    unsafe { stack.set_sp(sp.wrapping_add(WORD)) };
+                    assert_eq!(stack.len(), len + 1);
+                    assert_eq!(stack.data()[len], U256::MAX);
+                }
+            });
+        }
     }
 
     #[test]

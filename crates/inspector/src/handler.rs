@@ -119,7 +119,8 @@ where
                 ItemOrResult::Result(result) => result,
             };
 
-            if let Some(result) = evm.frame_return_result(result)? {
+            let mut result = result;
+            if evm.frame_return_result(&mut result)? {
                 return Ok(result);
             }
         }

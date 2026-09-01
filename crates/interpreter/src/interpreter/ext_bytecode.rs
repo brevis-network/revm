@@ -1,8 +1,8 @@
-use super::{Immediates, Jumps, LegacyBytecode};
+use super::{Immediates, JumpCtx, Jumps, LegacyBytecode};
 use crate::{interpreter_types::LoopControl, InterpreterAction};
 use bytecode::{utils::read_u16, Bytecode};
 use core::ops::Deref;
-use primitives::B256;
+use primitives::{MaybeB256, B256};
 
 #[cfg(feature = "serde")]
 mod serde;
@@ -15,9 +15,12 @@ pub struct ExtBytecode {
     /// Whether the execution should continue.
     continue_execution: bool,
     /// Bytecode Keccak-256 hash.
-    /// This is `None` if it hasn't been calculated yet.
+    /// This is absent if it hasn't been calculated yet.
     /// Since it's not necessary for execution, it's not calculated by default.
-    bytecode_hash: Option<B256>,
+    ///
+    /// [`MaybeB256`] rather than `Option<B256>` so the 32 bytes land somewhere the compiler
+    /// knows is 8-aligned; see there.
+    bytecode_hash: MaybeB256,
     /// Actions that the EVM should do. It contains return value of the Interpreter or inputs for `CALL` or `CREATE` instructions.
     /// For `RETURN` or `REVERT` instructions it contains the result of the instruction.
     pub action: Option<InterpreterAction>,
@@ -52,14 +55,30 @@ impl ExtBytecode {
     /// Creates new `ExtBytecode` with the given hash.
     #[inline]
     pub fn new_with_hash(base: Bytecode, hash: B256) -> Self {
-        // Not `new_with_optional_hash(base, Some(hash))`: building that `Some` is a 32-byte
-        // copy into a 1-aligned payload, i.e. a `memcpy` libcall, once per call frame.
-        let instruction_pointer = base.bytecode_ptr();
-        // SAFETY: every field is initialized exactly once below.
+        // SAFETY: `write_with_hash` initializes every field, so `assume_init` sees a fully
+        // initialized `Self`.
         unsafe {
             let mut me = core::mem::MaybeUninit::<Self>::uninit();
-            let p = me.as_mut_ptr();
-            primitives::write_some_b256(
+            Self::write_with_hash(me.as_mut_ptr(), base, hash);
+            me.assume_init()
+        }
+    }
+
+    /// Writes a fresh `ExtBytecode` over `base` into `p`, one field at a time.
+    ///
+    /// Not `write_with_optional_hash(p, base, Some(hash))`: building that `Some` is a
+    /// 32-byte copy into a 1-aligned payload, i.e. a `memcpy` libcall, once per call frame.
+    ///
+    /// # Safety
+    /// `p` must point at writable, properly aligned storage for a `Self` that holds no live
+    /// value - uninitialized, or already dropped.
+    #[inline(always)]
+    unsafe fn write_with_hash(p: *mut Self, base: Bytecode, hash: B256) {
+        let instruction_pointer = base.bytecode_ptr();
+        // SAFETY: `p` is writable storage for a `Self` per the contract, and every field is
+        // initialized exactly once below.
+        unsafe {
+            MaybeB256::write_some(
                 core::ptr::addr_of_mut!((*p).bytecode_hash),
                 core::ptr::addr_of!(hash).cast::<u8>(),
             );
@@ -67,33 +86,72 @@ impl ExtBytecode {
             core::ptr::addr_of_mut!((*p).instruction_pointer).write(instruction_pointer);
             core::ptr::addr_of_mut!((*p).action).write(None);
             core::ptr::addr_of_mut!((*p).continue_execution).write(true);
-            me.assume_init()
         }
     }
 
     /// Creates new `ExtBytecode` with the given hash.
     #[inline]
     pub fn new_with_optional_hash(base: Bytecode, hash: Option<B256>) -> Self {
-        let instruction_pointer = base.bytecode_ptr();
-        // Written field by field so the `Option<B256>` payload goes through
-        // `write_some_b256` rather than a `memcpy` libcall; this runs once per call frame.
-        // SAFETY: every field is initialized exactly once below, so `assume_init` sees a
+        // SAFETY: `write_with_optional_hash` initializes every field, so `assume_init` sees a
         // fully initialized `Self`.
         unsafe {
             let mut me = core::mem::MaybeUninit::<Self>::uninit();
-            let p = me.as_mut_ptr();
+            Self::write_with_optional_hash(me.as_mut_ptr(), base, hash);
+            me.assume_init()
+        }
+    }
+
+    /// Writes a fresh `ExtBytecode` over `base` into `p`, one field at a time, so the
+    /// `Option<B256>` payload goes through `write_some_b256` rather than a `memcpy` libcall.
+    ///
+    /// # Safety
+    /// `p` must point at writable, properly aligned storage for a `Self` that holds no live
+    /// value - uninitialized, or already dropped.
+    #[inline(always)]
+    unsafe fn write_with_optional_hash(p: *mut Self, base: Bytecode, hash: Option<B256>) {
+        let instruction_pointer = base.bytecode_ptr();
+        // SAFETY: `p` is writable storage for a `Self` per the contract, and every field is
+        // initialized exactly once below.
+        unsafe {
             match hash {
-                Some(h) => primitives::write_some_b256(
+                Some(h) => MaybeB256::write_some(
                     core::ptr::addr_of_mut!((*p).bytecode_hash),
                     core::ptr::addr_of!(h).cast::<u8>(),
                 ),
-                None => core::ptr::addr_of_mut!((*p).bytecode_hash).write(None),
+                None => core::ptr::addr_of_mut!((*p).bytecode_hash).write(MaybeB256::NONE),
             }
             core::ptr::addr_of_mut!((*p).base).write(base);
             core::ptr::addr_of_mut!((*p).instruction_pointer).write(instruction_pointer);
             core::ptr::addr_of_mut!((*p).action).write(None);
             core::ptr::addr_of_mut!((*p).continue_execution).write(true);
-            me.assume_init()
+        }
+    }
+
+    /// Replaces the `ExtBytecode` at `dst` with a fresh one over `base`.
+    ///
+    /// `Interpreter::clear` used to take the new value by parameter and assign it, which is a
+    /// 184-byte `memcpy` libcall per call frame - and a pointless one, because
+    /// [`Self::new_with_hash`] already writes every field one at a time and only the
+    /// destination was a stack slot rather than the interpreter's own field. Same reasoning
+    /// as the `input` parameter `Interpreter::clear` does not have.
+    #[inline]
+    pub fn replace_with_hash(dst: &mut Self, base: Bytecode, hash: B256) {
+        // SAFETY: `dst` is a live, aligned `Self`; it is dropped and then every one of its
+        // fields is written again before this returns, with nothing fallible in between, so
+        // it holds exactly one live value at every point an observer could look.
+        unsafe {
+            core::ptr::drop_in_place(dst);
+            Self::write_with_hash(dst, base, hash);
+        }
+    }
+
+    /// [`Self::replace_with_hash`] for a hash that may not have been calculated yet.
+    #[inline]
+    pub fn replace_with_optional_hash(dst: &mut Self, base: Bytecode, hash: Option<B256>) {
+        // SAFETY: as in `replace_with_hash`.
+        unsafe {
+            core::ptr::drop_in_place(dst);
+            Self::write_with_optional_hash(dst, base, hash);
         }
     }
 
@@ -103,23 +161,26 @@ impl ExtBytecode {
     #[inline]
     pub fn calculate_hash(&mut self) -> B256 {
         let hash = self.base.hash_slow();
-        self.bytecode_hash = Some(hash);
+        self.bytecode_hash = MaybeB256::some(&hash);
         hash
     }
 
     /// Returns the bytecode hash.
     #[inline]
     pub fn hash(&mut self) -> Option<B256> {
-        self.bytecode_hash
+        self.bytecode_hash.get()
     }
 
     /// Returns the bytecode hash or calculates it if it is not set.
     #[inline]
     pub fn get_or_calculate_hash(&mut self) -> B256 {
-        *self.bytecode_hash.get_or_insert_with(
-            #[cold]
-            || self.base.hash_slow(),
-        )
+        if self.bytecode_hash.is_some() {
+            // SAFETY-free fast path: `is_some`, so `get` is `Some`.
+            return self.bytecode_hash.get().unwrap_or_default();
+        }
+        let hash = self.base.hash_slow();
+        self.bytecode_hash = MaybeB256::some(&hash);
+        hash
     }
 }
 
@@ -178,6 +239,36 @@ impl Jumps for ExtBytecode {
             .legacy_jump_table()
             .expect("Panic if not legacy")
             .is_valid(offset)
+    }
+
+    #[inline]
+    fn jump_ctx(&self) -> JumpCtx {
+        // A non-legacy bytecode has no bitmap. `table_len == 0` rejects every target, which
+        // is what `is_valid_legacy_jump` would have meant if it did not panic; `run_plain`
+        // reads this once per frame, including for frames that never execute a jump, so
+        // panicking here would fire for bytecode the old path never asked about.
+        match self.base.legacy_jump_table() {
+            Some(table) => JumpCtx {
+                table_ptr: table.table_ptr(),
+                table_len: table.len(),
+                code_base: self.base.bytes_ref().as_ptr(),
+            },
+            None => JumpCtx::EMPTY,
+        }
+    }
+
+    #[inline]
+    fn is_valid_legacy_jump_with(&mut self, ctx: JumpCtx, offset: usize) -> bool {
+        // Same expression as `JumpTable::is_valid`, off the hoisted copy.
+        offset < ctx.table_len
+            && unsafe { *ctx.table_ptr.add(offset >> 3) & (1 << (offset & 7)) != 0 }
+    }
+
+    #[inline]
+    fn absolute_ip_with(&self, ctx: JumpCtx, offset: usize) -> *const u8 {
+        // SAFETY: the caller has checked `offset` against the bitmap, whose length is the
+        // unpadded bytecode length, so `code_base + offset` is inside the padded bytes.
+        unsafe { ctx.code_base.add(offset) }
     }
 
     #[inline]
@@ -255,6 +346,8 @@ mod tests {
         let bytecode = Bytecode::new_raw(Bytes::from(&[0x60, 0x00][..]));
         let hash = bytecode.hash_slow();
         let ext_bytecode = ExtBytecode::new_with_hash(bytecode.clone(), hash);
-        assert_eq!(ext_bytecode.bytecode_hash, Some(hash));
+        assert_eq!(ext_bytecode.bytecode_hash.get(), Some(hash));
+        assert!(ext_bytecode.bytecode_hash.is_some());
+        assert_eq!(ExtBytecode::new(bytecode).bytecode_hash.get(), None);
     }
 }

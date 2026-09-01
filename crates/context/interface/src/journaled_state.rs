@@ -10,6 +10,7 @@ use crate::{
 };
 use core::ops::{Deref, DerefMut};
 use database_interface::Database;
+use primitives::AlignedAddress;
 use primitives::{
     hardfork::SpecId, Address, Bytes, HashMap, HashSet, Log, StorageKey, StorageValue, B256, U256,
 };
@@ -121,10 +122,13 @@ pub trait JournalTr {
     ) -> Result<Option<TransferError>, <Self::Database as Database>::Error>;
 
     /// Transfers the balance from one account to another. Assume form and to are loaded.
+    ///
+    /// The addresses come in pre-aligned: this sits on the hot path of every value-bearing
+    /// CALL and hashes both of them, and `Address` is align-1. See [`AlignedAddress`].
     fn transfer_loaded(
         &mut self,
-        from: Address,
-        to: Address,
+        from: AlignedAddress,
+        to: AlignedAddress,
         balance: U256,
     ) -> Option<TransferError>;
 

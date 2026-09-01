@@ -1,5 +1,5 @@
 use core::cmp::Ordering;
-use primitives::U256;
+use primitives::{u256_eq, u256_is_zero, U256};
 
 /// Represents the sign of a 256-bit signed integer value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -40,7 +40,7 @@ pub fn i256_sign(val: &U256) -> Sign {
         Sign::Minus
     } else {
         // SAFETY: false == 0 == Zero, true == 1 == Plus
-        unsafe { core::mem::transmute::<bool, Sign>(!val.is_zero()) }
+        unsafe { core::mem::transmute::<bool, Sign>(!u256_is_zero(val)) }
     }
 }
 
@@ -96,7 +96,7 @@ pub fn i256_div(mut first: U256, mut second: U256) -> U256 {
     }
 
     let first_sign = i256_sign_compl(&mut first);
-    if first == MIN_NEGATIVE_VALUE && second == U256::from(1) {
+    if u256_eq(&first, &MIN_NEGATIVE_VALUE) && u256_eq(&second, &U256::from(1)) {
         return two_compl(MIN_NEGATIVE_VALUE);
     }
 

@@ -163,6 +163,15 @@ impl JumpTable {
         }
     }
 
+    /// The cached pointer to the table's bytes.
+    ///
+    /// Exposed so that a caller running many jumps against the same bytecode can hoist it
+    /// out of its loop; see `JumpCtx` in the interpreter.
+    #[inline]
+    pub fn table_ptr(&self) -> *const u8 {
+        self.table_ptr
+    }
+
     /// Checks if `pc` is a valid jump destination.
     /// Uses cached pointer and bit operations for faster access
     #[inline]

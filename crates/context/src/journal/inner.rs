@@ -14,18 +14,139 @@ use database_interface::Database;
 use primitives::{
     hardfork::SpecId::{self, *},
     hash_map::Entry,
-    Address, HashMap, Log, StorageKey, StorageValue, B256, KECCAK_EMPTY, U256,
+    Address, AlignedAddress, HashMap, Log, StorageKey, StorageValue, B256, KECCAK_EMPTY, U256,
 };
 use state::{Account, EvmState, EvmStorageSlot, TransientStorage};
 use std::vec::Vec;
+/// The account [`JournalInner::sload_slot`] resolved last, and where it lives.
+///
+/// Every SLOAD and SSTORE in a call frame targets the same address - the executing
+/// contract's - so the account lookup that opens `sload_slot` finds the same bucket over and
+/// over. It is not cheap: hashing the address and walking hashbrown's control bytes measured
+/// at ~90 of the ~232 retired instructions `sload_slot` spends per call.
+///
+/// `ptr` is a `usize` rather than a `*mut Account` so that `JournalInner` keeps its auto
+/// traits; zero means empty.
+///
+/// The address is kept as the three words it is made of rather than as an
+/// [`AlignedAddress`], so that comparing it against a candidate is three loads and three
+/// compares. Re-homing the candidate into an `AlignedAddress` first and comparing that
+/// measured 14 instructions more per call: `Address` is `[u8; 20]`, so LLVM materializes the
+/// copy as scalars and then reassembles the two words out of 32-bit halves.
+///
+/// # Safety
+///
+/// A non-zero `ptr` must point at the `Account` stored under `addr` in
+/// [`JournalInner::state`]. A `hashbrown` bucket pointer survives `get`/`get_mut` and
+/// survives a `remove`, but not a growth or an in-place rehash, and neither of those is
+/// observable from outside the table - so the cache must be emptied at every point where the
+/// table can restructure.
+///
+/// Seven places clear, for four different reasons.
+///
+/// *It restructures here.* Two sites: the vacant arm of
+/// [`JournalInner::load_account_mut_optional_code`] -- the module's only `insert` -- and
+/// [`JournalInner::finalize`], which takes the map out.
+///
+/// *It hands the map to someone who might.* [`JournalEntryTr::revert`] receives a bare
+/// `&mut EvmState`, and it is a *trait* method - the stock entry only ever `get_mut`s, but
+/// nothing in the type system says an implementor must, and the private field does not help
+/// because that reference goes past the accessor. That is `discard_tx`, and
+/// `checkpoint_revert` inside its `journal_i` guard, the only place a `revert` can run.
+/// [`JournalInner::state`] belongs here too: it returns `&mut self.state` wholesale, so the
+/// caller can do anything at all to the table.
+///
+/// *Nothing could be cached anyway.* One site: `sload_slot`, on the arm where the address is
+/// not 8-aligned and so cannot be read as words. Discretionary, like `commit_tx` -- that path
+/// only reaches the map through `get_mut`, so no bucket moves. Note it discards the entry for
+/// the *previous* address, which a later lookup could still have matched: a small
+/// pessimisation, not a required clear.
+///
+/// *Hygiene.* `commit_tx` clears once per transaction without needing to, to keep the window
+/// in which a bucket pointer is live short.
+///
+/// What is left - every other method here - reaches the map through
+/// `get`/`get_mut`/`entry`-occupied, none of which can move a bucket. A new method that
+/// hands out `&mut EvmState`, or that can insert, needs a clear and belongs on this list.
+#[derive(Debug, Default)]
+pub struct AccountCache {
+    w0: u64,
+    w1: u64,
+    w2: u32,
+    ptr: usize,
+}
+
+impl AccountCache {
+    /// Empties the cache.
+    #[inline(always)]
+    fn clear(&mut self) {
+        self.ptr = 0;
+    }
+
+    /// The 20 bytes of `address` as three words, or `None` if they cannot be read that way.
+    ///
+    /// `Address` is `[u8; 20]` with alignment 1, so a wide read needs a runtime check; where
+    /// it fails the caller skips the cache rather than paying twenty byte loads to consult
+    /// it. On this guest the check has not been observed to fail - the addresses reaching
+    /// `sload_slot` are 8-aligned - so the fallback is a correctness arm, not a fast path.
+    #[inline(always)]
+    fn address_words(address: &Address) -> Option<(u64, u64, u32)> {
+        let p = address.as_ptr();
+        if (p as usize).is_multiple_of(core::mem::align_of::<u64>()) {
+            // SAFETY: 20 readable bytes, and this arm is only taken when the start is
+            // 8-aligned, so the reads at 0, 8 and 16 are naturally aligned and in bounds.
+            unsafe {
+                Some((
+                    p.cast::<u64>().read(),
+                    p.add(8).cast::<u64>().read(),
+                    p.add(16).cast::<u32>().read(),
+                ))
+            }
+        } else {
+            None
+        }
+    }
+}
+
+/// A clone gets a fresh map with a different allocation, so it must not inherit the pointer.
+/// Hand-written rather than derived for that reason.
+impl Clone for AccountCache {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+/// A cache is not part of the journal's logical state, so two `JournalInner`s that differ
+/// only in it are equal.
+impl PartialEq for AccountCache {
+    #[inline]
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for AccountCache {}
+
 /// Inner journal state that contains journal and state changes.
 ///
 /// Spec Id is a essential information for the Journal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct JournalInner<ENTRY> {
-    /// The current state
-    pub state: EvmState,
+    /// The current state.
+    ///
+    /// Private, and reachable from outside this module only through [`Self::state`] and
+    /// [`Self::state_ref`]. `account_cache` holds a `hashbrown` bucket pointer into this
+    /// map, and that pointer does not survive a growth or an in-place rehash - neither of
+    /// which is observable from outside the table - so every path that can restructure the
+    /// map has to empty the cache first. [`Self::state`] does; a `pub` field would let a
+    /// caller insert without going past it, and the result of that is not a panic but a
+    /// wrong state root. Keeping the field private is what makes the outside half of the
+    /// [`AccountCache`] contract a compile-time property rather than a convention: the name
+    /// appears only in its declaration, in the two accessors, and in this module's own uses,
+    /// which are audited in the [`AccountCache`] safety note.
+    state: EvmState,
     /// Transient storage that is discarded after every transaction.
     ///
     /// See [EIP-1153](https://eips.ethereum.org/EIPS/eip-1153).
@@ -57,6 +178,12 @@ pub struct JournalInner<ENTRY> {
     pub spec: SpecId,
     /// Warm addresses containing both coinbase and current precompiles.
     pub warm_addresses: WarmAddresses,
+    /// The account `sload_slot` resolved last; see [`AccountCache`].
+    ///
+    /// Not serialized: it is a cache over the map above, and a deserialized `JournalInner`
+    /// gets a fresh allocation, so it has to start empty.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    account_cache: AccountCache,
 }
 
 impl<ENTRY: JournalEntryTr> Default for JournalInner<ENTRY> {
@@ -80,6 +207,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             depth: 0,
             spec: SpecId::default(),
             warm_addresses: WarmAddresses::new(),
+            account_cache: AccountCache::default(),
         }
     }
 
@@ -108,10 +236,14 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             transaction_id,
             spec,
             warm_addresses,
+            account_cache,
         } = self;
         // Spec precompiles and state are not changed. It is always set again execution.
         let _ = spec;
         let _ = state;
+        // The map itself is untouched here; emptying the cache once per transaction costs
+        // one store and keeps the window in which a bucket pointer is live short.
+        account_cache.clear();
         transient_storage.clear();
         *depth = 0;
 
@@ -137,7 +269,11 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             transaction_id,
             spec,
             warm_addresses,
+            account_cache,
         } = self;
+        // Required, not hygiene: `revert` is a trait method handed a bare `&mut EvmState`,
+        // so an implementor may insert and move a bucket. See the note on `AccountCache`.
+        account_cache.clear();
         let is_spurious_dragon_enabled = spec.is_enabled_in(SPURIOUS_DRAGON);
         // iterate over all journals entries and revert our global state
         journal.drain(..).rev().for_each(|entry| {
@@ -169,7 +305,10 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             transaction_id,
             spec,
             warm_addresses,
+            account_cache,
         } = self;
+        // Required: the map is moved out below, so every bucket pointer dies here.
+        account_cache.clear();
         // Spec is not changed. And it is always set again in execution.
         let _ = spec;
         // Clear coinbase address warming for next tx
@@ -189,9 +328,23 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     }
 
     /// Return reference to state.
+    ///
+    /// Empties the account cache: the caller gets a `&mut EvmState` and may insert through
+    /// it. The cache cannot be consulted while that borrow lives - reading it needs `&self`,
+    /// which this `&mut self` excludes - so clearing it here is enough.
     #[inline]
     pub fn state(&mut self) -> &mut EvmState {
+        self.account_cache.clear();
         &mut self.state
+    }
+
+    /// Return a shared reference to state.
+    ///
+    /// Does not touch the account cache, and does not need to: a `&EvmState` cannot insert,
+    /// so no bucket can move while it lives.
+    #[inline]
+    pub fn state_ref(&self) -> &EvmState {
+        &self.state
     }
 
     /// Sets SpecId.
@@ -314,12 +467,33 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     #[inline]
     pub fn transfer_loaded(
         &mut self,
-        from: Address,
-        to: Address,
+        from: AlignedAddress,
+        to: AlignedAddress,
         balance: U256,
     ) -> Option<TransferError> {
-        if from == to {
-            let from_balance = self.state.get_mut(&to).unwrap().info.balance;
+        // Keyed by `FastAddressAt` so the bucket comparison is word-wise rather than the
+        // 20-byte `memcmp` libcall `Address: PartialEq` lowers to; this function made 32,852
+        // of them on mainnet block 24006677, at ~39 retired instructions inside `memcmp`
+        // each.
+        //
+        // One lookup site per account, and its own tag for each, because the inline
+        // comparison makes the probe big enough for LLVM to want to outline it and the call
+        // then costs more than the `memcmp` did. Four sites sharing one tag measured at
+        // +586,870, and sharing `sload_slot`'s tag 0 at +1,351,731; see `FastAddressAt`.
+        // `to` is wanted on all three paths, so it is resolved up front.
+        //
+        // A raw pointer for the same reason as in `sload_slot`: the borrow would have to
+        // cover the `from` lookup and the journal pushes below. Nothing inserts into
+        // `self.state` here, so the bucket cannot move.
+        let to_account: *mut Account = self
+            .state
+            .get_mut(primitives::FastAddressAt::<1>::new(&to.0))
+            .unwrap();
+
+        if from.same(&to) {
+            // SAFETY: just derived from a live `&mut Account`; nothing has touched
+            // `self.state` since.
+            let from_balance = unsafe { (*to_account).info.balance };
             // Check if from balance is enough to transfer the balance.
             if balance > from_balance {
                 return Some(TransferError::OutOfFunds);
@@ -327,14 +501,21 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             return None;
         }
 
-        if balance.is_zero() {
-            Self::touch_account(&mut self.journal, to, self.state.get_mut(&to).unwrap());
+        // `U256::is_zero` is spelled `*self == Self::ZERO` upstream, so it is a 32-byte
+        // `memcmp` libcall on this target: 16,383 calls on mainnet block 24006677, one per
+        // value-carrying `CALL`. See `primitives::u256_is_zero`.
+        if primitives::u256_is_zero(&balance) {
+            // SAFETY: as above.
+            Self::touch_account(&mut self.journal, to.0, unsafe { &mut *to_account });
             return None;
         }
 
         // sub balance from
-        let from_account = self.state.get_mut(&from).unwrap();
-        Self::touch_account(&mut self.journal, from, from_account);
+        let from_account = self
+            .state
+            .get_mut(primitives::FastAddressAt::<2>::new(&from.0))
+            .unwrap();
+        Self::touch_account(&mut self.journal, from.0, from_account);
         let from_balance = &mut from_account.info.balance;
         let Some(from_balance_decr) = from_balance.checked_sub(balance) else {
             return Some(TransferError::OutOfFunds);
@@ -342,8 +523,9 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         *from_balance = from_balance_decr;
 
         // add balance to
-        let to_account = self.state.get_mut(&to).unwrap();
-        Self::touch_account(&mut self.journal, to, to_account);
+        // SAFETY: as above - the `from` lookup above is a lookup, so no bucket moved.
+        let to_account = unsafe { &mut *to_account };
+        Self::touch_account(&mut self.journal, to.0, to_account);
         let to_balance = &mut to_account.info.balance;
         let Some(to_balance_incr) = to_balance.checked_add(balance) else {
             // Overflow of U256 balance is not possible to happen on mainnet. We don't bother to return funds from from_acc.
@@ -353,7 +535,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
 
         // add journal entry
         self.journal
-            .push(ENTRY::balance_transfer(from, to, balance));
+            .push(ENTRY::balance_transfer(from.0, to.0, balance));
 
         None
     }
@@ -369,7 +551,11 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     ) -> Result<Option<TransferError>, DB::Error> {
         self.load_account(db, from)?;
         self.load_account(db, to)?;
-        Ok(self.transfer_loaded(from, to, balance))
+        Ok(self.transfer_loaded(
+            AlignedAddress::new(&from),
+            AlignedAddress::new(&to),
+            balance,
+        ))
     }
 
     /// Creates account or returns false if collision is detected.
@@ -471,6 +657,11 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
 
         // iterate over last N journals sets and revert our global state
         if checkpoint.journal_i < self.journal.len() {
+            // `JournalEntryTr::revert` gets a bare `&mut EvmState`, so an implementor may
+            // insert and reallocate the table behind the cached bucket pointer; `discard_tx`
+            // clears for the same reason. Inside the guard because that is the only place a
+            // `revert` runs, and this path is every reverting frame return.
+            self.account_cache.clear();
             self.journal
                 .drain(checkpoint.journal_i..)
                 .rev()
@@ -553,7 +744,8 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
 
         Ok(StateLoad {
             data: SelfDestructResult {
-                had_value: !balance.is_zero(),
+                // See the `transfer_loaded` comment: a `memcmp` libcall otherwise.
+                had_value: !primitives::u256_is_zero(&balance),
                 target_exists: !is_empty,
                 previously_destroyed: destroyed_status
                     == SelfdestructionRevertStatus::RepeatedSelfdestruction,
@@ -662,15 +854,41 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         load_code: bool,
         skip_cold_load: bool,
     ) -> Result<StateLoad<JournaledAccount<'_, ENTRY>>, JournalLoadError<DB::Error>> {
-        let load = match self.state.entry(address) {
-            Entry::Occupied(entry) => {
-                let account = entry.into_mut();
+        // The by-value `Address` argument sits in a slot LLVM treats as byte-aligned, and
+        // this function reads it four times over: to hash it, to journal it, and to build
+        // the returned `JournaledAccount`. Re-home it once; see `AlignedAddress`.
+        let address = AlignedAddress::new(&address);
+        // `entry` takes the key by value and compares it with `K: Eq`, so `Equivalent` cannot
+        // redirect the bucket comparison and it stays the 20-byte `memcmp` libcall
+        // `Address: PartialEq` lowers to - 32,786 of them on mainnet block 24006677, at ~39
+        // retired instructions each, on a function that is called 32,983 times and finds the
+        // account already there almost every time. `get_mut` can be keyed by
+        // `FastAddressAt`, and the insert then only has to exist on the path that misses.
+        //
+        // Tag 3, and this is its only call site: one query type shared between two sites
+        // makes LLVM outline hashbrown's probe and the call costs more than the `memcmp`;
+        // see `FastAddressAt`.
+        //
+        // A raw pointer rather than the `&mut Account` itself: the borrow it comes from would
+        // have to stay live across the vacant arm, which needs `self.state` again, and NLL
+        // cannot see that the two arms are exclusive. Exactly one reference is created from
+        // it and nothing touches `self.state` in between.
+        let occupied: Option<*mut Account> = self
+            .state
+            .get_mut(primitives::FastAddressAt::<3>::new(&address.0))
+            .map(|account| account as *mut Account);
+
+        let load = match occupied {
+            Some(account) => {
+                // SAFETY: derived from a live `&mut Account` just above, and nothing has
+                // touched `self.state` since.
+                let account = unsafe { &mut *account };
 
                 // skip load if account is cold.
                 let mut is_cold = account.is_cold_transaction_id(self.transaction_id);
                 if is_cold {
                     // account can be loaded by we still need to check warm_addresses to see if it is cold.
-                    let should_be_cold = self.warm_addresses.is_cold(&address);
+                    let should_be_cold = self.warm_addresses.is_cold(&address.0);
 
                     // dont load it cold if skipping cold load is true.
                     if should_be_cold && skip_cold_load {
@@ -695,22 +913,33 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
                     is_cold,
                 }
             }
-            Entry::Vacant(vac) => {
+            None => {
+                // Required: the insert below is the only one this module performs on the
+                // state map, so it is the only place a bucket pointer can be moved. Cleared
+                // before the insert rather than after so that no path out of this arm can
+                // skip it.
+                self.account_cache.clear();
                 // Precompiles among some other account(coinbase included) are warm loaded so we need to take that into account
-                let is_cold = self.warm_addresses.is_cold(&address);
+                let is_cold = self.warm_addresses.is_cold(&address.0);
 
                 // dont load cold account if skip_cold_load is true
                 if is_cold && skip_cold_load {
                     return Err(JournalLoadError::ColdLoadSkipped);
                 }
-                let account = if let Some(account) = db.basic(address)? {
+                let account = if let Some(account) = db.basic(address.0)? {
                     account.into()
                 } else {
                     Account::new_not_existing(self.transaction_id)
                 };
 
+                // `entry` only on this path, which is the rare one: it costs the `memcmp`
+                // the hit path no longer pays, and it is the only spelling that hands back a
+                // `&mut Account` for the value it inserted.
                 StateLoad {
-                    data: vac.insert(account),
+                    data: match self.state.entry(address.0) {
+                        Entry::Occupied(e) => e.into_mut(),
+                        Entry::Vacant(vac) => vac.insert(account),
+                    },
                     is_cold,
                 }
             }
@@ -718,7 +947,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
 
         // journal loading of cold account.
         if load.is_cold {
-            self.journal.push(ENTRY::account_warmed(address));
+            self.journal.push(ENTRY::account_warmed(address.0));
         }
 
         if load_code && load.data.info.code.is_none() {
@@ -731,7 +960,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             info.code = Some(code);
         }
 
-        Ok(load.map(|i| JournaledAccount::new(address, i, &mut self.journal)))
+        Ok(load.map(|i| JournaledAccount::new(address.0, i, &mut self.journal)))
     }
 
     /// Resolves a storage slot to a mutable reference, warming it and journaling the warm
@@ -746,8 +975,10 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     ///
     /// Panics if the account is not present in the state.
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn sload_slot<'a, DB: Database>(
         state: &'a mut EvmState,
+        account_cache: &mut AccountCache,
         warm_addresses: &WarmAddresses,
         journal: &mut Vec<ENTRY>,
         transaction_id: usize,
@@ -756,41 +987,128 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         key: StorageKey,
         skip_cold_load: bool,
     ) -> Result<StateLoad<&'a mut EvmStorageSlot>, JournalLoadError<DB::Error>> {
-        // assume acc is warm
-        let account = state.get_mut(&address).unwrap();
-
-        let is_newly_created = account.is_created();
-        let (slot, is_cold) = match account.storage.entry(key) {
-            Entry::Occupied(occ) => {
-                let slot = occ.into_mut();
-                // skip load if account is cold.
-                let is_cold = slot.is_cold_transaction_id(transaction_id);
-                if skip_cold_load && is_cold {
-                    return Err(JournalLoadError::ColdLoadSkipped);
-                }
-                slot.mark_warm_with_transaction_id(transaction_id);
-                (slot, is_cold)
+        // assume acc is warm.
+        //
+        // A raw pointer rather than a `&mut`: the slot returned on the hit path points into
+        // this account, so the borrow would have to live for `'a`, and NLL would then refuse
+        // to let the miss path name the account at all. Exactly one reference is ever created
+        // from the pointer, and nothing touches `state` in between.
+        //
+        // The lookup itself is skipped whenever this is the same account as last time, which
+        // it is for every SLOAD and SSTORE of a call frame after the first; see
+        // [`AccountCache`] for why a bucket pointer may be kept and where it is dropped.
+        //
+        // Keyed by `FastAddress` so the bucket comparison is word-wise; see there. This is
+        // the only site that uses it - a second caller of the same instantiation pushes
+        // `RawTable::find` past the inliner and it outlines, which costs more than it saves.
+        let words = AccountCache::address_words(&address);
+        let cached = match words {
+            Some((w0, w1, w2)) => {
+                account_cache.ptr != 0
+                    && account_cache.w0 == w0
+                    && account_cache.w1 == w1
+                    && account_cache.w2 == w2
             }
-            Entry::Vacant(vac) => {
-                // is storage cold
-                let is_cold = !warm_addresses.is_storage_warm(&address, &key);
-
-                if is_cold && skip_cold_load {
-                    return Err(JournalLoadError::ColdLoadSkipped);
-                }
-                // if storage was cleared, we don't need to ping db.
-                let value = if is_newly_created {
-                    StorageValue::ZERO
-                } else {
-                    db.storage(address, key)?
-                };
-
-                (
-                    vac.insert(EvmStorageSlot::new(value, transaction_id)),
-                    is_cold,
-                )
-            }
+            None => false,
         };
+        let account: *mut Account = if cached {
+            account_cache.ptr as *mut Account
+        } else {
+            let found: *mut Account = state
+                .get_mut(primitives::FastAddress::new(&address))
+                .unwrap();
+            match words {
+                Some((w0, w1, w2)) => {
+                    *account_cache = AccountCache {
+                        w0,
+                        w1,
+                        w2,
+                        ptr: found as usize,
+                    }
+                }
+                // Not cacheable: the address cannot be compared word-wise. Clears rather
+                // than keeps the previous address's entry -- a pessimisation, not a
+                // required clear; see the note on `AccountCache`.
+                None => account_cache.clear(),
+            }
+            found
+        };
+
+        // Hit path: the slot is already in the account's map. 76,069 of 76,821 calls on
+        // mainnet block 24006677 land here, so everything the miss path needs -- the database
+        // read, the insert, the access-list probe -- lives in `sload_slot_miss` instead.
+        // `HashMap::entry` would drag the insert-and-grow machinery in here as well, and it is
+        // that, not the work itself, that gave this function a 464-byte frame and twelve
+        // callee-saved registers to spill.
+        //
+        // SAFETY: `account` was just derived from a live `&mut Account`, and no other access
+        // to `state` happens before it is used.
+        // Keyed by `FastU256` so the bucket comparison is limb-wise rather than a 32-byte
+        // `memcmp` libcall; see there.
+        if let Some(slot) = unsafe { (*account).storage.get_mut(primitives::FastU256::new(&key)) } {
+            let is_cold = slot.is_cold_transaction_id(transaction_id);
+            if is_cold {
+                if skip_cold_load {
+                    return Err(JournalLoadError::ColdLoadSkipped);
+                }
+                // add it to journal as cold loaded.
+                journal.push(ENTRY::storage_warmed(address, key));
+            }
+            // `mark_warm_with_transaction_id` would recompute `is_cold_transaction_id`, which
+            // is the value already in hand.
+            slot.transaction_id = transaction_id;
+            slot.is_cold = false;
+            return Ok(StateLoad::new(slot, is_cold));
+        }
+
+        // SAFETY: as above -- the hit path above returned, so no reference derived from
+        // `account` is still live.
+        Self::sload_slot_miss(
+            unsafe { &mut *account },
+            warm_addresses,
+            journal,
+            transaction_id,
+            db,
+            address,
+            key,
+            skip_cold_load,
+        )
+    }
+
+    /// The half of [`Self::sload_slot`] that runs when the slot is not in the account's map
+    /// yet, which on mainnet block 24006677 is 752 calls out of 76,821.
+    ///
+    /// Out of line so the hit path carries neither its stack frame nor its register pressure.
+    #[inline(never)]
+    #[cold]
+    #[allow(clippy::too_many_arguments)]
+    fn sload_slot_miss<'a, DB: Database>(
+        account: &'a mut Account,
+        warm_addresses: &WarmAddresses,
+        journal: &mut Vec<ENTRY>,
+        transaction_id: usize,
+        db: &mut DB,
+        address: Address,
+        key: StorageKey,
+        skip_cold_load: bool,
+    ) -> Result<StateLoad<&'a mut EvmStorageSlot>, JournalLoadError<DB::Error>> {
+        // is storage cold
+        let is_cold = !warm_addresses.is_storage_warm(&address, &key);
+
+        if is_cold && skip_cold_load {
+            return Err(JournalLoadError::ColdLoadSkipped);
+        }
+        // if storage was cleared, we don't need to ping db.
+        let value = if account.is_created() {
+            StorageValue::ZERO
+        } else {
+            db.storage(address, key)?
+        };
+
+        let slot = account
+            .storage
+            .entry(key)
+            .or_insert(EvmStorageSlot::new(value, transaction_id));
 
         if is_cold {
             // add it to journal as cold loaded.
@@ -815,6 +1133,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     ) -> Result<StateLoad<StorageValue>, JournalLoadError<DB::Error>> {
         let Self {
             state,
+            account_cache,
             warm_addresses,
             journal,
             transaction_id,
@@ -822,6 +1141,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         } = self;
         let load = Self::sload_slot(
             state,
+            account_cache,
             warm_addresses,
             journal,
             *transaction_id,
@@ -830,7 +1150,19 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             key,
             skip_cold_load,
         )?;
-        Ok(StateLoad::new(load.data.present_value, load.is_cold))
+        // `StateLoad::new(slot.present_value, ..)` is a 32-byte move that LLVM lowers to a
+        // `memcpy` libcall on this target once the value has been through `Result`'s niche
+        // layout; at 62 K SLOADs per mainnet block it was the single most frequent `memcpy`
+        // call site in the guest. Storing four limbs states the alignment at the store.
+        // SAFETY: `p` points at a fresh, 8-aligned `StateLoad<StorageValue>`, and both of its
+        // fields are written exactly once below, so `assume_init` sees an initialized value.
+        Ok(unsafe {
+            let mut out = mem::MaybeUninit::<StateLoad<StorageValue>>::uninit();
+            let p = out.as_mut_ptr();
+            primitives::copy_u256(core::ptr::addr_of_mut!((*p).data), &load.data.present_value);
+            core::ptr::addr_of_mut!((*p).is_cold).write(load.is_cold);
+            out.assume_init()
+        })
     }
 
     /// Stores storage slot.
@@ -849,6 +1181,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     ) -> Result<StateLoad<SStoreResult>, JournalLoadError<DB::Error>> {
         let Self {
             state,
+            account_cache,
             warm_addresses,
             journal,
             transaction_id,
@@ -858,6 +1191,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // the journal push below, so neither the account nor the slot is looked up twice.
         let load = Self::sload_slot(
             state,
+            account_cache,
             warm_addresses,
             journal,
             *transaction_id,
@@ -870,8 +1204,9 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         let slot = load.data;
         let present = slot.present_value;
 
-        // new value is same as present, we don't need to do anything
-        if present != new {
+        // new value is same as present, we don't need to do anything.
+        // `!=` on `U256` is a memcmp libcall on the guest target; see `primitives::u256_eq`.
+        if !primitives::u256_eq(&present, &new) {
             journal.push(ENTRY::storage_changed(address, key, present));
             // insert value into present state.
             slot.present_value = new;
@@ -902,7 +1237,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     /// EIP-1153: Transient storage opcodes
     #[inline]
     pub fn tstore(&mut self, address: Address, key: StorageKey, new: StorageValue) {
-        let had_value = if new.is_zero() {
+        let had_value = if primitives::u256_is_zero(&new) {
             // if new values is zero, remove entry from transient storage.
             // if previous values was some insert it inside journal.
             // If it is none nothing should be inserted.
@@ -934,6 +1269,32 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     #[inline]
     pub fn log(&mut self, log: Log) {
         self.logs.push(log);
+    }
+}
+
+/// Builds an [`SStoreResult`] limb by limb.
+///
+/// The struct is three `U256`s, and the plain literal is a 96-byte copy that LLVM lowers to a
+/// `memcpy` libcall (~74 retired instructions) rather than the twelve `ld`/`sd` pairs it
+/// actually is. `SSTORE` runs ~15 K times per mainnet block.
+#[inline(always)]
+fn sstore_result(
+    original_value: StorageValue,
+    present_value: StorageValue,
+    new_value: StorageValue,
+) -> SStoreResult {
+    // SAFETY: all three fields are initialized exactly once below, and each is a `U256` at an
+    // 8-aligned offset of an 8-aligned struct.
+    unsafe {
+        let mut r = core::mem::MaybeUninit::<SStoreResult>::uninit();
+        let p = r.as_mut_ptr();
+        primitives::copy_u256(
+            core::ptr::addr_of_mut!((*p).original_value),
+            &original_value,
+        );
+        primitives::copy_u256(core::ptr::addr_of_mut!((*p).present_value), &present_value);
+        primitives::copy_u256(core::ptr::addr_of_mut!((*p).new_value), &new_value);
+        r.assume_init()
     }
 }
 
@@ -978,31 +1339,5 @@ mod tests {
         let state_load = result.unwrap();
         assert!(!state_load.is_cold); // Should be warm
         assert_eq!(state_load.data, U256::ZERO); // Empty slot
-    }
-}
-
-/// Builds an [`SStoreResult`] limb by limb.
-///
-/// The struct is three `U256`s, and the plain literal is a 96-byte copy that LLVM lowers to a
-/// `memcpy` libcall (~74 retired instructions) rather than the twelve `ld`/`sd` pairs it
-/// actually is. `SSTORE` runs ~15 K times per mainnet block.
-#[inline(always)]
-fn sstore_result(
-    original_value: StorageValue,
-    present_value: StorageValue,
-    new_value: StorageValue,
-) -> SStoreResult {
-    // SAFETY: all three fields are initialized exactly once below, and each is a `U256` at an
-    // 8-aligned offset of an 8-aligned struct.
-    unsafe {
-        let mut r = core::mem::MaybeUninit::<SStoreResult>::uninit();
-        let p = r.as_mut_ptr();
-        primitives::copy_u256(
-            core::ptr::addr_of_mut!((*p).original_value),
-            &original_value,
-        );
-        primitives::copy_u256(core::ptr::addr_of_mut!((*p).present_value), &present_value);
-        primitives::copy_u256(core::ptr::addr_of_mut!((*p).new_value), &new_value);
-        r.assume_init()
     }
 }

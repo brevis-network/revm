@@ -3,7 +3,7 @@ use core::{
     cmp::Ordering,
     hash::{Hash, Hasher},
 };
-use primitives::{B256, KECCAK_EMPTY, U256};
+use primitives::{b256_eq, b256_is_zero, u256_is_zero, B256, KECCAK_EMPTY, U256};
 
 /// Account information that contains balance, nonce, code hash and code
 ///
@@ -25,6 +25,19 @@ pub struct AccountInfo {
     /// By default, this is `Some(Bytecode::default())`.
     pub code: Option<Bytecode>,
 }
+
+/// [`AccountInfo::code_hash`] reads the field as four aligned `u64`s and writes 32 bytes into
+/// a `MaybeUninit<B256>`. That is sound exactly while the struct itself is 8-aligned, the
+/// field's offset is a multiple of 8, and `B256` is 32 bytes wide -- all three of which
+/// `repr(Rust)` happens to give it today but none of which it promises. Assert all three:
+/// checking only the offset would let a change that drops the struct's alignment (say
+/// `balance` ceasing to be a `U256`) through, leaving `code_hash()` doing misaligned `ld` on a
+/// target that has no misaligned scalar access.
+const _: () = assert!(
+    core::mem::align_of::<AccountInfo>().is_multiple_of(8)
+        && core::mem::offset_of!(AccountInfo, code_hash).is_multiple_of(8)
+        && core::mem::size_of::<B256>() == 32
+);
 
 impl Default for AccountInfo {
     fn default() -> Self {
@@ -230,8 +243,15 @@ impl AccountInfo {
     /// - nonce is zero
     #[inline]
     pub fn is_empty(&self) -> bool {
-        let code_empty = self.is_empty_code_hash() || self.code_hash.is_zero();
-        code_empty && self.balance.is_zero() && self.nonce == 0
+        // Word-wise rather than `==` / `is_zero`: all three of those lower to a `memcmp`
+        // libcall on the guest target, and this is the hottest such call site there (65 K per
+        // mainnet block, from `load_account_info_skip_cold_load`).
+        //
+        // The `KECCAK_EMPTY` arm compares against the constant's four words as immediates
+        // (`b256_is`, from branch m); the all-zero arm and the balance go through the
+        // or-reduced helpers (from branch n), which answer in one branch rather than four.
+        let code_empty = self.is_empty_code_hash() || b256_is_zero(&self.code_hash);
+        code_empty && u256_is_zero(&self.balance) && self.nonce == 0
     }
 
     /// Returns `true` if the account is not empty.
@@ -249,15 +269,37 @@ impl AccountInfo {
     /// Returns bytecode hash associated with this account.
     ///
     /// If account does not have code, it returns `KECCAK_EMPTY` hash.
+    ///
+    /// `B256` is `[u8; 32]` with alignment 1, so `self.code_hash` as a *value* expression is
+    /// 32 `lbu` plus the chain that reassembles them: measured at 1.96 M retired instructions
+    /// on mainnet block 24006677. `&self` is 8-aligned (`AccountInfo` contains a `U256`) and
+    /// the field sits at an 8-aligned offset -- asserted below, so a field reorder fails the
+    /// build rather than silently falling back -- which makes the copy four `ld`/`sd` pairs.
     #[inline]
     pub fn code_hash(&self) -> B256 {
-        self.code_hash
+        #[repr(align(8))]
+        struct Aligned(core::mem::MaybeUninit<B256>);
+        let mut out = Aligned(core::mem::MaybeUninit::uninit());
+        // SAFETY: `out.0` is 32 writable bytes at an 8-aligned address (the wrapper says so),
+        // `self.code_hash` is 32 readable bytes at an 8-aligned address (`&self` is 8-aligned
+        // and the offset is a multiple of 8, asserted above), the two do not overlap, and all
+        // 32 bytes are written before `assume_init`.
+        unsafe {
+            let d = out.0.as_mut_ptr().cast::<u64>();
+            let q = self.code_hash.0.as_ptr().cast::<u64>();
+            d.write(q.read());
+            d.add(1).write(q.add(1).read());
+            d.add(2).write(q.add(2).read());
+            d.add(3).write(q.add(3).read());
+            out.0.assume_init()
+        }
     }
 
     /// Returns true if the code hash is the Keccak256 hash of the empty string `""`.
     #[inline]
     pub fn is_empty_code_hash(&self) -> bool {
-        self.code_hash == KECCAK_EMPTY
+        // See the note in `is_empty`.
+        b256_eq(&self.code_hash, &KECCAK_EMPTY)
     }
 
     /// Takes bytecode from account.

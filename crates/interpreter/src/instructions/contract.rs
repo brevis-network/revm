@@ -114,7 +114,7 @@ pub fn call<WIRE: InterpreterTypes, H: Host + ?Sized>(
     let to = to.into_address();
     // Max gas limit is not possible in real ethereum situation.
     let local_gas_limit = u64::try_from(local_gas_limit).unwrap_or(u64::MAX);
-    let has_transfer = !value.is_zero();
+    let has_transfer = !primitives::u256_is_zero(&value);
 
     if context.interpreter.runtime_flag.is_static() && has_transfer {
         context
@@ -126,9 +126,15 @@ pub fn call<WIRE: InterpreterTypes, H: Host + ?Sized>(
     else {
         return;
     };
-    let Some((gas_limit, bytecode, bytecode_hash)) =
-        load_acc_and_calc_gas(&mut context, to, has_transfer, true, local_gas_limit)
-    else {
+    let mut known_bytecode = None;
+    let Some(gas_limit) = load_acc_and_calc_gas(
+        &mut context,
+        to,
+        has_transfer,
+        true,
+        local_gas_limit,
+        &mut known_bytecode,
+    ) else {
         return;
     };
 
@@ -142,7 +148,7 @@ pub fn call<WIRE: InterpreterTypes, H: Host + ?Sized>(
                 target_address: to,
                 caller: context.interpreter.input.target_address(),
                 bytecode_address: to,
-                known_bytecode: Some((bytecode_hash, bytecode)),
+                known_bytecode,
                 value: CallValue::Transfer(value),
                 scheme: CallScheme::Call,
                 is_static: context.interpreter.runtime_flag.is_static(),
@@ -161,16 +167,22 @@ pub fn call_code<WIRE: InterpreterTypes, H: Host + ?Sized>(
     let to = Address::from_word(B256::from(to));
     // Max gas limit is not possible in real ethereum situation.
     let local_gas_limit = u64::try_from(local_gas_limit).unwrap_or(u64::MAX);
-    let has_transfer = !value.is_zero();
+    let has_transfer = !primitives::u256_is_zero(&value);
 
     let Some((input, return_memory_offset)) = get_memory_input_and_out_ranges(context.interpreter)
     else {
         return;
     };
 
-    let Some((gas_limit, bytecode, bytecode_hash)) =
-        load_acc_and_calc_gas(&mut context, to, has_transfer, false, local_gas_limit)
-    else {
+    let mut known_bytecode = None;
+    let Some(gas_limit) = load_acc_and_calc_gas(
+        &mut context,
+        to,
+        has_transfer,
+        false,
+        local_gas_limit,
+        &mut known_bytecode,
+    ) else {
         return;
     };
 
@@ -184,7 +196,7 @@ pub fn call_code<WIRE: InterpreterTypes, H: Host + ?Sized>(
                 target_address: context.interpreter.input.target_address(),
                 caller: context.interpreter.input.target_address(),
                 bytecode_address: to,
-                known_bytecode: Some((bytecode_hash, bytecode)),
+                known_bytecode,
                 value: CallValue::Transfer(value),
                 scheme: CallScheme::CallCode,
                 is_static: context.interpreter.runtime_flag.is_static(),
@@ -210,9 +222,15 @@ pub fn delegate_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
         return;
     };
 
-    let Some((gas_limit, bytecode, bytecode_hash)) =
-        load_acc_and_calc_gas(&mut context, to, false, false, local_gas_limit)
-    else {
+    let mut known_bytecode = None;
+    let Some(gas_limit) = load_acc_and_calc_gas(
+        &mut context,
+        to,
+        false,
+        false,
+        local_gas_limit,
+        &mut known_bytecode,
+    ) else {
         return;
     };
 
@@ -226,7 +244,7 @@ pub fn delegate_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
                 target_address: context.interpreter.input.target_address(),
                 caller: context.interpreter.input.caller_address(),
                 bytecode_address: to,
-                known_bytecode: Some((bytecode_hash, bytecode)),
+                known_bytecode,
                 value: CallValue::Apparent(context.interpreter.input.call_value()),
                 scheme: CallScheme::DelegateCall,
                 is_static: context.interpreter.runtime_flag.is_static(),
@@ -252,9 +270,15 @@ pub fn static_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
         return;
     };
 
-    let Some((gas_limit, bytecode, bytecode_hash)) =
-        load_acc_and_calc_gas(&mut context, to, false, false, local_gas_limit)
-    else {
+    let mut known_bytecode = None;
+    let Some(gas_limit) = load_acc_and_calc_gas(
+        &mut context,
+        to,
+        false,
+        false,
+        local_gas_limit,
+        &mut known_bytecode,
+    ) else {
         return;
     };
 
@@ -268,7 +292,7 @@ pub fn static_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
                 target_address: to,
                 caller: context.interpreter.input.target_address(),
                 bytecode_address: to,
-                known_bytecode: Some((bytecode_hash, bytecode)),
+                known_bytecode,
                 value: CallValue::Transfer(U256::ZERO),
                 scheme: CallScheme::StaticCall,
                 is_static: true,

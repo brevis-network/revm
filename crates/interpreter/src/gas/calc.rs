@@ -8,7 +8,7 @@ use primitives::{eip7702, hardfork::SpecId, U256};
 /// `SSTORE` opcode refund calculation.
 #[allow(clippy::collapsible_else_if)]
 #[inline]
-pub fn sstore_refund(spec_id: SpecId, vals: &SStoreResult) -> i64 {
+pub const fn sstore_refund(spec_id: SpecId, vals: &SStoreResult) -> i64 {
     if spec_id.is_enabled_in(SpecId::ISTANBUL) {
         // EIP-3529: Reduction in refunds
         let sstore_clears_schedule = if spec_id.is_enabled_in(SpecId::LONDON) {
@@ -89,7 +89,7 @@ const fn log2floor(value: U256) -> u64 {
 /// `EXP` opcode cost calculation.
 #[inline]
 pub fn exp_cost(spec_id: SpecId, power: U256) -> Option<u64> {
-    if power.is_zero() {
+    if primitives::u256_is_zero(&power) {
         Some(EXP)
     } else {
         // EIP-160: EXP cost increase
@@ -489,4 +489,266 @@ pub fn get_tokens_in_calldata(input: &[u8], is_istanbul: bool) -> u64 {
 #[inline]
 pub fn calc_tx_floor_cost(tokens_in_calldata: u64) -> u64 {
     tokens_in_calldata * TOTAL_COST_FLOOR_PER_TOKEN + 21_000
+}
+
+// -------------------------------------------------------------------------------------
+// SSTORE cost/refund table, in the shape evmone uses (`sstore_costs[rev][status]`).
+//
+// The hard-fork revision is a per-block constant, and `sstore_cost` / `sstore_refund`
+// between them walk two branch nests over the *same* three storage words on every single
+// `SSTORE`. Both nests are a pure function of the revision and of which of the nine
+// storage transitions (`SStoreStatus`) the write is, so the whole thing collapses to one
+// classification and one load.
+//
+// The table is not written out by hand: every entry is produced by calling the branch
+// chains above on a representative transition at compile time, so the schedule is
+// correct by construction for every revision and cannot drift from them.
+// -------------------------------------------------------------------------------------
+
+/// One `(dynamic gas cost, refund)` pair - exactly what `dyn_sstore_cost(spec, vals, false)`
+/// and `sstore_refund(spec, vals)` return.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SStoreGas {
+    /// Warm `SSTORE` cost with [`SStoreSpec::static_cost`] already taken out, i.e. exactly
+    /// what `dyn_sstore_cost` returns for a warm slot. The cold surcharge is added
+    /// separately, see [`SStoreSpec`].
+    pub dyn_cost: u32,
+    /// Gas refund, which can be negative.
+    pub refund: i32,
+}
+
+/// The nine storage transitions, written `original -> present -> new`.
+///
+/// `X`, `Y`, `Z` are distinct non-zero values. Every transition that is not listed - and
+/// every no-op, where `new == present` - behaves exactly like [`ASSIGNED`](SStoreStatus::Assigned).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum SStoreStatus {
+    /// `X -> Y -> Z`, `0 -> Y -> Z`, and every no-op.
+    Assigned = 0,
+    /// `0 -> 0 -> Z`
+    Added = 1,
+    /// `X -> X -> 0`
+    Deleted = 2,
+    /// `X -> X -> Z`
+    Modified = 3,
+    /// `X -> 0 -> Z`
+    DeletedAdded = 4,
+    /// `X -> Y -> 0`
+    ModifiedDeleted = 5,
+    /// `X -> 0 -> X`
+    DeletedRestored = 6,
+    /// `0 -> Y -> 0`
+    AddedDeleted = 7,
+    /// `X -> Y -> X`
+    ModifiedRestored = 8,
+}
+
+/// Number of entries in [`SStoreStatus`].
+pub const SSTORE_STATUS_COUNT: usize = 9;
+
+/// Classifies a storage write into one of the nine [`SStoreStatus`] transitions.
+///
+/// The order of the tests is the cheap-first order: a clean write (`original == present`,
+/// which is every first write to a slot in a transaction) is settled in two word-wide
+/// comparisons, and no comparison is ever made twice.
+#[inline]
+pub fn sstore_status(vals: &SStoreResult) -> SStoreStatus {
+    use primitives::{u256_eq, u256_is_zero};
+    use SStoreStatus::*;
+
+    // A no-op write. Also the only case where `present == new`, so nothing below can hit it.
+    if u256_eq(&vals.new_value, &vals.present_value) {
+        return Assigned;
+    }
+
+    let n0 = u256_is_zero(&vals.new_value);
+
+    // Clean slot: this transaction has not written it before.
+    if u256_eq(&vals.original_value, &vals.present_value) {
+        return if u256_is_zero(&vals.original_value) {
+            // `present == original == 0` and `new != present`, so `new != 0`.
+            Added
+        } else if n0 {
+            Deleted
+        } else {
+            Modified
+        };
+    }
+
+    // Dirty slot.
+    if u256_is_zero(&vals.original_value) {
+        // `0 -> Y -> ...` with `Y != 0` and `new != Y`.
+        if n0 {
+            AddedDeleted
+        } else {
+            Assigned
+        }
+    } else if u256_is_zero(&vals.present_value) {
+        // `X -> 0 -> Z` with `Z != 0`.
+        if u256_eq(&vals.original_value, &vals.new_value) {
+            DeletedRestored
+        } else {
+            DeletedAdded
+        }
+    } else if n0 {
+        ModifiedDeleted
+    } else if u256_eq(&vals.original_value, &vals.new_value) {
+        ModifiedRestored
+    } else {
+        Assigned
+    }
+}
+
+/// The two revision-only `SSTORE` constants: the static charge taken before the storage
+/// load, and the cold surcharge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SStoreSpec {
+    /// [`static_sstore_cost`] for this revision.
+    pub static_cost: u32,
+    /// Cold-slot surcharge for this revision: `COLD_SLOAD_COST` from Berlin on, else 0.
+    pub cold_extra: u32,
+}
+
+/// Every [`SpecId`], in discriminant order, so the tables below can be indexed by
+/// `spec_id as usize`.
+const ALL_SPECS: [SpecId; 21] = [
+    SpecId::FRONTIER,
+    SpecId::FRONTIER_THAWING,
+    SpecId::HOMESTEAD,
+    SpecId::DAO_FORK,
+    SpecId::TANGERINE,
+    SpecId::SPURIOUS_DRAGON,
+    SpecId::BYZANTIUM,
+    SpecId::CONSTANTINOPLE,
+    SpecId::PETERSBURG,
+    SpecId::ISTANBUL,
+    SpecId::MUIR_GLACIER,
+    SpecId::BERLIN,
+    SpecId::LONDON,
+    SpecId::ARROW_GLACIER,
+    SpecId::GRAY_GLACIER,
+    SpecId::MERGE,
+    SpecId::SHANGHAI,
+    SpecId::CANCUN,
+    SpecId::PRAGUE,
+    SpecId::OSAKA,
+    SpecId::AMSTERDAM,
+];
+
+/// A representative `SStoreResult` for each [`SStoreStatus`], in discriminant order.
+/// `1`, `2` and `3` stand in for the distinct non-zero `X`, `Y` and `Z`.
+const STATUS_WITNESS: [(u64, u64, u64); SSTORE_STATUS_COUNT] = [
+    (1, 2, 3), // Assigned
+    (0, 0, 1), // Added
+    (1, 1, 0), // Deleted
+    (1, 1, 2), // Modified
+    (1, 0, 2), // DeletedAdded
+    (1, 2, 0), // ModifiedDeleted
+    (1, 0, 1), // DeletedRestored
+    (0, 1, 0), // AddedDeleted
+    (1, 2, 1), // ModifiedRestored
+];
+
+/// `SSTORE` dynamic cost and refund, indexed by `spec_id as usize` then by
+/// `sstore_status(vals) as usize`.
+pub static SSTORE_GAS: [[SStoreGas; SSTORE_STATUS_COUNT]; 21] = {
+    let mut table = [[SStoreGas {
+        dyn_cost: 0,
+        refund: 0,
+    }; SSTORE_STATUS_COUNT]; 21];
+    let mut s = 0;
+    while s < 21 {
+        let spec = ALL_SPECS[s];
+        let mut i = 0;
+        while i < SSTORE_STATUS_COUNT {
+            let (o, p, n) = STATUS_WITNESS[i];
+            let vals = SStoreResult {
+                original_value: U256::from_limbs([o, 0, 0, 0]),
+                present_value: U256::from_limbs([p, 0, 0, 0]),
+                new_value: U256::from_limbs([n, 0, 0, 0]),
+            };
+            table[s][i] = SStoreGas {
+                dyn_cost: dyn_sstore_cost(spec, &vals, false) as u32,
+                refund: sstore_refund(spec, &vals) as i32,
+            };
+            i += 1;
+        }
+        s += 1;
+    }
+    table
+};
+
+/// The revision-only `SSTORE` constants, indexed by `spec_id as usize`.
+pub static SSTORE_SPEC: [SStoreSpec; 21] = {
+    let mut table = [SStoreSpec {
+        static_cost: 0,
+        cold_extra: 0,
+    }; 21];
+    let mut s = 0;
+    while s < 21 {
+        let spec = ALL_SPECS[s];
+        table[s] = SStoreSpec {
+            static_cost: static_sstore_cost(spec) as u32,
+            cold_extra: if spec.is_enabled_in(SpecId::BERLIN) {
+                COLD_SLOAD_COST as u32
+            } else {
+                0
+            },
+        };
+        s += 1;
+    }
+    table
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The table must agree with the branch chains it was generated from, on every
+    /// revision and on every storage transition - not just the nine witnesses. Four
+    /// distinct values (zero plus three non-zero) cover every shape the classification
+    /// can distinguish.
+    #[test]
+    fn sstore_table_matches_the_branch_chains() {
+        for spec in ALL_SPECS {
+            let spec_row = SSTORE_SPEC[spec as usize];
+            assert_eq!(
+                spec_row.static_cost as u64,
+                static_sstore_cost(spec),
+                "static cost, {spec:?}"
+            );
+
+            for o in 0..4u64 {
+                for p in 0..4u64 {
+                    for n in 0..4u64 {
+                        let vals = SStoreResult {
+                            original_value: U256::from(o),
+                            present_value: U256::from(p),
+                            new_value: U256::from(n),
+                        };
+                        let entry = SSTORE_GAS[spec as usize][sstore_status(&vals) as usize];
+
+                        assert_eq!(
+                            entry.refund as i64,
+                            sstore_refund(spec, &vals),
+                            "refund, {spec:?}, {o}->{p}->{n}"
+                        );
+
+                        for is_cold in [false, true] {
+                            let mut want = entry.dyn_cost as u64;
+                            if is_cold {
+                                want += spec_row.cold_extra as u64;
+                            }
+                            assert_eq!(
+                                want,
+                                dyn_sstore_cost(spec, &vals, is_cold),
+                                "dynamic cost, {spec:?}, {o}->{p}->{n}, cold={is_cold}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

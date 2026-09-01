@@ -201,11 +201,14 @@ impl<DB: Database> JournalExt for Journal<DB> {
 
     #[inline]
     fn evm_state(&self) -> &EvmState {
-        &self.state
+        self.state_ref()
     }
 
+    /// Through `JournalInner::state`, not the field: the caller may insert through the
+    /// reference this hands out, and that accessor is what empties the account cache. See
+    /// the note on the field.
     #[inline]
     fn evm_state_mut(&mut self) -> &mut EvmState {
-        &mut self.state
+        self.state()
     }
 }

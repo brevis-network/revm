@@ -19,9 +19,32 @@ use crate::InstructionContext;
 /// a return for a body of about a hundred instructions.
 #[inline(always)]
 pub fn keccak256<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, WIRE>) {
-    popn_top!([offset], top, context.interpreter);
-    let len = as_usize_or_fail!(context.interpreter, top);
-    gas_or_fail!(context.interpreter, gas::keccak256_cost(len));
+    run_threaded!(context, keccak256_at)
+}
+
+/// [`keccak256`], threading the stack cursor.
+///
+/// The body lives here; the plain form above is this one with the cursor read out
+/// of the stack and written back, which is what the instruction *table* needs. See
+/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+#[inline(always)]
+#[allow(unused_mut)]
+pub fn keccak256_at<WIRE: InterpreterTypes, H: ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+    mut sp: usize,
+    rem: u64,
+) -> (usize, u64) {
+    popn_top_at!([offset], top, context.interpreter, sp, rem);
+    // This one charges gas of its own, so it publishes the threaded counter into the field
+    // the `gas!`/`resize_memory!` charges below work on, and hands back what the field ends
+    // up holding. See `sync_gas_at!`.
+    sync_gas_at!(context.interpreter, rem);
+    let len = as_usize_or_fail_ret!(context.interpreter, top, (sp, u64::MAX));
+    gas_or_fail!(
+        context.interpreter,
+        gas::keccak256_cost(len),
+        (sp, u64::MAX)
+    );
     // Built in an 8-aligned slot so the `B256` -> `U256` byte reversal below can load limbs
     // with `ld` instead of 32 `lbu`.
     #[repr(align(8))]
@@ -29,21 +52,39 @@ pub fn keccak256<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<
     let hash = AlignedWord(if len == 0 {
         KECCAK_EMPTY
     } else {
-        let from = as_usize_or_fail!(context.interpreter, offset);
-        resize_memory!(context.interpreter, from, len);
+        let from = as_usize_or_fail_ret!(context.interpreter, offset, (sp, u64::MAX));
+        resize_memory!(context.interpreter, from, len, (sp, u64::MAX));
         primitives::keccak256(context.interpreter.memory.slice_len(from, len).as_ref())
     });
     // SAFETY: `AlignedWord` is 8-aligned and holds 32 bytes.
     *top = unsafe { u256_from_be_aligned(hash.0.as_ptr()) };
+    (sp, context.interpreter.gas.remaining())
 }
 
 /// Implements the ADDRESS instruction.
 ///
 /// Pushes the current contract's address onto the stack.
 pub fn address<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, WIRE>) {
+    run_threaded!(context, address_at)
+}
+
+/// [`address`], threading the stack cursor.
+///
+/// The body lives here; the plain form above is this one with the cursor read out
+/// of the stack and written back, which is what the instruction *table* needs. See
+/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+#[inline(always)]
+#[allow(unused_mut)]
+pub fn address_at<WIRE: InterpreterTypes, H: ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+    mut sp: usize,
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
-    push!(
+    push_at!(
         context.interpreter,
+        sp,
+        rem,
         context
             .interpreter
             .input
@@ -51,15 +92,33 @@ pub fn address<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_
             .into_word()
             .into()
     );
+    (sp, rem)
 }
 
 /// Implements the CALLER instruction.
 ///
 /// Pushes the caller's address onto the stack.
 pub fn caller<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, WIRE>) {
+    run_threaded!(context, caller_at)
+}
+
+/// [`caller`], threading the stack cursor.
+///
+/// The body lives here; the plain form above is this one with the cursor read out
+/// of the stack and written back, which is what the instruction *table* needs. See
+/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+#[inline(always)]
+#[allow(unused_mut)]
+pub fn caller_at<WIRE: InterpreterTypes, H: ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+    mut sp: usize,
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
-    push!(
+    push_at!(
         context.interpreter,
+        sp,
+        rem,
         context
             .interpreter
             .input
@@ -67,17 +126,36 @@ pub fn caller<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_,
             .into_word()
             .into()
     );
+    (sp, rem)
 }
 
 /// Implements the CODESIZE instruction.
 ///
 /// Pushes the size of running contract's bytecode onto the stack.
 pub fn codesize<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, WIRE>) {
+    run_threaded!(context, codesize_at)
+}
+
+/// [`codesize`], threading the stack cursor.
+///
+/// The body lives here; the plain form above is this one with the cursor read out
+/// of the stack and written back, which is what the instruction *table* needs. See
+/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+#[inline(always)]
+#[allow(unused_mut)]
+pub fn codesize_at<WIRE: InterpreterTypes, H: ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+    mut sp: usize,
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
-    push!(
+    push_at!(
         context.interpreter,
+        sp,
+        rem,
         U256::from(context.interpreter.bytecode.bytecode_len())
     );
+    (sp, rem)
 }
 
 /// Implements the CODECOPY instruction.
@@ -108,8 +186,23 @@ pub fn codecopy<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'
 /// a return for a body of about a hundred instructions.
 #[inline(always)]
 pub fn calldataload<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, WIRE>) {
+    run_threaded!(context, calldataload_at)
+}
+
+/// [`calldataload`], threading the stack cursor.
+///
+/// The body lives here; the plain form above is this one with the cursor read out
+/// of the stack and written back, which is what the instruction *table* needs. See
+/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+#[inline(always)]
+#[allow(unused_mut)]
+pub fn calldataload_at<WIRE: InterpreterTypes, H: ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+    mut sp: usize,
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
-    popn_top!([], offset_ptr, context.interpreter);
+    popn_top_at!([], offset_ptr, context.interpreter, sp, rem);
     let offset = as_usize_saturated!(offset_ptr);
     // Assemble straight into the stack slot, one limb at a time. Building a `U256` first
     // keeps all four limbs live to the end, which cost this instruction a prologue that
@@ -130,7 +223,7 @@ pub fn calldataload<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionConte
             dst.add(2).write(0);
             dst.add(3).write(0);
         }
-        return;
+        return (sp, rem);
     }
     let count = 32.min(input_len - offset);
     match context.interpreter.input.input() {
@@ -144,6 +237,7 @@ pub fn calldataload<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionConte
             unsafe { be_word_to(input_slice.as_ptr().add(offset), count, dst) }
         }
     }
+    (sp, rem)
 }
 
 /// Reads `count` (`<= 32`) big-endian bytes from `src` into the four little-endian limbs at
@@ -243,19 +337,58 @@ unsafe fn be_word_to(src: *const u8, count: usize, dst: *mut u64) {
 ///
 /// Pushes the size of input data onto the stack.
 pub fn calldatasize<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, WIRE>) {
+    run_threaded!(context, calldatasize_at)
+}
+
+/// [`calldatasize`], threading the stack cursor.
+///
+/// The body lives here; the plain form above is this one with the cursor read out
+/// of the stack and written back, which is what the instruction *table* needs. See
+/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+#[inline(always)]
+#[allow(unused_mut)]
+pub fn calldatasize_at<WIRE: InterpreterTypes, H: ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+    mut sp: usize,
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
-    push!(
+    push_at!(
         context.interpreter,
+        sp,
+        rem,
         U256::from(context.interpreter.input.input().len())
     );
+    (sp, rem)
 }
 
 /// Implements the CALLVALUE instruction.
 ///
 /// Pushes the value sent with the current call onto the stack.
 pub fn callvalue<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, WIRE>) {
+    run_threaded!(context, callvalue_at)
+}
+
+/// [`callvalue`], threading the stack cursor.
+///
+/// The body lives here; the plain form above is this one with the cursor read out
+/// of the stack and written back, which is what the instruction *table* needs. See
+/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+#[inline(always)]
+#[allow(unused_mut)]
+pub fn callvalue_at<WIRE: InterpreterTypes, H: ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+    mut sp: usize,
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
-    push!(context.interpreter, context.interpreter.input.call_value());
+    push_at!(
+        context.interpreter,
+        sp,
+        rem,
+        context.interpreter.input.call_value()
+    );
+    (sp, rem)
 }
 
 /// Implements the CALLDATACOPY instruction.
@@ -289,12 +422,30 @@ pub fn calldatacopy<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionConte
 
 /// EIP-211: New opcodes: RETURNDATASIZE and RETURNDATACOPY
 pub fn returndatasize<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, WIRE>) {
-    check!(context.interpreter, BYZANTIUM);
+    run_threaded!(context, returndatasize_at)
+}
+
+/// [`returndatasize`], threading the stack cursor.
+///
+/// The body lives here; the plain form above is this one with the cursor read out
+/// of the stack and written back, which is what the instruction *table* needs. See
+/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+#[inline(always)]
+#[allow(unused_mut)]
+pub fn returndatasize_at<WIRE: InterpreterTypes, H: ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+    mut sp: usize,
+    rem: u64,
+) -> (usize, u64) {
+    check_at!(context.interpreter, sp, rem, BYZANTIUM);
     //gas!(context.interpreter, gas::BASE);
-    push!(
+    push_at!(
         context.interpreter,
+        sp,
+        rem,
         U256::from(context.interpreter.return_data.buffer().len())
     );
+    (sp, rem)
 }
 
 /// EIP-211: New opcodes: RETURNDATASIZE and RETURNDATACOPY
@@ -329,11 +480,24 @@ pub fn returndatacopy<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionCon
 ///
 /// Pushes the amount of remaining gas onto the stack.
 pub fn gas<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, WIRE>) {
+    run_threaded!(context, gas_at)
+}
+
+/// [`gas`], threading the stack cursor.
+///
+/// The body lives here; the plain form above is this one with the cursor read out
+/// of the stack and written back, which is what the instruction *table* needs. See
+/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+#[inline(always)]
+#[allow(unused_mut)]
+pub fn gas_at<WIRE: InterpreterTypes, H: ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+    mut sp: usize,
+    rem: u64,
+) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
-    push!(
-        context.interpreter,
-        U256::from(context.interpreter.gas.remaining())
-    );
+    push_at!(context.interpreter, sp, rem, U256::from(rem));
+    (sp, rem)
 }
 
 /// Common logic for copying data from a source buffer to the EVM's memory.
@@ -350,6 +514,23 @@ pub fn memory_resize(
         return None;
     }
     let memory_offset = as_usize_or_fail_ret!(interpreter, memory_offset, None);
+    // Not `resize_memory_written!`, though it looks like it should be.
+    //
+    // All three callers -- CODECOPY, CALLDATACOPY, RETURNDATACOPY -- do overwrite every
+    // byte of the range they grow into (`set_data` copies what the source has and
+    // `fill(0)`s the rest), so the hint would be *sound*. It is just not worth anything:
+    // measured at **+147,976** on block 24006677, of which +75,205 is this function itself
+    // growing.
+    //
+    // The reason is the ratio. These three are ~11,000 dispatches between them against
+    // MSTORE's 290,738, and they mostly write into memory that already exists, so there is
+    // very little fill to skip -- while `resize_written` is the larger function and is
+    // called on every one of those dispatches, growing or not. The hint pays for MSTORE
+    // because 36.5 % of MSTOREs grow and the skipped fill is a whole word each time.
+    //
+    // MCOPY was measured with it too, taking the `dst >= src` half (the only sound one --
+    // when `src` is the max, the bytes grown into are the copy's *source* and must read as
+    // zero): a further +652. Not worth the branch.
     resize_memory!(interpreter, memory_offset, len, None);
 
     Some(memory_offset)

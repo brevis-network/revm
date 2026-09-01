@@ -79,19 +79,32 @@ pub type InstructionTable<W, H> = [Instruction<W, H>; 256];
 /// The built-in instruction set, one `OPCODE => implementation, static_gas, moves_ip;`
 /// per opcode.
 ///
-/// The last column says how the arm has to treat the instruction pointer that
-/// `Interpreter::run_plain` keeps in a local; see the `execute!` rules in the dispatch loop
-/// there.
+/// The last column says how the arm has to treat the two values `Interpreter::run_plain`
+/// keeps in loop-locals -- the instruction pointer and the byte-scaled stack cursor -- see
+/// the `execute!` rules in the dispatch loop there.
 ///
-/// * `0` -- the implementation never touches the instruction pointer. Most opcodes.
-/// * `1` -- it reads or writes it, so the arm stores the local before the call and reloads
-///   it after (`PC`, `JUMP`, `JUMPI`).
-/// * `(2, N)` -- `PUSH1`..`PUSH32`: the arm reads the `N` immediate bytes straight off the
-///   local and advances it by `1 + N` itself, instead of paying a store, a load and a
-///   second store to hand the pointer to `stack::push::<N>`.
-/// * `(3, f)` -- `JUMP`/`JUMPI`: `f` returns the new instruction pointer rather than
-///   storing it. Depends on `-tail-dup-size=12` being set; the dispatch loop has the
-///   numbers.
+/// * `0` -- neither is threaded: the arm stores the cursor before the call and reads it back
+///   after, and the instruction pointer stays in `ExtBytecode` throughout. Everything that
+///   reaches out to the host, to a frame action or to a variable-length copy.
+/// * `1` -- the same for the stack, plus the instruction pointer stored and reloaded (`PC`).
+/// * `(2, N)` -- `PUSH1`..`PUSH32`: both threaded. The arm reads the `N` immediate bytes
+///   straight off the local pointer, writes the word at the local cursor and advances both
+///   itself, instead of paying a store, a load and a second store for each.
+/// * `(3, f)` -- `JUMP`/`JUMPI`: both threaded. `f` takes the pointer and the cursor and
+///   returns the new pair rather than storing either.
+/// * `(4, f)` -- the stack cursor *and the gas counter* threaded, the instruction pointer
+///   untouched. `f` takes both and returns the new pair. This is most of the hot list: the
+///   arithmetic and bitwise opcodes, `POP`/`PUSH0`/`DUP`/`SWAP`, `MLOAD`/`MSTORE`/`MSTORE8`/
+///   `MSIZE`, and the one-word opcodes that ask the host or the block for a value.
+/// * `5` -- touches neither (`JUMPDEST`).
+///
+/// The gas counter rides along on `(2, N)` and `(4, f)` but **not** on `(3, f)`: `JUMP`/
+/// `JUMPI` publish and reload it like tag `0` does. They are the only hot arms that *change*
+/// the counter, and an arm that redefines it costs a register copy on every other arm too --
+/// the note on `rem` in [`Interpreter::run_plain`](crate::Interpreter::run_plain) has the
+/// numbers.
+///
+/// Threading depends on `-tail-dup-size=12` being set; the dispatch loop has the numbers.
 ///
 /// Both the instruction *table* ([`instruction_table`]) and the switch dispatch in
 /// [`Interpreter::run_plain`](crate::Interpreter::run_plain) are generated from this single
@@ -103,78 +116,138 @@ macro_rules! for_each_builtin_instruction {
     ($m:ident, $fuse:literal) => {
         $m! {
             STOP => $crate::instructions::control::stop, 0, 0;
-            ADD => $crate::instructions::arithmetic::add, 3, 0;
-            MUL => $crate::instructions::arithmetic::mul, 5, 0;
-            SUB => $crate::instructions::arithmetic::sub, 3, 0;
-            DIV => $crate::instructions::arithmetic::div, 5, 0;
-            SDIV => $crate::instructions::arithmetic::sdiv, 5, 0;
-            MOD => $crate::instructions::arithmetic::rem, 5, 0;
-            SMOD => $crate::instructions::arithmetic::smod, 5, 0;
-            ADDMOD => $crate::instructions::arithmetic::addmod, 8, 0;
-            MULMOD => $crate::instructions::arithmetic::mulmod, 8, 0;
+            ADD => $crate::instructions::arithmetic::add, 3,
+                (4, $crate::instructions::arithmetic::add_at);
+            MUL => $crate::instructions::arithmetic::mul, 5,
+                (4, $crate::instructions::arithmetic::mul_at);
+            SUB => $crate::instructions::arithmetic::sub, 3,
+                (4, $crate::instructions::arithmetic::sub_at);
+            DIV => $crate::instructions::arithmetic::div, 5,
+                (4, $crate::instructions::arithmetic::div_at);
+            SDIV => $crate::instructions::arithmetic::sdiv, 5,
+                (4, $crate::instructions::arithmetic::sdiv_at);
+            MOD => $crate::instructions::arithmetic::rem, 5,
+                (4, $crate::instructions::arithmetic::rem_at);
+            SMOD => $crate::instructions::arithmetic::smod, 5,
+                (4, $crate::instructions::arithmetic::smod_at);
+            ADDMOD => $crate::instructions::arithmetic::addmod, 8,
+                (4, $crate::instructions::arithmetic::addmod_at);
+            MULMOD => $crate::instructions::arithmetic::mulmod, 8,
+                (4, $crate::instructions::arithmetic::mulmod_at);
             EXP => $crate::instructions::arithmetic::exp, 0, 0;
-            SIGNEXTEND => $crate::instructions::arithmetic::signextend, 5, 0;
-            LT => $crate::instructions::bitwise::lt, 3, 0;
-            GT => $crate::instructions::bitwise::gt, 3, 0;
-            SLT => $crate::instructions::bitwise::slt, 3, 0;
-            SGT => $crate::instructions::bitwise::sgt, 3, 0;
-            EQ => $crate::instructions::bitwise::eq, 3, 0;
-            ISZERO => $crate::instructions::bitwise::iszero, 3, 0;
-            AND => $crate::instructions::bitwise::bitand, 3, 0;
-            OR => $crate::instructions::bitwise::bitor, 3, 0;
-            XOR => $crate::instructions::bitwise::bitxor, 3, 0;
-            NOT => $crate::instructions::bitwise::not, 3, 0;
-            BYTE => $crate::instructions::bitwise::byte, 3, 0;
-            SHL => $crate::instructions::bitwise::shl, 3, 0;
-            SHR => $crate::instructions::bitwise::shr, 3, 0;
-            SAR => $crate::instructions::bitwise::sar, 3, 0;
-            CLZ => $crate::instructions::bitwise::clz, 5, 0;
-            KECCAK256 => $crate::instructions::system::keccak256, 0, 0;
-            ADDRESS => $crate::instructions::system::address, 2, 0;
-            BALANCE => $crate::instructions::host::balance, 0, 0;
-            ORIGIN => $crate::instructions::tx_info::origin, 2, 0;
-            CALLER => $crate::instructions::system::caller, 2, 0;
-            CALLVALUE => $crate::instructions::system::callvalue, 2, 0;
-            CALLDATALOAD => $crate::instructions::system::calldataload, 3, 0;
-            CALLDATASIZE => $crate::instructions::system::calldatasize, 2, 0;
+            SIGNEXTEND => $crate::instructions::arithmetic::signextend, 5,
+                (4, $crate::instructions::arithmetic::signextend_at);
+            LT => $crate::instructions::bitwise::lt, 3,
+                (4, $crate::instructions::bitwise::lt_at);
+            GT => $crate::instructions::bitwise::gt, 3,
+                (4, $crate::instructions::bitwise::gt_at);
+            SLT => $crate::instructions::bitwise::slt, 3,
+                (4, $crate::instructions::bitwise::slt_at);
+            SGT => $crate::instructions::bitwise::sgt, 3,
+                (4, $crate::instructions::bitwise::sgt_at);
+            EQ => $crate::instructions::bitwise::eq, 3,
+                (4, $crate::instructions::bitwise::eq_at);
+            ISZERO => $crate::instructions::bitwise::iszero, 3,
+                (4, $crate::instructions::bitwise::iszero_at);
+            AND => $crate::instructions::bitwise::bitand, 3,
+                (4, $crate::instructions::bitwise::bitand_at);
+            OR => $crate::instructions::bitwise::bitor, 3,
+                (4, $crate::instructions::bitwise::bitor_at);
+            XOR => $crate::instructions::bitwise::bitxor, 3,
+                (4, $crate::instructions::bitwise::bitxor_at);
+            NOT => $crate::instructions::bitwise::not, 3,
+                (4, $crate::instructions::bitwise::not_at);
+            BYTE => $crate::instructions::bitwise::byte, 3,
+                (4, $crate::instructions::bitwise::byte_at);
+            SHL => $crate::instructions::bitwise::shl, 3,
+                (4, $crate::instructions::bitwise::shl_at);
+            SHR => $crate::instructions::bitwise::shr, 3,
+                (4, $crate::instructions::bitwise::shr_at);
+            SAR => $crate::instructions::bitwise::sar, 3,
+                (4, $crate::instructions::bitwise::sar_at);
+            CLZ => $crate::instructions::bitwise::clz, 5,
+                (4, $crate::instructions::bitwise::clz_at);
+            KECCAK256 => $crate::instructions::system::keccak256, 0,
+                (4, $crate::instructions::system::keccak256_at);
+            ADDRESS => $crate::instructions::system::address, 2,
+                (4, $crate::instructions::system::address_at);
+            BALANCE => $crate::instructions::host::balance, 0,
+                (4, $crate::instructions::host::balance_at);
+            ORIGIN => $crate::instructions::tx_info::origin, 2,
+                (4, $crate::instructions::tx_info::origin_at);
+            CALLER => $crate::instructions::system::caller, 2,
+                (4, $crate::instructions::system::caller_at);
+            CALLVALUE => $crate::instructions::system::callvalue, 2,
+                (4, $crate::instructions::system::callvalue_at);
+            CALLDATALOAD => $crate::instructions::system::calldataload, 3,
+                (4, $crate::instructions::system::calldataload_at);
+            CALLDATASIZE => $crate::instructions::system::calldatasize, 2,
+                (4, $crate::instructions::system::calldatasize_at);
             CALLDATACOPY => $crate::instructions::system::calldatacopy, 0, 0;
-            CODESIZE => $crate::instructions::system::codesize, 2, 0;
+            CODESIZE => $crate::instructions::system::codesize, 2,
+                (4, $crate::instructions::system::codesize_at);
             CODECOPY => $crate::instructions::system::codecopy, 0, 0;
-            GASPRICE => $crate::instructions::tx_info::gasprice, 2, 0;
-            EXTCODESIZE => $crate::instructions::host::extcodesize, 0, 0;
+            GASPRICE => $crate::instructions::tx_info::gasprice, 2,
+                (4, $crate::instructions::tx_info::gasprice_at);
+            EXTCODESIZE => $crate::instructions::host::extcodesize, 0,
+                (4, $crate::instructions::host::extcodesize_at);
             EXTCODECOPY => $crate::instructions::host::extcodecopy, 0, 0;
-            RETURNDATASIZE => $crate::instructions::system::returndatasize, 2, 0;
+            RETURNDATASIZE => $crate::instructions::system::returndatasize, 2,
+                (4, $crate::instructions::system::returndatasize_at);
             RETURNDATACOPY => $crate::instructions::system::returndatacopy, 0, 0;
-            EXTCODEHASH => $crate::instructions::host::extcodehash, 0, 0;
-            BLOCKHASH => $crate::instructions::host::blockhash, 20, 0;
-            COINBASE => $crate::instructions::block_info::coinbase, 2, 0;
-            TIMESTAMP => $crate::instructions::block_info::timestamp, 2, 0;
-            NUMBER => $crate::instructions::block_info::block_number, 2, 0;
-            DIFFICULTY => $crate::instructions::block_info::difficulty, 2, 0;
-            GASLIMIT => $crate::instructions::block_info::gaslimit, 2, 0;
-            CHAINID => $crate::instructions::block_info::chainid, 2, 0;
-            SELFBALANCE => $crate::instructions::host::selfbalance, 5, 0;
-            BASEFEE => $crate::instructions::block_info::basefee, 2, 0;
-            BLOBHASH => $crate::instructions::tx_info::blob_hash, 3, 0;
-            BLOBBASEFEE => $crate::instructions::block_info::blob_basefee, 2, 0;
-            POP => $crate::instructions::stack::pop, 2, 0;
-            MLOAD => $crate::instructions::memory::mload, 3, 0;
-            MSTORE => $crate::instructions::memory::mstore, 3, 0;
-            MSTORE8 => $crate::instructions::memory::mstore8, 3, 0;
-            SLOAD => $crate::instructions::host::sload, 0, 0;
-            SSTORE => $crate::instructions::host::sstore, 0, 0;
+            EXTCODEHASH => $crate::instructions::host::extcodehash, 0,
+                (4, $crate::instructions::host::extcodehash_at);
+            BLOCKHASH => $crate::instructions::host::blockhash, 20,
+                (4, $crate::instructions::host::blockhash_at);
+            COINBASE => $crate::instructions::block_info::coinbase, 2,
+                (4, $crate::instructions::block_info::coinbase_at);
+            TIMESTAMP => $crate::instructions::block_info::timestamp, 2,
+                (4, $crate::instructions::block_info::timestamp_at);
+            NUMBER => $crate::instructions::block_info::block_number, 2,
+                (4, $crate::instructions::block_info::block_number_at);
+            DIFFICULTY => $crate::instructions::block_info::difficulty, 2,
+                (4, $crate::instructions::block_info::difficulty_at);
+            GASLIMIT => $crate::instructions::block_info::gaslimit, 2,
+                (4, $crate::instructions::block_info::gaslimit_at);
+            CHAINID => $crate::instructions::block_info::chainid, 2,
+                (4, $crate::instructions::block_info::chainid_at);
+            SELFBALANCE => $crate::instructions::host::selfbalance, 5,
+                (4, $crate::instructions::host::selfbalance_at);
+            BASEFEE => $crate::instructions::block_info::basefee, 2,
+                (4, $crate::instructions::block_info::basefee_at);
+            BLOBHASH => $crate::instructions::tx_info::blob_hash, 3,
+                (4, $crate::instructions::tx_info::blob_hash_at);
+            BLOBBASEFEE => $crate::instructions::block_info::blob_basefee, 2,
+                (4, $crate::instructions::block_info::blob_basefee_at);
+            POP => $crate::instructions::stack::pop, 2,
+                (4, $crate::instructions::stack::pop_at);
+            MLOAD => $crate::instructions::memory::mload, 3,
+                (4, $crate::instructions::memory::mload_at);
+            MSTORE => $crate::instructions::memory::mstore, 3,
+                (4, $crate::instructions::memory::mstore_at);
+            MSTORE8 => $crate::instructions::memory::mstore8, 3,
+                (4, $crate::instructions::memory::mstore8_at);
+            SLOAD => $crate::instructions::host::sload, 0,
+                (4, $crate::instructions::host::sload_at);
+            SSTORE => $crate::instructions::host::sstore, 0,
+                (4, $crate::instructions::host::sstore_at);
             JUMP => $crate::instructions::control::jump::<$fuse, _, _>, 8,
                 (3, $crate::instructions::control::jump_at::<$fuse, _, _>);
             JUMPI => $crate::instructions::control::jumpi::<$fuse, _, _>, 10,
                 (3, $crate::instructions::control::jumpi_at::<$fuse, _, _>);
             PC => $crate::instructions::control::pc, 2, 1;
-            MSIZE => $crate::instructions::memory::msize, 2, 0;
-            GAS => $crate::instructions::system::gas, 2, 0;
-            JUMPDEST => $crate::instructions::control::jumpdest, 1, 0;
-            TLOAD => $crate::instructions::host::tload, 100, 0;
-            TSTORE => $crate::instructions::host::tstore, 100, 0;
+            MSIZE => $crate::instructions::memory::msize, 2,
+                (4, $crate::instructions::memory::msize_at);
+            GAS => $crate::instructions::system::gas, 2,
+                (4, $crate::instructions::system::gas_at);
+            JUMPDEST => $crate::instructions::control::jumpdest, 1, 5;
+            TLOAD => $crate::instructions::host::tload, 100,
+                (4, $crate::instructions::host::tload_at);
+            TSTORE => $crate::instructions::host::tstore, 100,
+                (4, $crate::instructions::host::tstore_at);
             MCOPY => $crate::instructions::memory::mcopy, 0, 0;
-            PUSH0 => $crate::instructions::stack::push0, 2, 0;
+            PUSH0 => $crate::instructions::stack::push0, 2,
+                (4, $crate::instructions::stack::push0_at);
             PUSH1 => $crate::instructions::stack::push::<1, _, _>, 3, (2, 1);
             PUSH2 => $crate::instructions::stack::push::<2, _, _>, 3, (2, 2);
             PUSH3 => $crate::instructions::stack::push::<3, _, _>, 3, (2, 3);
@@ -207,38 +280,54 @@ macro_rules! for_each_builtin_instruction {
             PUSH30 => $crate::instructions::stack::push::<30, _, _>, 3, (2, 30);
             PUSH31 => $crate::instructions::stack::push::<31, _, _>, 3, (2, 31);
             PUSH32 => $crate::instructions::stack::push::<32, _, _>, 3, (2, 32);
-            DUP1 => $crate::instructions::stack::dup::<1, _, _>, 3, 0;
-            DUP2 => $crate::instructions::stack::dup::<2, _, _>, 3, 0;
-            DUP3 => $crate::instructions::stack::dup::<3, _, _>, 3, 0;
-            DUP4 => $crate::instructions::stack::dup::<4, _, _>, 3, 0;
-            DUP5 => $crate::instructions::stack::dup::<5, _, _>, 3, 0;
-            DUP6 => $crate::instructions::stack::dup::<6, _, _>, 3, 0;
-            DUP7 => $crate::instructions::stack::dup::<7, _, _>, 3, 0;
-            DUP8 => $crate::instructions::stack::dup::<8, _, _>, 3, 0;
-            DUP9 => $crate::instructions::stack::dup::<9, _, _>, 3, 0;
-            DUP10 => $crate::instructions::stack::dup::<10, _, _>, 3, 0;
-            DUP11 => $crate::instructions::stack::dup::<11, _, _>, 3, 0;
-            DUP12 => $crate::instructions::stack::dup::<12, _, _>, 3, 0;
-            DUP13 => $crate::instructions::stack::dup::<13, _, _>, 3, 0;
-            DUP14 => $crate::instructions::stack::dup::<14, _, _>, 3, 0;
-            DUP15 => $crate::instructions::stack::dup::<15, _, _>, 3, 0;
-            DUP16 => $crate::instructions::stack::dup::<16, _, _>, 3, 0;
-            SWAP1 => $crate::instructions::stack::swap::<1, _, _>, 3, 0;
-            SWAP2 => $crate::instructions::stack::swap::<2, _, _>, 3, 0;
-            SWAP3 => $crate::instructions::stack::swap::<3, _, _>, 3, 0;
-            SWAP4 => $crate::instructions::stack::swap::<4, _, _>, 3, 0;
-            SWAP5 => $crate::instructions::stack::swap::<5, _, _>, 3, 0;
-            SWAP6 => $crate::instructions::stack::swap::<6, _, _>, 3, 0;
-            SWAP7 => $crate::instructions::stack::swap::<7, _, _>, 3, 0;
-            SWAP8 => $crate::instructions::stack::swap::<8, _, _>, 3, 0;
-            SWAP9 => $crate::instructions::stack::swap::<9, _, _>, 3, 0;
-            SWAP10 => $crate::instructions::stack::swap::<10, _, _>, 3, 0;
-            SWAP11 => $crate::instructions::stack::swap::<11, _, _>, 3, 0;
-            SWAP12 => $crate::instructions::stack::swap::<12, _, _>, 3, 0;
-            SWAP13 => $crate::instructions::stack::swap::<13, _, _>, 3, 0;
-            SWAP14 => $crate::instructions::stack::swap::<14, _, _>, 3, 0;
-            SWAP15 => $crate::instructions::stack::swap::<15, _, _>, 3, 0;
-            SWAP16 => $crate::instructions::stack::swap::<16, _, _>, 3, 0;
+            DUP1 => $crate::instructions::stack::dup::<1, _, _>, 3, (6, 1);
+            DUP2 => $crate::instructions::stack::dup::<2, _, _>, 3, (6, 2);
+            DUP3 => $crate::instructions::stack::dup::<3, _, _>, 3, (6, 3);
+            DUP4 => $crate::instructions::stack::dup::<4, _, _>, 3, (6, 4);
+            DUP5 => $crate::instructions::stack::dup::<5, _, _>, 3, (6, 5);
+            DUP6 => $crate::instructions::stack::dup::<6, _, _>, 3, (6, 6);
+            DUP7 => $crate::instructions::stack::dup::<7, _, _>, 3, (6, 7);
+            DUP8 => $crate::instructions::stack::dup::<8, _, _>, 3, (6, 8);
+            DUP9 => $crate::instructions::stack::dup::<9, _, _>, 3, (6, 9);
+            DUP10 => $crate::instructions::stack::dup::<10, _, _>, 3, (6, 10);
+            DUP11 => $crate::instructions::stack::dup::<11, _, _>, 3, (6, 11);
+            DUP12 => $crate::instructions::stack::dup::<12, _, _>, 3, (6, 12);
+            DUP13 => $crate::instructions::stack::dup::<13, _, _>, 3, (6, 13);
+            DUP14 => $crate::instructions::stack::dup::<14, _, _>, 3, (6, 14);
+            DUP15 => $crate::instructions::stack::dup::<15, _, _>, 3, (6, 15);
+            DUP16 => $crate::instructions::stack::dup::<16, _, _>, 3, (6, 16);
+            SWAP1 => $crate::instructions::stack::swap::<1, _, _>, 3,
+                (4, $crate::instructions::stack::swap_at::<1, _, _>);
+            SWAP2 => $crate::instructions::stack::swap::<2, _, _>, 3,
+                (4, $crate::instructions::stack::swap_at::<2, _, _>);
+            SWAP3 => $crate::instructions::stack::swap::<3, _, _>, 3,
+                (4, $crate::instructions::stack::swap_at::<3, _, _>);
+            SWAP4 => $crate::instructions::stack::swap::<4, _, _>, 3,
+                (4, $crate::instructions::stack::swap_at::<4, _, _>);
+            SWAP5 => $crate::instructions::stack::swap::<5, _, _>, 3,
+                (4, $crate::instructions::stack::swap_at::<5, _, _>);
+            SWAP6 => $crate::instructions::stack::swap::<6, _, _>, 3,
+                (4, $crate::instructions::stack::swap_at::<6, _, _>);
+            SWAP7 => $crate::instructions::stack::swap::<7, _, _>, 3,
+                (4, $crate::instructions::stack::swap_at::<7, _, _>);
+            SWAP8 => $crate::instructions::stack::swap::<8, _, _>, 3,
+                (4, $crate::instructions::stack::swap_at::<8, _, _>);
+            SWAP9 => $crate::instructions::stack::swap::<9, _, _>, 3,
+                (4, $crate::instructions::stack::swap_at::<9, _, _>);
+            SWAP10 => $crate::instructions::stack::swap::<10, _, _>, 3,
+                (4, $crate::instructions::stack::swap_at::<10, _, _>);
+            SWAP11 => $crate::instructions::stack::swap::<11, _, _>, 3,
+                (4, $crate::instructions::stack::swap_at::<11, _, _>);
+            SWAP12 => $crate::instructions::stack::swap::<12, _, _>, 3,
+                (4, $crate::instructions::stack::swap_at::<12, _, _>);
+            SWAP13 => $crate::instructions::stack::swap::<13, _, _>, 3,
+                (4, $crate::instructions::stack::swap_at::<13, _, _>);
+            SWAP14 => $crate::instructions::stack::swap::<14, _, _>, 3,
+                (4, $crate::instructions::stack::swap_at::<14, _, _>);
+            SWAP15 => $crate::instructions::stack::swap::<15, _, _>, 3,
+                (4, $crate::instructions::stack::swap_at::<15, _, _>);
+            SWAP16 => $crate::instructions::stack::swap::<16, _, _>, 3,
+                (4, $crate::instructions::stack::swap_at::<16, _, _>);
             LOG0 => $crate::instructions::host::log::<0, _>, 0, 0;
             LOG1 => $crate::instructions::host::log::<1, _>, 0, 0;
             LOG2 => $crate::instructions::host::log::<2, _>, 0, 0;
@@ -292,15 +381,7 @@ const fn instruction_table_impl<WIRE: InterpreterTypes, H: Host>() -> [Instructi
 /// millions of times per block. OR-ing the limbs keeps it at a handful of instructions.
 #[inline(always)]
 pub(crate) fn u256_is_zero(value: &U256) -> bool {
-    let limbs = value.as_limbs();
-    (limbs[0] | limbs[1] | limbs[2] | limbs[3]) == 0
-}
-
-/// Whether two `U256` are equal, without going through `memcmp`. See [`u256_is_zero`].
-#[inline(always)]
-pub(crate) fn u256_eq(a: &U256, b: &U256) -> bool {
-    let (a, b) = (a.as_limbs(), b.as_limbs());
-    ((a[0] ^ b[0]) | (a[1] ^ b[1]) | (a[2] ^ b[2]) | (a[3] ^ b[3])) == 0
+    primitives::u256_is_zero(value)
 }
 
 #[cfg(test)]

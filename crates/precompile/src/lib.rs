@@ -235,6 +235,19 @@ impl Precompiles {
         if let Some(short_address) = short_address(address) {
             return self.optimized_access[short_address].as_ref();
         }
+        // Every precompile of every Ethereum spec so far is a short address, so on mainnet
+        // `all_short_addresses` holds and a long address cannot be in `inner`. `extend` is the
+        // only way an entry gets in and it clears the flag for anything that is not short, so
+        // the answer is `None` without looking.
+        //
+        // Worth stating because the lookup is not cheap: `AddressHashMap` is keyed with
+        // alloy's `FbBuildHasher`, whose `write` reassembles the 20 bytes with
+        // `usize::from_ne_bytes` on a byte-aligned pointer, and this target has no unaligned
+        // scalar load. It measured at 1.30 M retired instructions - 54 per call frame, since
+        // `EthPrecompiles::run` asks once per frame and almost every answer is `None`.
+        if self.all_short_addresses {
+            return None;
+        }
         self.inner.get(address)
     }
 

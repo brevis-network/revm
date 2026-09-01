@@ -1,12 +1,16 @@
 use super::TransitionAccount;
-use primitives::{hash_map::Entry, Address, HashMap};
+use primitives::{hash_map::Entry, Address, AddressMap, HashMap};
 use std::vec::Vec;
 
 /// State of accounts in transition between transaction executions.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct TransitionState {
     /// Block state account with account state
-    pub transitions: HashMap<Address, TransitionAccount>,
+    ///
+    /// Keyed by `Address`, so this uses [`FixedKeyHasher`](primitives::FixedKeyHasher)
+    /// rather than the default foldhash, whose long-input path costs ~190 retired
+    /// instructions per lookup in the zkVM guest. See [`AddressMap`].
+    pub transitions: AddressMap<TransitionAccount>,
 }
 
 impl TransitionState {
