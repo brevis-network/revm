@@ -147,10 +147,11 @@ pub(crate) fn bswap64_halves_shared(x: u64, m1: u64, m2: u64) -> u64 {
 /// on mainnet block 24006677: `ADDRESS` 85.0 -> 69.1 retired per dispatch, `CALLER` 78.0 ->
 /// 63.0.
 ///
-/// `Address` is `[u8; 20]` with alignment 1 and RV64 has no misaligned scalar load, so the
-/// ladder is the same shape as [`primitives::copy_address_bytes`]: 8-aligned, 4-aligned,
-/// then bytes. `InputsImpl`'s two address fields land 8- and 4-aligned, and the byte arm is
-/// never reached from the interpreter -- both offsets are compile-time multiples of 4.
+/// `Address` is `[u8; 20]` with alignment 1 and RV64 has no misaligned scalar load, so there
+/// is a ladder, but unlike [`primitives::copy_address_bytes`]'s it has no 8-aligned rung --
+/// see the comment on the 4-aligned arm for why the narrow loads win. `InputsImpl`'s two
+/// address fields land 8- and 4-aligned, so the byte arm is never reached from the
+/// interpreter: both offsets are compile-time multiples of 4.
 ///
 /// # Safety
 ///
@@ -165,19 +166,15 @@ pub(crate) unsafe fn u256_from_be_address(p: *const u8) -> U256 {
     // SAFETY: 20 readable bytes per the contract, and each arm only takes accesses as wide
     // as `p` is known to be aligned for.
     unsafe {
-        if a.is_multiple_of(8) {
-            let q = p.cast::<u64>();
-            let w0 = q.read();
-            let w1 = q.add(1).read();
-            let w2 = u64::from(p.add(16).cast::<u32>().read());
-            U256::from_limbs([
-                bswap64_masked((w1 >> 32) | (w2 << 32), m1, m2),
-                bswap64_masked((w0 >> 32) | (w1 << 32), m1, m2),
-                // Bytes 0..4 are the low half of `w0`; the reversal's stage 3 lifts them.
-                bswap64_halves_masked(w0 & 0xFFFF_FFFF, m1, m2),
-                0,
-            ])
-        } else if a.is_multiple_of(4) {
+        // No 8-aligned arm: it is *slower* here, which is the opposite of the usual. Two
+        // `lwu`s cost one instruction more than the `ld` that would cover both halves, but
+        // they hand the halves over already separated, and assembling them swapped is what
+        // makes the reversal ten instructions instead of thirteen. Net two per limb in the
+        // narrow loads' favour, and the whole conversion is 39 instructions against 47.
+        // Measured on block 24006677 by having `ADDRESS` (8-aligned field) take the wide arm
+        // and `CALLER` (4-aligned field) the narrow one: 68.0 against 60.0 retired per
+        // dispatch for the same work.
+        if a.is_multiple_of(4) {
             let q = p.cast::<u32>();
             let u0 = u64::from(q.read());
             let u1 = u64::from(q.add(1).read());
