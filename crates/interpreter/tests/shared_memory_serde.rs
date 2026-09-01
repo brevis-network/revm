@@ -17,3 +17,32 @@ fn deserialised_shared_memory_satisfies_inv_b() {
     let _ = back.get_u256(0);
     back.set_u256(32, U256::from(7u64));
 }
+
+/// INV-B case 5: someone else holding the same `Rc` grows the `Vec` and moves the
+/// allocation. There is no restore site for that, so the guard in `new_child_context` --
+/// the one check that is compiled into the guest as well -- has to catch it.
+///
+/// This cannot go vacuous: without the growth the same sequence returns a child normally,
+/// which the first half asserts.
+#[test]
+#[should_panic(expected = "INV-B broken before a child frame")]
+fn external_growth_is_caught_before_descending_into_a_child() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let buf = Rc::new(RefCell::new(Vec::<u8>::with_capacity(64)));
+    let mut m = SharedMemory::new_with_buffer(buf.clone());
+    m.resize(32);
+
+    // Control: with the buffer untouched, descending is fine.
+    let mut m2 = SharedMemory::new_with_buffer(buf.clone());
+    m2.resize(32);
+    let _child = m2.new_child_context();
+    m2.free_child_context();
+
+    // Now the case-5 violation: grow through the other handle, past the capacity, so the
+    // allocation moves and every cached `base` on it is left dangling.
+    buf.borrow_mut().reserve(1 << 16);
+
+    let _ = m.new_child_context();
+}

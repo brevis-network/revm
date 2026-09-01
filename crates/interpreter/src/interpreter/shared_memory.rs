@@ -671,7 +671,31 @@ impl SharedMemory {
         // INV-B, case 1: the child has a checkpoint of its own.
         // SAFETY: `new_checkpoint == buffer.len()`, which is in bounds of the allocation
         // (one-past-the-end at worst), so the offset is a valid pointer to form.
-        let base = unsafe { self.buffer_ref_mut().as_mut_ptr().add(new_checkpoint) };
+        let buf_start = self.buffer_ref_mut().as_mut_ptr();
+        // INV-B, case 5, checked here *in the guest too*.
+        //
+        // Case 5 is the one break with no restore site: something outside this type holding
+        // the same `Rc` can grow the `Vec` and move the allocation. `check_base` guards
+        // every access, but it is compiled out of the guest, which is the only build where
+        // a stale `base` is a wild store instead of a panic.
+        //
+        // This is the one place the true base is already in a register on the guest's own
+        // path -- `buf_start` is loaded either way -- so the check is a compare and a
+        // branch, ~2 instructions on 20,078 frame descents, against the 1.18 M that caching
+        // `base` saves. It does not cover a violation that happens *and* is used inside a
+        // single frame with no nested call; the cheap complete check is the three dependent
+        // loads this cache exists to remove.
+        //
+        // It aborts rather than reports: there is no log in the guest, and a corrupted
+        // memory image that keeps executing is worse than one that stops. A halt here means
+        // the block is rejected, which is the safe direction.
+        assert!(
+            self.base as usize == buf_start as usize + self.my_checkpoint,
+            "INV-B broken before a child frame: the shared memory buffer moved behind this \
+             context's back. See INV-B case 5 on SharedMemory::base -- something holding the \
+             same Rc grew the Vec."
+        );
+        let base = unsafe { buf_start.add(new_checkpoint) };
         SharedMemory {
             buffer: Some(self.buffer().clone()),
             base,
