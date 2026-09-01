@@ -281,13 +281,19 @@ fn return_inner(
     // //gas!(interpreter, gas::ZERO)
     popn!([offset, len], interpreter);
     let len = as_usize_or_fail!(interpreter, len);
-    // Important: Offset must be ignored if len is zeros
-    let mut output = Bytes::default();
-    if len != 0 {
+    // Important: Offset must be ignored if len is zeros.
+    //
+    // Written as one `if` *expression* rather than a default plus a conditional
+    // reassignment: with two assignments LLVM keeps `output` in its own 32-byte slot and
+    // then copies it into the action it is building, a copy worth 8 instructions on every
+    // RETURN/REVERT.
+    let output: Bytes = if len != 0 {
         let offset = as_usize_or_fail!(interpreter, offset);
         resize_memory!(interpreter, offset, len);
-        output = interpreter.memory.slice_len(offset, len).to_vec().into()
-    }
+        interpreter.memory.slice_len(offset, len).to_vec().into()
+    } else {
+        Bytes::default()
+    };
 
     interpreter.set_action(InterpreterAction::new_return(
         instruction_result,
