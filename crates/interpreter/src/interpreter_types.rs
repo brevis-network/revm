@@ -176,6 +176,17 @@ pub trait MemoryTr {
     /// Panics if range is out of scope of allocated memory.
     fn global_slice(&self, range: Range<usize>) -> Ref<'_, [u8]>;
 
+    /// Data pointer of the whole shared buffer, without taking a borrow guard.
+    ///
+    /// [`global_slice`](Self::global_slice) hands back a `Ref`, and on the guest target that
+    /// guard is three retired instructions to bump the borrow count and three more to drop
+    /// it. `CALLDATALOAD` pays them 46,000 times on mainnet block 24006677 for a pointer
+    /// that dies inside the statement that made it.
+    ///
+    /// The pointer is invalidated by anything that can grow the memory, so read through it
+    /// before the next `resize`.
+    fn global_ptr(&self) -> *const u8;
+
     /// Offset of local context of memory.
     fn local_memory_offset(&self) -> usize;
 

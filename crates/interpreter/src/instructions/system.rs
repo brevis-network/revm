@@ -208,7 +208,21 @@ pub fn calldataload_at<WIRE: InterpreterTypes, H: ?Sized>(
     // keeps all four limbs live to the end, which cost this instruction a prologue that
     // saved ten callee-saved registers on every `CALLDATALOAD`.
     let dst = (offset_ptr as *mut U256).cast::<u64>();
-    let input_len = context.interpreter.input.input().len();
+    // One match over the input, not two. Asking for `len()` and then matching again to get
+    // the bytes made LLVM re-test the discriminant, reload `range.start` and recompute the
+    // length -- and `global_slice` hands back a `Ref`, whose guard is three retired
+    // instructions to bump the shared buffer's borrow count and three more to drop it, on
+    // every `CALLDATALOAD`, for a pointer that dies inside the statement.
+    let (base, input_len) = match context.interpreter.input.input() {
+        CallInput::SharedBuffer(range) => {
+            let (start, end) = (range.start, range.end);
+            // SAFETY: `start` is in bounds of the shared buffer -- it is where the caller
+            // wrote this frame's calldata -- and nothing here can resize the memory.
+            let base = unsafe { context.interpreter.memory.global_ptr().add(start) };
+            (base, end.saturating_sub(start))
+        }
+        CallInput::Bytes(bytes) => (bytes.as_ptr(), bytes.len()),
+    };
 
     // The word used to be assembled as a `B256` (a runtime-length `memcpy`, 72.8 retired
     // instructions) and then converted with `B256 -> U256`, which is four software byte
@@ -226,17 +240,8 @@ pub fn calldataload_at<WIRE: InterpreterTypes, H: ?Sized>(
         return (sp, rem);
     }
     let count = 32.min(input_len - offset);
-    match context.interpreter.input.input() {
-        CallInput::Bytes(bytes) => {
-            // SAFETY: `offset < input_len` and `count <= input_len - offset`.
-            unsafe { be_word_to(bytes.as_ptr().add(offset), count, dst) }
-        }
-        CallInput::SharedBuffer(range) => {
-            let input_slice = context.interpreter.memory.global_slice(range.clone());
-            // SAFETY: as above, within the shared-buffer slice.
-            unsafe { be_word_to(input_slice.as_ptr().add(offset), count, dst) }
-        }
-    }
+    // SAFETY: `offset < input_len` and `count <= input_len - offset`.
+    unsafe { be_word_to(base.add(offset), count, dst) }
     (sp, rem)
 }
 

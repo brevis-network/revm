@@ -573,6 +573,15 @@ impl MemoryTr for SharedMemory {
         })
     }
 
+    #[inline]
+    fn global_ptr(&self) -> *const u8 {
+        // SAFETY: the guest is single threaded and no other borrow of the shared buffer is
+        // live while an instruction executes, so going through `RefCell::as_ptr` gives the
+        // same access as `dbg_borrow`, without the borrow-flag bookkeeping. Same argument as
+        // `SharedMemory::resize` above.
+        unsafe { (*self.buffer().as_ptr()).as_ptr() }
+    }
+
     fn resize(&mut self, new_size: usize) -> bool {
         self.resize(new_size);
         true
