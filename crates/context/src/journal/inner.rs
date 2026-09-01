@@ -1090,7 +1090,12 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     }
 
     /// Resolves a storage slot to a mutable reference, warming it and journaling the warm
-    /// load if it was cold.
+    /// load if it was cold: everything [`sload_slot_warm`] declined to do.
+    ///
+    /// Redoes both lookups rather than being handed their results, which costs a probe on
+    /// a path taken 752 times in 76,821 and is what keeps all six of these arguments out of
+    /// the warm path's live set. The account lookup lands in the cache the warm path just
+    /// filled, so in practice it is a tag compare.
     ///
     /// Takes the journal's fields apart rather than `&mut self` so that the caller keeps
     /// access to [`Self::journal`] while holding the returned slot: that is what lets
@@ -1100,9 +1105,10 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     /// # Panics
     ///
     /// Panics if the account is not present in the state.
-    #[inline]
+    #[inline(never)]
+    #[cold]
     #[allow(clippy::too_many_arguments)]
-    fn sload_slot<'a, DB: Database>(
+    fn sload_slot_cold<'a, DB: Database>(
         state: &'a mut EvmState,
         account_cache: &mut AccountCache,
         warm_addresses: &WarmAddresses,
@@ -1124,15 +1130,15 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // it is for every SLOAD and SSTORE of a call frame after the first; see
         // [`AccountCache`] for why a bucket pointer may be kept and where it is dropped.
         //
-        // Keyed by `FastAddress` so the bucket comparison is word-wise; see there. This is
-        // the only site that uses it - a second caller of the same instantiation pushes
+        // Keyed by `FastAddressAt` so the bucket comparison is word-wise; see there. Tag 4,
+        // and this is its only call site: a second caller of one instantiation pushes
         // `RawTable::find` past the inliner and it outlines, which costs more than it saves.
         let words = AccountCache::address_words(&address);
         let account: *mut Account = match words.and_then(|w| account_cache.get(w)) {
             Some(cached) => cached,
             None => {
                 let found: *mut Account = state
-                    .get_mut(primitives::FastAddress::new(&address))
+                    .get_mut(primitives::FastAddressAt::<4>::new(&address))
                     .unwrap();
                 match words {
                     // SAFETY: `found` is the account stored under `w` in `state`, and this
@@ -1147,18 +1153,18 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             }
         };
 
-        // Hit path: the slot is already in the account's map. 76,069 of 76,821 calls on
-        // mainnet block 24006677 land here, so everything the miss path needs -- the database
-        // read, the insert, the access-list probe -- lives in `sload_slot_miss` instead.
-        // `HashMap::entry` would drag the insert-and-grow machinery in here as well, and it is
-        // that, not the work itself, that gave this function a 464-byte frame and twelve
-        // callee-saved registers to spill.
+        // The slot is in the account's map but cold, which is one of the two reasons the warm
+        // path declines. `HashMap::entry` would drag the insert-and-grow machinery in here as
+        // well, and it is that, not the work itself, that gave this function a 464-byte frame
+        // and twelve callee-saved registers to spill; the insert stays in `sload_slot_miss`.
         //
         // SAFETY: `account` was just derived from a live `&mut Account`, and no other access
         // to `state` happens before it is used.
-        // Keyed by `FastU256` so the bucket comparison is limb-wise rather than a 32-byte
-        // `memcmp` libcall; see there.
-        if let Some(slot) = unsafe { (*account).storage.get_mut(primitives::FastU256::new(&key)) } {
+        // Keyed by `FastU256At` so the bucket comparison is limb-wise rather than a 32-byte
+        // `memcmp` libcall; see there. Tag 1, and this is its only call site.
+        if let Some(slot) = unsafe { (*account)
+                .storage
+                .get_mut(primitives::FastU256At::<1>::new(&key)) } {
             let is_cold = slot.is_cold_transaction_id(transaction_id);
             if is_cold {
                 if skip_cold_load {
@@ -1188,7 +1194,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         )
     }
 
-    /// The half of [`Self::sload_slot`] that runs when the slot is not in the account's map
+    /// The half of [`Self::sload_slot_cold`] that runs when the slot is not in the account's map
     /// yet, which on mainnet block 24006677 is 752 calls out of 76,821.
     ///
     /// Out of line so the hit path carries neither its stack frame nor its register pressure.
@@ -1244,6 +1250,52 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         key: StorageKey,
         skip_cold_load: bool,
     ) -> Result<StateLoad<StorageValue>, JournalLoadError<DB::Error>> {
+        let slot = sload_slot_warm(
+            &mut self.state,
+            &mut self.account_cache,
+            self.transaction_id,
+            &address,
+            &key,
+        );
+        if slot.is_null() {
+            return self.sload_cold(db, address, key, skip_cold_load);
+        }
+        // `StateLoad::new(slot.present_value, ..)` is a 32-byte move that LLVM lowers to a
+        // `memcpy` libcall on this target once the value has been through `Result`'s niche
+        // layout; at 62 K SLOADs per mainnet block it was the single most frequent `memcpy`
+        // call site in the guest. Storing four limbs states the alignment at the store.
+        // SAFETY: `p` points at a fresh, 8-aligned `StateLoad<StorageValue>`, and both of its
+        // fields are written exactly once below, so `assume_init` sees an initialized value.
+        // `slot` is non-null, so it points at a slot inside `self.state`, which nothing has
+        // touched since.
+        Ok(unsafe {
+            let mut out = mem::MaybeUninit::<StateLoad<StorageValue>>::uninit();
+            let p = out.as_mut_ptr();
+            primitives::copy_u256(
+                core::ptr::addr_of_mut!((*p).data),
+                &(*slot).present_value,
+            );
+            core::ptr::addr_of_mut!((*p).is_cold).write(false);
+            out.assume_init()
+        })
+    }
+
+    /// [`Self::sload`] for a slot [`sload_slot_warm`] declined.
+    ///
+    /// Out of line, `cold`, and taking `&mut self` rather than the journal's fields: the
+    /// point of the split is that the warm path does not keep `db`, `warm_addresses`,
+    /// `journal` or `skip_cold_load` live, and marshalling nine arguments at the call site
+    /// would put them back. It also keeps `sload` small enough to stay inlined into the
+    /// interpreter; leaving that to the inliner outlined `sstore` and cost +2,532,111.
+    #[inline(never)]
+    #[cold]
+    fn sload_cold<DB: Database>(
+        &mut self,
+        db: &mut DB,
+        address: Address,
+        key: StorageKey,
+        skip_cold_load: bool,
+    ) -> Result<StateLoad<StorageValue>, JournalLoadError<DB::Error>> {
         let Self {
             state,
             account_cache,
@@ -1252,7 +1304,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             transaction_id,
             ..
         } = self;
-        let load = Self::sload_slot(
+        let load = Self::sload_slot_cold(
             state,
             account_cache,
             warm_addresses,
@@ -1263,12 +1315,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             key,
             skip_cold_load,
         )?;
-        // `StateLoad::new(slot.present_value, ..)` is a 32-byte move that LLVM lowers to a
-        // `memcpy` libcall on this target once the value has been through `Result`'s niche
-        // layout; at 62 K SLOADs per mainnet block it was the single most frequent `memcpy`
-        // call site in the guest. Storing four limbs states the alignment at the store.
-        // SAFETY: `p` points at a fresh, 8-aligned `StateLoad<StorageValue>`, and both of its
-        // fields are written exactly once below, so `assume_init` sees an initialized value.
+        // SAFETY: as in `sload`.
         Ok(unsafe {
             let mut out = mem::MaybeUninit::<StateLoad<StorageValue>>::uninit();
             let p = out.as_mut_ptr();
@@ -1292,6 +1339,49 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         new: StorageValue,
         skip_cold_load: bool,
     ) -> Result<StateLoad<SStoreResult>, JournalLoadError<DB::Error>> {
+        // assume that acc exists and load the slot. The slot reference is kept alive across
+        // the journal push below, so neither the account nor the slot is looked up twice.
+        let slot = sload_slot_warm(
+            &mut self.state,
+            &mut self.account_cache,
+            self.transaction_id,
+            &address,
+            &key,
+        );
+        if slot.is_null() {
+            return self.sstore_cold(db, address, key, new, skip_cold_load);
+        }
+        // SAFETY: non-null, so it points at a slot inside `self.state`. `self.journal` is a
+        // different field, so pushing to it below cannot disturb it.
+        let slot = unsafe { &mut *slot };
+        let present = slot.present_value;
+
+        // new value is same as present, we don't need to do anything.
+        // `!=` on `U256` is a memcmp libcall on the guest target; see `primitives::u256_eq`.
+        if !primitives::u256_eq(&present, &new) {
+            self.journal
+                .push(ENTRY::storage_changed(address, key, present));
+            // insert value into present state.
+            slot.present_value = new;
+        }
+
+        Ok(StateLoad::new(
+            sstore_result(slot.original_value(), present, new),
+            false,
+        ))
+    }
+
+    /// [`Self::sstore`] for a slot [`sload_slot_warm`] declined; see [`Self::sload_cold`].
+    #[inline(never)]
+    #[cold]
+    fn sstore_cold<DB: Database>(
+        &mut self,
+        db: &mut DB,
+        address: Address,
+        key: StorageKey,
+        new: StorageValue,
+        skip_cold_load: bool,
+    ) -> Result<StateLoad<SStoreResult>, JournalLoadError<DB::Error>> {
         let Self {
             state,
             account_cache,
@@ -1300,9 +1390,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             transaction_id,
             ..
         } = self;
-        // assume that acc exists and load the slot. The slot reference is kept alive across
-        // the journal push below, so neither the account nor the slot is looked up twice.
-        let load = Self::sload_slot(
+        let load = Self::sload_slot_cold(
             state,
             account_cache,
             warm_addresses,
@@ -1317,11 +1405,8 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         let slot = load.data;
         let present = slot.present_value;
 
-        // new value is same as present, we don't need to do anything.
-        // `!=` on `U256` is a memcmp libcall on the guest target; see `primitives::u256_eq`.
         if !primitives::u256_eq(&present, &new) {
             journal.push(ENTRY::storage_changed(address, key, present));
-            // insert value into present state.
             slot.present_value = new;
         }
 
@@ -1383,6 +1468,84 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     pub fn log(&mut self, log: Log) {
         self.logs.push(log);
     }
+}
+
+/// The warm path of a storage access: the account is in the state map, the slot is in the
+/// account's map, and the slot is already warm.
+///
+/// Null when any of the three does not hold. The caller then takes
+/// [`JournalInner::sload_cold`] or [`JournalInner::sstore_cold`], which redo both lookups and
+/// handle the case; on mainnet block 24006677 that is 752 of 76,821 accesses.
+///
+/// The split is for the stack frame, not for the work. With one body, the four arguments only
+/// the slow half needs -- `warm_addresses`, `journal`, `db`, `skip_cold_load` -- plus the
+/// `unwrap` and the journal push, which are calls and so need `ra` saved, gave the function
+/// thirteen callee-saved registers and a 272-byte frame: 54 of the 151 retired instructions
+/// it spent per call went on its own prologue and epilogue, more than the storage probe it
+/// exists to do. This half takes five arguments, makes no call, and hands back a pointer
+/// rather than a `Result` in an `sret` slot.
+///
+/// Not a method: nothing here needs `ENTRY` or `DB`, so as a free function it is one
+/// instantiation for `sload` and `sstore` together rather than one per journal entry type.
+///
+/// # Safety
+///
+/// A non-null return points at a slot inside `state` and is valid for as long as the caller's
+/// borrow of `state`; nothing here keeps a reference past the return.
+#[inline(never)]
+fn sload_slot_warm(
+    state: &mut EvmState,
+    account_cache: &mut AccountCache,
+    transaction_id: usize,
+    address: &Address,
+    key: &StorageKey,
+) -> *mut EvmStorageSlot {
+    // A raw pointer rather than a `&mut`: the slot returned below points into this account,
+    // and NLL cannot see that the two arms are exclusive. Exactly one reference is ever
+    // created from it, and nothing touches `state` in between.
+    //
+    // The lookup is skipped whenever the account is one of the two the cache holds, which on
+    // mainnet block 24006677 is 74,948 of 76,821 calls; see [`AccountCache`] for why a bucket
+    // pointer may be kept and where it is dropped.
+    //
+    // Keyed by `FastAddress` - tag 0 - so the bucket comparison is word-wise; see there. This
+    // is the only site that uses tag 0: a second caller of one instantiation pushes
+    // `RawTable::find` past the inliner and it outlines, which costs more than it saves.
+    let words = AccountCache::address_words(address);
+    let account: *mut Account = match words.and_then(|w| account_cache.get(w)) {
+        Some(cached) => cached,
+        None => match state.get_mut(primitives::FastAddress::new(address)) {
+            Some(found) => {
+                let found: *mut Account = found;
+                match words {
+                    // SAFETY: `found` is the account stored under `w` in `state`, and this
+                    // module empties the cache everywhere `state` can restructure.
+                    Some(w) => account_cache.put(w, found),
+                    // Not cacheable: the address cannot be compared word-wise. Clears rather
+                    // than keeps the previous addresses' entries -- a pessimisation, not a
+                    // required clear; see the note on `AccountCache`.
+                    None => account_cache.clear(),
+                }
+                found
+            }
+            // The cold path panics. Returning instead of panicking here is what keeps this
+            // function free of calls, and so free of a saved `ra`.
+            None => return core::ptr::null_mut(),
+        },
+    };
+
+    // SAFETY: `account` was just derived from a live `&mut Account`, and no other access to
+    // `state` happens before it is used.
+    // Keyed by `FastU256` - tag 0 - so the bucket comparison is limb-wise rather than a
+    // 32-byte `memcmp` libcall; see there. The only site that uses tag 0.
+    let Some(slot) = (unsafe { (*account).storage.get_mut(primitives::FastU256::new(key)) }) else {
+        return core::ptr::null_mut();
+    };
+    if slot.is_cold_transaction_id(transaction_id) {
+        // Warming it journals the load, and journalling needs `journal`; the cold path has it.
+        return core::ptr::null_mut();
+    }
+    slot
 }
 
 /// Builds an [`SStoreResult`] limb by limb.

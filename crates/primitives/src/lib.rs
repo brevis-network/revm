@@ -654,12 +654,19 @@ impl<const TAG: usize> core::borrow::Borrow<FastAddressAt<TAG>> for Address {
 /// `map.get_mut(FastU256::new(&key))` and neither the map type nor a stored key changes.
 /// `Hash` forwards to `U256`'s, so the query hashes into the bucket the key was stored in;
 /// `fast_u256_finds_what_u256_stored` pins that.
+///
+/// `TAG` is [`FastAddressAt`]'s, for the same reason: one query type shared between two call
+/// sites is what makes LLVM outline hashbrown's probe, and the call then costs more than the
+/// `memcmp` it saved. Pick a tag per call site and say which in a comment there.
 #[derive(Debug, Eq)]
 #[repr(transparent)]
-pub struct FastU256(U256);
+pub struct FastU256At<const TAG: usize>(U256);
 
-impl FastU256 {
-    /// Borrows a [`U256`] as a [`FastU256`].
+/// [`FastU256At`] with the tag the warm storage lookup uses.
+pub type FastU256 = FastU256At<0>;
+
+impl<const TAG: usize> FastU256At<TAG> {
+    /// Borrows a [`U256`] as a [`FastU256At`].
     #[inline(always)]
     pub fn new(value: &U256) -> &Self {
         // SAFETY: `#[repr(transparent)]` over `U256`, so the two have the same layout and
@@ -668,24 +675,24 @@ impl FastU256 {
     }
 }
 
-impl PartialEq for FastU256 {
+impl<const TAG: usize> PartialEq for FastU256At<TAG> {
     #[inline(always)]
     fn eq(&self, other: &Self) -> bool {
         u256_eq(&self.0, &other.0)
     }
 }
 
-impl core::hash::Hash for FastU256 {
+impl<const TAG: usize> core::hash::Hash for FastU256At<TAG> {
     #[inline(always)]
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.0.hash(state);
     }
 }
 
-impl core::borrow::Borrow<FastU256> for U256 {
+impl<const TAG: usize> core::borrow::Borrow<FastU256At<TAG>> for U256 {
     #[inline(always)]
-    fn borrow(&self) -> &FastU256 {
-        FastU256::new(self)
+    fn borrow(&self) -> &FastU256At<TAG> {
+        FastU256At::new(self)
     }
 }
 
