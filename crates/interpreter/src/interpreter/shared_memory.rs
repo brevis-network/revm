@@ -317,10 +317,27 @@ unsafe fn store_be_word_bytes(p: *mut u8, src: *const u64) {
         if (l3 | l2 | l1) == 0 {
             // Same ladder as the aligned path: a value below `2^64` leaves the top 24 bytes
             // zero, and a zero byte needs no shift to produce.
-            let mut j = 0;
-            while j < 24 {
-                p.add(j).write(0);
-                j += 1;
+            //
+            // Volatile, so that LLVM's loop-idiom pass cannot turn the fill back into the
+            // `memset` libcall it was: measured at ~63 retired instructions a call against
+            // the 24 stores it replaces, on 10,192 calls on mainnet block 24006677.
+            //
+            // The four-aligned rung is worth its two-instruction test because this path only
+            // runs for offsets that are *not* 8-aligned, and the ones that occur are the ABI
+            // encoders' `p + 4`: six `sw` instead of twenty-four `sb`.
+            if (p as usize).is_multiple_of(core::mem::align_of::<u32>()) {
+                let q = p.cast::<u32>();
+                let mut j = 0;
+                while j < 6 {
+                    q.add(j).write_volatile(0);
+                    j += 1;
+                }
+            } else {
+                let mut j = 0;
+                while j < 24 {
+                    p.add(j).write_volatile(0);
+                    j += 1;
+                }
             }
             store_be_limb_bytes(p.add(24), *src);
             return;
@@ -1527,11 +1544,54 @@ pub fn resize_memory_written<Memory: MemoryTr>(
     len: usize,
 ) -> bool {
     let new_num_words = num_words(offset.saturating_add(len));
-    if new_num_words > gas.memory().words_num {
+    if new_num_words > gas.memory().words_num() {
         resize_memory_cold_written(gas, memory, new_num_words, offset, len)
     } else {
         true
     }
+}
+
+/// The expansion half of a 32-byte `MSTORE` whose caller has *already* found that the word
+/// does not fit, by testing `offset >= gas.memory().word_limit()`.
+///
+/// Splitting the test out of [`resize_memory_written`] is what lets `MSTORE` keep the whole
+/// gas machinery on the cold side: the hot path then neither publishes the threaded counter
+/// nor re-reads it, and the "does it fit" test is a single `bgeu` against a field instead of
+/// a saturating `num_words` of `offset + 32`.
+///
+/// # Safety
+///
+/// The caller's test is the precondition: `num_words(offset + 32) > words_num` must already
+/// hold, because `resize_memory_cold_written` reaches `record_new_len` through
+/// `unwrap_unchecked`.
+#[inline(always)]
+#[must_use]
+pub unsafe fn grow_memory_word_written<Memory: MemoryTr>(
+    gas: &mut crate::Gas,
+    memory: &mut Memory,
+    offset: usize,
+) -> bool {
+    let new_num_words = num_words(offset.saturating_add(32));
+    debug_assert!(new_num_words > gas.memory().words_num());
+    resize_memory_cold_written(gas, memory, new_num_words, offset, 32)
+}
+
+/// [`grow_memory_word_written`] for a caller that only reads the word (`MLOAD`), so the new
+/// tail has to be zeroed in full.
+///
+/// # Safety
+///
+/// Same precondition as [`grow_memory_word_written`].
+#[inline(always)]
+#[must_use]
+pub unsafe fn grow_memory_word<Memory: MemoryTr>(
+    gas: &mut crate::Gas,
+    memory: &mut Memory,
+    offset: usize,
+) -> bool {
+    let new_num_words = num_words(offset.saturating_add(32));
+    debug_assert!(new_num_words > gas.memory().words_num());
+    resize_memory_cold(gas, memory, new_num_words)
 }
 
 /// [`resize_memory_cold`] for [`resize_memory_written`]; inlined for the same reason.
@@ -1565,7 +1625,7 @@ pub fn resize_memory<Memory: MemoryTr>(
     len: usize,
 ) -> bool {
     let new_num_words = num_words(offset.saturating_add(len));
-    if new_num_words > gas.memory().words_num {
+    if new_num_words > gas.memory().words_num() {
         resize_memory_cold(gas, memory, new_num_words)
     } else {
         true

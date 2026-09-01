@@ -19,7 +19,10 @@ pub(crate) use shared_memory::{
     bswap64_halves_shared, bswap64_shared, bswap_masks_shared, u256_from_be_address,
     u256_from_be_aligned,
 };
-pub use shared_memory::{num_words, resize_memory, resize_memory_written, SharedMemory};
+pub use shared_memory::{
+    grow_memory_word, grow_memory_word_written, num_words, resize_memory, resize_memory_written,
+    SharedMemory,
+};
 pub use stack::{too_shallow_for, Stack, BYTE_LIMIT, STACK_LIMIT, WORD};
 
 // imports
@@ -669,9 +672,46 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
             ((6, $n:literal), $_f:expr) => {{
                 ip = unsafe { ip.add(1) };
                 if sp != byte_limit && (sp as isize) > too_shallow_for($n) {
-                    // SAFETY: room and depth checked above, in that order.
-                    unsafe { self.stack.dup_at(sp, $n) };
-                    sp = sp.wrapping_add(WORD);
+                    // Fused `DUP2; MSTORE`: the word `DUP2` copies to the top is the offset
+                    // `MSTORE` pops straight back off, so the copy never happens and the
+                    // store reads it where it lies. See `memory::mstore_dup2_at` for why
+                    // this pair and no other, and for what the two tests above cover.
+                    //
+                    // Const-folded away in the other fifteen `DUP` arms: `DUP1; MLOAD` is
+                    // 9.9 % of `DUP1` and the peek does not pay for itself below ~20 %.
+                    //
+                    // Falls through to the bottom of the arm rather than `continue`-ing, for
+                    // the reason recorded at length on the `(2, N)` arm above: an extra back
+                    // edge tips the whole loop's register allocation.
+                    if $n == 2
+                        && unsafe { *ip } == $crate::instructions::opcode_consts::MSTORE
+                    {
+                        // The `MSTORE`'s own static charge, on the same counter and with the
+                        // same exit as a dispatch of its own would have taken.
+                        rem = rem.wrapping_sub($crate::gas::VERYLOW);
+                        if (rem as i64) < 0 {
+                            // `ip` is at the `MSTORE`; leave the same pointer behind the
+                            // unfused pair would have.
+                            self.bytecode.set_ip(unsafe { ip.add(1) });
+                            break;
+                        }
+                        ip = unsafe { ip.add(1) };
+                        let (next_sp, next_rem) =
+                            $crate::instructions::memory::mstore_dup2_at(
+                                InstructionContext {
+                                    interpreter: self,
+                                    host,
+                                },
+                                sp,
+                                rem,
+                            );
+                        sp = next_sp;
+                        rem = next_rem;
+                    } else {
+                        // SAFETY: room and depth checked above, in that order.
+                        unsafe { self.stack.dup_at(sp, $n) };
+                        sp = sp.wrapping_add(WORD);
+                    }
                 } else {
                     // Same halt as `poison_at!`: publish the counter for the halt to stash,
                     // hand the poison back in the register, leave the cursor alone.
