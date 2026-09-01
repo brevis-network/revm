@@ -999,13 +999,12 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // source at an alignment it cannot know and LLVM lowers even its aligned arm as 32-bit
         // halves that it then reassembles, which measured 25 retired instructions per call
         // against six for three loads and three stores.
+        // The misaligned arm is out of line so that LLVM does not merge the two: with both
+        // here it read the last four bytes of the address one at a time on *both* paths,
+        // because one of them has to. 32,982 of 32,983 calls take the aligned arm.
         let (address, words) = match AccountCache::address_words(&address) {
             Some((w0, w1, w2)) => (AlignedAddress::from_words(w0, w1, w2), (w0, w1, w2)),
-            None => {
-                let address = AlignedAddress::new(&address);
-                let words = AccountCache::aligned_words(&address);
-                (address, words)
-            }
+            None => rehome_misaligned_address(&address),
         };
         // `entry` takes the key by value and compares it with `K: Eq`, so `Equivalent` cannot
         // redirect the bucket comparison and it stays the 20-byte `memcmp` libcall
@@ -1548,6 +1547,20 @@ fn resolve_account(
         }
         None => core::ptr::null_mut(),
     }
+}
+
+/// Re-homes an [`Address`] that does not start 8-aligned, and reads its three words.
+///
+/// Out of line, and `cold`, so that [`JournalInner::load_account_mut_optional_code`]'s
+/// aligned arm is three loads and three stores. Inline, LLVM merges the tails of the two arms
+/// and the merged tail reads the last four bytes of the address one at a time, which is what
+/// the misaligned arm needs and the aligned one does not.
+#[inline(never)]
+#[cold]
+fn rehome_misaligned_address(address: &Address) -> (AlignedAddress, (u64, u64, u32)) {
+    let address = AlignedAddress::new(address);
+    let words = AccountCache::aligned_words(&address);
+    (address, words)
 }
 
 /// The warm path of a storage access: the account is in the state map, the slot is in the
