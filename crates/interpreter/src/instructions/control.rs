@@ -49,8 +49,10 @@ pub fn jump_at<const FUSE_JUMPDEST: bool, ITy: InterpreterTypes, H: ?Sized>(
 ) -> (*const u8, usize) {
     //gas!(context.interpreter, gas::MID);
     popn_at!([target], context.interpreter, sp, (ip, sp));
+    // `PRECHARGED == FUSE_JUMPDEST`: where the `JUMPDEST` is elided, the arm's static gas
+    // already covers it, and `JUMP` always lands on it. See `for_each_builtin_instruction!`.
     (
-        jump_inner::<FUSE_JUMPDEST, _>(context.interpreter, target, ip, jctx),
+        jump_inner::<FUSE_JUMPDEST, FUSE_JUMPDEST, _>(context.interpreter, target, ip, jctx),
         sp,
     )
 }
@@ -94,8 +96,10 @@ pub fn jumpi_at<const FUSE_JUMPDEST: bool, WIRE: InterpreterTypes, H: ?Sized>(
     if super::u256_is_zero(&cond) {
         return (ip, sp);
     }
+    // `PRECHARGED = false`: the elided `JUMPDEST` is charged in `jump_to`, because it is
+    // conditional here. See `for_each_builtin_instruction!`.
     (
-        jump_inner::<FUSE_JUMPDEST, _>(context.interpreter, target, ip, jctx),
+        jump_inner::<FUSE_JUMPDEST, false, _>(context.interpreter, target, ip, jctx),
         sp,
     )
 }
@@ -104,14 +108,14 @@ pub fn jumpi_at<const FUSE_JUMPDEST: bool, WIRE: InterpreterTypes, H: ?Sized>(
 ///
 /// Validates jump target and performs the actual jump.
 #[inline(always)]
-fn jump_inner<const FUSE_JUMPDEST: bool, WIRE: InterpreterTypes>(
+fn jump_inner<const FUSE_JUMPDEST: bool, const PRECHARGED: bool, WIRE: InterpreterTypes>(
     interpreter: &mut Interpreter<WIRE>,
     target: U256,
     ip: *const u8,
     jctx: JumpCtx,
 ) -> *const u8 {
     let target = as_usize_or_fail_ret!(interpreter, target, InstructionResult::InvalidJump, ip);
-    jump_to::<FUSE_JUMPDEST, _>(interpreter, target, ip, jctx)
+    jump_to::<FUSE_JUMPDEST, PRECHARGED, _>(interpreter, target, ip, jctx)
 }
 
 /// [`jump_inner`] once the destination is already a `usize`.
@@ -120,7 +124,7 @@ fn jump_inner<const FUSE_JUMPDEST: bool, WIRE: InterpreterTypes>(
 /// straight from the two immediate bytes and so is known to fit in a `usize` -- the four
 /// limb tests `as_usize_or_fail_ret!` does are dead there.
 #[inline(always)]
-pub fn jump_to<const FUSE_JUMPDEST: bool, WIRE: InterpreterTypes>(
+pub fn jump_to<const FUSE_JUMPDEST: bool, const PRECHARGED: bool, WIRE: InterpreterTypes>(
     interpreter: &mut Interpreter<WIRE>,
     target: usize,
     ip: *const u8,
@@ -148,7 +152,9 @@ pub fn jump_to<const FUSE_JUMPDEST: bool, WIRE: InterpreterTypes>(
     // also drives `Interpreter::step`, and a step-by-step caller (an inspector) does observe
     // the JUMPDEST step, so the table is built with `FUSE_JUMPDEST = false`.
     if FUSE_JUMPDEST {
-        if interpreter.gas.record_cost_unsafe(crate::gas::JUMPDEST) {
+        // `PRECHARGED`: the caller folded this charge into its own, so there is no second
+        // `addi`/`sd`/`bltz` here. See `for_each_builtin_instruction!`.
+        if !PRECHARGED && interpreter.gas.record_cost_unsafe(crate::gas::JUMPDEST) {
             interpreter.halt_oog();
             return ip;
         }
@@ -187,12 +193,27 @@ pub unsafe fn jump_imm_at<const N: usize, WIRE: InterpreterTypes>(
 ) -> (*const u8, usize) {
     // The `PUSH` opcode, its `N` immediate bytes, and the `JUMP` byte.
     let next = unsafe { ip.add(N + 2) };
-    if interpreter.gas.record_cost_unsafe(crate::gas::MID) {
+    // The `JUMP` and the `JUMPDEST` it lands on, charged as one: `record_cost_unsafe` is an
+    // `addi`, a store into the gas field and a branch, and this arm ran two of them back to
+    // back. Worth 3 retired instructions on each of the 168,479 fused `JUMP`s on mainnet
+    // block 24006677.
+    //
+    // Sound because the second charge is *unconditional* -- `JUMP` always lands on the
+    // `JUMPDEST` -- so the only execution the merge can change is one that has `MID` but not
+    // `MID + JUMPDEST` *and* an invalid destination: it halts out-of-gas where it used to
+    // halt `InvalidJump`. Both are exceptional, both spend the frame's whole limit, and
+    // neither reason is consensus-visible. See the note on `JUMPI` in
+    // `for_each_builtin_instruction!` for the conditional case, which is *not* sound and
+    // which block 24006790 catches.
+    if interpreter
+        .gas
+        .record_cost_unsafe(crate::gas::MID + crate::gas::JUMPDEST)
+    {
         interpreter.halt_oog();
         return (next, sp);
     }
     let target = unsafe { read_be_usize::<N>(ip.add(1)) };
-    (jump_to::<true, _>(interpreter, target, next, jctx), sp)
+    (jump_to::<true, true, _>(interpreter, target, next, jctx), sp)
 }
 
 /// Fused `PUSH<N>; JUMPI`. See [`jump_imm_at`].
@@ -227,10 +248,10 @@ pub unsafe fn jumpi_imm_at<const N: usize, WIRE: InterpreterTypes>(
             return (next, sp);
         }
         let target = unsafe { read_be_usize::<N>(ip.add(1)) };
-        return (jump_to::<true, _>(interpreter, target, next, jctx), sp);
+        return (jump_to::<true, false, _>(interpreter, target, next, jctx), sp);
     }
     let target = unsafe { read_be_usize::<N>(ip.add(1)) };
-    (jump_to::<true, _>(interpreter, target, next, jctx), sp)
+    (jump_to::<true, false, _>(interpreter, target, next, jctx), sp)
 }
 
 /// The `N` big-endian bytes at `src` as a `usize`.

@@ -231,7 +231,28 @@ macro_rules! for_each_builtin_instruction {
                 (4, $crate::instructions::host::sload_at);
             SSTORE => $crate::instructions::host::sstore, 0,
                 (4, $crate::instructions::host::sstore_at);
-            JUMP => $crate::instructions::control::jump::<$fuse, _, _>, 8,
+            // The `+ 1` is the `JUMPDEST` these two land on, which `jump_to` elides and
+            // used to charge with a second `record_cost_unsafe` -- an `addi`, a store into
+            // the gas field and a branch, on every jump. Folded into the arm's own static
+            // charge it is free: the dispatch loop was subtracting a constant there anyway.
+            // Only the fused build takes it; the instruction *table* drives `step`, which an
+            // inspector single-steps, so there the `JUMPDEST` is a dispatch of its own and
+            // pays its own gas.
+            //
+            // `JUMPI` deliberately does **not** get the same treatment, and that is a
+            // measured result, not caution: a `JUMPDEST` it may not reach has to be handed
+            // back on the not-taken path, and pre-charging a *conditional* cost is not gas
+            // neutral. It diverges when the counter is left at exactly `HIGH`: the honest
+            // run carries on with zero gas and a following zero-cost `STOP` still completes
+            // the frame, while the pre-charged run is already out of gas. Merged in the
+            // fused `PUSH2; JUMPI` arm as well, that broke mainnet block 24006790 outright
+            // (guest exit 1) while every other benchmark block passed. `JUMP` is safe for
+            // the opposite reason: its `JUMPDEST` is unconditional, so the only execution
+            // the merge can change is one that runs out on an *invalid* destination, which
+            // halts `OutOfGas` instead of `InvalidJump` -- both exceptional, both spending
+            // the frame's whole limit, and neither reason consensus-visible.
+            JUMP => $crate::instructions::control::jump::<$fuse, _, _>,
+                if $fuse { 9 } else { 8 },
                 (3, $crate::instructions::control::jump_at::<$fuse, _, _>);
             JUMPI => $crate::instructions::control::jumpi::<$fuse, _, _>, 10,
                 (3, $crate::instructions::control::jumpi_at::<$fuse, _, _>);
