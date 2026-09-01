@@ -18,12 +18,14 @@ use primitives::{
 };
 use state::{Account, EvmState, EvmStorageSlot, TransientStorage};
 use std::vec::Vec;
-/// The account [`JournalInner::sload_slot`] resolved last, and where it lives.
+/// The two accounts this module resolved most recently, and where they live.
 ///
 /// Every SLOAD and SSTORE in a call frame targets the same address - the executing
-/// contract's - so the account lookup that opens `sload_slot` finds the same bucket over and
-/// over. It is not cheap: hashing the address and walking hashbrown's control bytes measured
-/// at ~90 of the ~232 retired instructions `sload_slot` spends per call.
+/// contract's - and a `CALL` looks that same account up twice more on its way in, in
+/// [`JournalInner::load_account_mut_optional_code`] and [`JournalInner::transfer_loaded`].
+/// The lookup is not cheap: hashing the address and walking hashbrown's control bytes
+/// measured at ~90 of the ~232 retired instructions `sload_slot` spent per call. On mainnet
+/// block 24006677 the cache answers 74,948 of the 76,821 storage accesses.
 ///
 /// Two ways, most-recent first. One way loses the caller of every frame that touches
 /// storage, and the caller's first access after the frame returns then pays a full probe
@@ -46,7 +48,7 @@ use std::vec::Vec;
 /// observable from outside the table - so the cache must be emptied at every point where the
 /// table can restructure.
 ///
-/// Seven places clear, for four different reasons.
+/// Eight places clear, for four different reasons.
 ///
 /// *It restructures here.* Two sites: the vacant arm of
 /// [`JournalInner::load_account_mut_optional_code`] -- the module's only `insert` -- and
@@ -60,11 +62,12 @@ use std::vec::Vec;
 /// [`JournalInner::state`] belongs here too: it returns `&mut self.state` wholesale, so the
 /// caller can do anything at all to the table.
 ///
-/// *Nothing could be cached anyway.* One site: `sload_slot`, on the arm where the address is
-/// not 8-aligned and so cannot be read as words. Discretionary, like `commit_tx` -- that path
-/// only reaches the map through `get_mut`, so no bucket moves. Note it discards the entry for
-/// the *previous* address, which a later lookup could still have matched: a small
-/// pessimisation, not a required clear.
+/// *Nothing could be cached anyway.* Two sites, both on the arm where the address is not
+/// 8-aligned and so cannot be read as words: `resolve_account`, reached from
+/// `sload_slot_warm`, and `JournalInner::sload_slot_cold`, which repeats the lookup.
+/// Discretionary, like `commit_tx` -- that path only reaches the map through `get_mut`, so no
+/// bucket moves. Note each discards the entries for the *previous* addresses, which a later
+/// lookup could still have matched: a small pessimisation, not a required clear.
 ///
 /// *Hygiene.* `commit_tx` clears once per transaction without needing to, to keep the window
 /// in which a bucket pointer is live short.
@@ -73,11 +76,26 @@ use std::vec::Vec;
 /// `get`/`get_mut`/`entry`-occupied, none of which can move a bucket. A new method that
 /// hands out `&mut EvmState`, or that can insert, needs a clear and belongs on this list.
 ///
-/// Three places fill: [`JournalInner::sload_slot`],
-/// [`JournalInner::load_account_mut_optional_code`] on its occupied arm, and
-/// [`JournalInner::transfer_loaded`] for its `to`. All three reach the map through `get_mut`,
-/// so the bucket they name cannot have moved between the lookup and the store, and all three
-/// are inside this module, so the clear list above covers them.
+/// Four places fill, and each is the `Some` arm of one of the four lookups this module makes:
+/// `resolve_account` (tag 0, for `sload_slot_warm`),
+/// `JournalInner::sload_slot_cold` (tag 4),
+/// [`JournalInner::load_account_mut_optional_code`] on its occupied arm (tag 3), and
+/// [`JournalInner::transfer_loaded`] for its `to` (tag 1). All four reach the map through
+/// `get_mut`, so the bucket they name cannot have moved between the lookup and the store, and
+/// all four are inside this module, so the clear list above covers them. The vacant arm of
+/// `load_account_mut_optional_code` is the one lookup that does *not* fill: it inserts, so it
+/// clears instead.
+///
+/// # What was measured and left alone
+///
+/// A second level of the same idea - caching the *slot* the last storage access resolved,
+/// keyed by the account pointer and the storage key - was instrumented rather than built. It
+/// would hit on 15,025 of the 76,821 accesses on mainnet block 24006677 (19.6 %, which is
+/// very nearly the 14,781 SSTOREs, each preceded by an SLOAD of the same slot). At ~78
+/// instructions saved per hit that is ~1.17 M against ~1.00 M paid for the key compare on
+/// every access and the fill on every miss - inside the noise, and it would need every
+/// `&mut Account` this module hands out audited for storage inserts, because `EvmStorage`
+/// growing is not observable from here the way `EvmState` growing is.
 #[derive(Debug, Default)]
 pub struct AccountCache {
     /// The account resolved most recently.
@@ -129,10 +147,11 @@ impl AccountCache {
             return Some(self.a.ptr as *mut Account);
         }
         if self.b.matches(w0, w1, w2) {
-            let hit = self.b;
-            self.b = self.a;
-            self.a = hit;
-            return Some(hit.ptr as *mut Account);
+            // A swap, not a write of the words already in registers: the latter reads one
+            // field fewer but measured +95,974 on mainnet block 24006677, register allocation
+            // in the caller being worth more here than the three loads.
+            mem::swap(&mut self.a, &mut self.b);
+            return Some(self.a.ptr as *mut Account);
         }
         None
     }
@@ -1131,7 +1150,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     }
 
     /// Resolves a storage slot to a mutable reference, warming it and journaling the warm
-    /// load if it was cold: everything [`sload_slot_warm`] declined to do.
+    /// load if it was cold: everything `sload_slot_warm` declined to do.
     ///
     /// Redoes both lookups rather than being handed their results, which costs a probe on
     /// a path taken 752 times in 76,821 and is what keeps all six of these arguments out of
@@ -1203,9 +1222,11 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // to `state` happens before it is used.
         // Keyed by `FastU256At` so the bucket comparison is limb-wise rather than a 32-byte
         // `memcmp` libcall; see there. Tag 1, and this is its only call site.
-        if let Some(slot) = unsafe { (*account)
+        if let Some(slot) = unsafe {
+            (*account)
                 .storage
-                .get_mut(primitives::FastU256At::<1>::new(&key)) } {
+                .get_mut(primitives::FastU256At::<1>::new(&key))
+        } {
             let is_cold = slot.is_cold_transaction_id(transaction_id);
             if is_cold {
                 if skip_cold_load {
@@ -1312,16 +1333,13 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         Ok(unsafe {
             let mut out = mem::MaybeUninit::<StateLoad<StorageValue>>::uninit();
             let p = out.as_mut_ptr();
-            primitives::copy_u256(
-                core::ptr::addr_of_mut!((*p).data),
-                &(*slot).present_value,
-            );
+            primitives::copy_u256(core::ptr::addr_of_mut!((*p).data), &(*slot).present_value);
             core::ptr::addr_of_mut!((*p).is_cold).write(false);
             out.assume_init()
         })
     }
 
-    /// [`Self::sload`] for a slot [`sload_slot_warm`] declined.
+    /// [`Self::sload`] for a slot `sload_slot_warm` declined.
     ///
     /// Out of line, `cold`, and taking `&mut self` rather than the journal's fields: the
     /// point of the split is that the warm path does not keep `db`, `warm_addresses`,
@@ -1412,7 +1430,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         ))
     }
 
-    /// [`Self::sstore`] for a slot [`sload_slot_warm`] declined; see [`Self::sload_cold`].
+    /// [`Self::sstore`] for a slot `sload_slot_warm` declined; see [`Self::sload_cold`].
     #[inline(never)]
     #[cold]
     fn sstore_cold<DB: Database>(
@@ -1513,7 +1531,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
 
 /// Resolves an account the [`AccountCache`] does not hold, and records it.
 ///
-/// Null when it is not in the map at all; [`sload_slot_warm`]'s caller panics on that, which
+/// Null when it is not in the map at all; `sload_slot_warm`'s caller panics on that, which
 /// is what keeps `sload_slot_warm` free of calls.
 ///
 /// Out of line and `cold` for the register pressure: the address hash, hashbrown's control
