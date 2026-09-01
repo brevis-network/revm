@@ -72,6 +72,12 @@ use std::vec::Vec;
 /// What is left - every other method here - reaches the map through
 /// `get`/`get_mut`/`entry`-occupied, none of which can move a bucket. A new method that
 /// hands out `&mut EvmState`, or that can insert, needs a clear and belongs on this list.
+///
+/// Three places fill: [`JournalInner::sload_slot`],
+/// [`JournalInner::load_account_mut_optional_code`] on its occupied arm, and
+/// [`JournalInner::transfer_loaded`] for its `to`. All three reach the map through `get_mut`,
+/// so the bucket they name cannot have moved between the lookup and the store, and all three
+/// are inside this module, so the clear list above covers them.
 #[derive(Debug, Default)]
 pub struct AccountCache {
     /// The account resolved most recently.
@@ -147,6 +153,24 @@ impl AccountCache {
             w2,
             ptr: account as usize,
         };
+    }
+
+    /// The 20 bytes of an already 8-aligned `address` as three words.
+    ///
+    /// [`AlignedAddress`] is `align(8)` by construction, so unlike [`Self::address_words`]
+    /// this needs no runtime check and has no fallback arm.
+    #[inline(always)]
+    fn aligned_words(address: &AlignedAddress) -> (u64, u64, u32) {
+        // SAFETY: `AlignedAddress` is `#[repr(C, align(8))]` around 20 readable bytes, so the
+        // reads at 0, 8 and 16 are in bounds and naturally aligned.
+        unsafe {
+            let p = (address as *const AlignedAddress).cast::<u8>();
+            (
+                p.cast::<u64>().read(),
+                p.add(8).cast::<u64>().read(),
+                p.add(16).cast::<u32>().read(),
+            )
+        }
     }
 
     /// The 20 bytes of `address` as three words, or `None` if they cannot be read that way.
@@ -551,10 +575,26 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // A raw pointer for the same reason as in `sload_slot`: the borrow would have to
         // cover the `from` lookup and the journal pushes below. Nothing inserts into
         // `self.state` here, so the bucket cannot move.
-        let to_account: *mut Account = self
-            .state
-            .get_mut(primitives::FastAddressAt::<1>::new(&to.0))
-            .unwrap();
+        //
+        // Consults and fills the [`AccountCache`] as well: `to` is the account the frame this
+        // transfer opens is about to run in, so caching it here is what lets that frame's
+        // first `SLOAD` skip its probe too. `from` does not, both because it is only reached
+        // on the 78-in-16,391 path that actually moves value and because caching it would
+        // evict `to` again.
+        let to_words = AccountCache::aligned_words(&to);
+        let to_account: *mut Account = match self.account_cache.get(to_words) {
+            Some(cached) => cached,
+            None => {
+                let found: *mut Account = self
+                    .state
+                    .get_mut(primitives::FastAddressAt::<1>::new(&to.0))
+                    .unwrap();
+                // SAFETY: `found` is the account stored under `to_words` in `self.state`, and
+                // nothing here inserts into it.
+                self.account_cache.put(to_words, found);
+                found
+            }
+        };
 
         if from.same(&to) {
             // SAFETY: just derived from a live `&mut Account`; nothing has touched
@@ -939,10 +979,30 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // have to stay live across the vacant arm, which needs `self.state` again, and NLL
         // cannot see that the two arms are exclusive. Exactly one reference is created from
         // it and nothing touches `self.state` in between.
-        let occupied: Option<*mut Account> = self
-            .state
-            .get_mut(primitives::FastAddressAt::<3>::new(&address.0))
-            .map(|account| account as *mut Account);
+        //
+        // Consults and fills the same [`AccountCache`] `sload_slot` uses. The two run back to
+        // back all the time -- a `CALL` loads the callee here and then every `SLOAD` of the
+        // frame it opens asks for the same account -- so a shared cache turns the first of
+        // those probes into a tag compare as well. Filling only from the occupied arm: the
+        // vacant arm below inserts, which is exactly what a cached bucket pointer does not
+        // survive, and it clears.
+        let words = AccountCache::aligned_words(&address);
+        let occupied: Option<*mut Account> = match self.account_cache.get(words) {
+            Some(cached) => Some(cached),
+            None => {
+                let found = self
+                    .state
+                    .get_mut(primitives::FastAddressAt::<3>::new(&address.0))
+                    .map(|account| account as *mut Account);
+                if let Some(account) = found {
+                    // SAFETY: `account` is the account stored under `words` in `self.state`,
+                    // and this module empties the cache everywhere that table can
+                    // restructure -- including the vacant arm just below.
+                    self.account_cache.put(words, account);
+                }
+                found
+            }
+        };
 
         let load = match occupied {
             Some(account) => {
