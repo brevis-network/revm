@@ -345,57 +345,73 @@ pub fn byte_at<WIRE: InterpreterTypes, H: ?Sized>(
 /// This is the same shape as a hardware barrel shifter and has no memory in it: two stages of
 /// selects move whole limbs, then one funnel stage moves bits. The `m` mask is what keeps the
 /// bit stage branch-free -- `b == 0` would otherwise need `x >> 64`, which is not a shift.
+///
+/// The limb selects are *not* factored out of the bit funnel. Selecting first and funnelling
+/// through one shared stage-3 is the smaller code, but the shared block cannot see the
+/// constants its predecessors put in the selected registers: on block 24006677 the
+/// `shift >= 192` arm reached it with three registers holding a freshly materialised zero and
+/// then spent eight `sll`/`srl`/`and`/`or` shifting them. 92% of the block's `SHL`s and 98%
+/// of its `SHR`s shift by 128 or more, so the funnel is duplicated into each of the four
+/// word-offset arms instead and two or three output limbs fold to a stored zero. Measured on
+/// 24006677: `SHL` 59.6 -> 43.4 retired per dispatch, `SHR` 59.9 -> 39.1.
 #[inline(always)]
 fn u256_shl(x: &U256, shift: usize) -> U256 {
     let l = x.as_limbs();
-    let w = shift >> 6;
-    // Stage 1 and 2: move by two limbs, then by one. Eight selects, no memory.
-    let (b0, b1, b2, b3) = if w & 2 != 0 {
-        (0, 0, l[0], l[1])
-    } else {
-        (l[0], l[1], l[2], l[3])
-    };
-    let (a0, a1, a2, a3) = if w & 1 != 0 {
-        (0, b0, b1, b2)
-    } else {
-        (b0, b1, b2, b3)
-    };
-    // Stage 3: the bit funnel.
     let b = (shift & 63) as u32;
     let c = (64 - b) & 63;
+    // `b == 0` would otherwise need `x >> 64`, which is not a shift.
     let m = if b == 0 { 0 } else { u64::MAX };
-    U256::from_limbs([
-        a0 << b,
-        (a1 << b) | ((a0 >> c) & m),
-        (a2 << b) | ((a1 >> c) & m),
-        (a3 << b) | ((a2 >> c) & m),
-    ])
+    if shift & 128 != 0 {
+        if shift & 64 != 0 {
+            U256::from_limbs([0, 0, 0, l[0] << b])
+        } else {
+            U256::from_limbs([0, 0, l[0] << b, (l[1] << b) | ((l[0] >> c) & m)])
+        }
+    } else if shift & 64 != 0 {
+        U256::from_limbs([
+            0,
+            l[0] << b,
+            (l[1] << b) | ((l[0] >> c) & m),
+            (l[2] << b) | ((l[1] >> c) & m),
+        ])
+    } else {
+        U256::from_limbs([
+            l[0] << b,
+            (l[1] << b) | ((l[0] >> c) & m),
+            (l[2] << b) | ((l[1] >> c) & m),
+            (l[3] << b) | ((l[2] >> c) & m),
+        ])
+    }
 }
 
 /// `x >> shift` for `shift < 256`, computed entirely in registers. See [`u256_shl`].
 #[inline(always)]
 fn u256_shr(x: &U256, shift: usize) -> U256 {
     let l = x.as_limbs();
-    let w = shift >> 6;
-    let (b0, b1, b2, b3) = if w & 2 != 0 {
-        (l[2], l[3], 0, 0)
-    } else {
-        (l[0], l[1], l[2], l[3])
-    };
-    let (a0, a1, a2, a3) = if w & 1 != 0 {
-        (b1, b2, b3, 0)
-    } else {
-        (b0, b1, b2, b3)
-    };
     let b = (shift & 63) as u32;
     let c = (64 - b) & 63;
     let m = if b == 0 { 0 } else { u64::MAX };
-    U256::from_limbs([
-        (a0 >> b) | ((a1 << c) & m),
-        (a1 >> b) | ((a2 << c) & m),
-        (a2 >> b) | ((a3 << c) & m),
-        a3 >> b,
-    ])
+    if shift & 128 != 0 {
+        if shift & 64 != 0 {
+            U256::from_limbs([l[3] >> b, 0, 0, 0])
+        } else {
+            U256::from_limbs([(l[2] >> b) | ((l[3] << c) & m), l[3] >> b, 0, 0])
+        }
+    } else if shift & 64 != 0 {
+        U256::from_limbs([
+            (l[1] >> b) | ((l[2] << c) & m),
+            (l[2] >> b) | ((l[3] << c) & m),
+            l[3] >> b,
+            0,
+        ])
+    } else {
+        U256::from_limbs([
+            (l[0] >> b) | ((l[1] << c) & m),
+            (l[1] >> b) | ((l[2] << c) & m),
+            (l[2] >> b) | ((l[3] << c) & m),
+            l[3] >> b,
+        ])
+    }
 }
 
 /// EIP-145: Bitwise shifting instructions in EVM
