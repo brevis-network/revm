@@ -25,6 +25,10 @@ use std::vec::Vec;
 /// over. It is not cheap: hashing the address and walking hashbrown's control bytes measured
 /// at ~90 of the ~232 retired instructions `sload_slot` spends per call.
 ///
+/// Two ways, most-recent first. One way loses the caller of every frame that touches
+/// storage, and the caller's first access after the frame returns then pays a full probe
+/// again; the second way holds it across the call.
+///
 /// `ptr` is a `usize` rather than a `*mut Account` so that `JournalInner` keeps its auto
 /// traits; zero means empty.
 ///
@@ -70,17 +74,79 @@ use std::vec::Vec;
 /// hands out `&mut EvmState`, or that can insert, needs a clear and belongs on this list.
 #[derive(Debug, Default)]
 pub struct AccountCache {
+    /// The account resolved most recently.
+    a: CachedAccount,
+    /// The one resolved before it.
+    b: CachedAccount,
+}
+
+/// One way of the [`AccountCache`]: an account, and the address it is stored under.
+///
+/// Carries the same `# Safety` contract as [`AccountCache`]: a non-zero `ptr` must point at
+/// the `Account` stored under `(w0, w1, w2)` in [`JournalInner::state`].
+#[derive(Debug, Default, Clone, Copy)]
+struct CachedAccount {
     w0: u64,
     w1: u64,
     w2: u32,
     ptr: usize,
 }
 
+impl CachedAccount {
+    /// True when this way holds an account and it is the one stored under these words.
+    #[inline(always)]
+    fn matches(&self, w0: u64, w1: u64, w2: u32) -> bool {
+        self.ptr != 0 && self.w0 == w0 && self.w1 == w1 && self.w2 == w2
+    }
+}
+
 impl AccountCache {
     /// Empties the cache.
+    ///
+    /// Both ways, always: they point into the same table, so anything that invalidates one
+    /// invalidates the other.
     #[inline(always)]
     fn clear(&mut self) {
-        self.ptr = 0;
+        self.a.ptr = 0;
+        self.b.ptr = 0;
+    }
+
+    /// The account stored under `words`, if either way holds it.
+    ///
+    /// A hit in the second way is promoted, which is what makes the cache survive a call:
+    /// the frame that is entered evicts its caller into `b`, and the caller's first storage
+    /// access after the frame returns finds it there and moves it back to `a`, so a sibling
+    /// call after that does not evict it again.
+    #[inline(always)]
+    fn get(&mut self, (w0, w1, w2): (u64, u64, u32)) -> Option<*mut Account> {
+        if self.a.matches(w0, w1, w2) {
+            return Some(self.a.ptr as *mut Account);
+        }
+        if self.b.matches(w0, w1, w2) {
+            let hit = self.b;
+            self.b = self.a;
+            self.a = hit;
+            return Some(hit.ptr as *mut Account);
+        }
+        None
+    }
+
+    /// Records `account` as the most recently resolved, evicting the older way.
+    ///
+    /// # Safety
+    ///
+    /// `account` must point at the `Account` stored under `words` in
+    /// [`JournalInner::state`], and the caller must be on a path that empties the cache
+    /// before that table can restructure; see the type's safety note.
+    #[inline(always)]
+    fn put(&mut self, (w0, w1, w2): (u64, u64, u32), account: *mut Account) {
+        self.b = self.a;
+        self.a = CachedAccount {
+            w0,
+            w1,
+            w2,
+            ptr: account as usize,
+        };
     }
 
     /// The 20 bytes of `address` as three words, or `None` if they cannot be read that way.
@@ -1002,36 +1068,23 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // the only site that uses it - a second caller of the same instantiation pushes
         // `RawTable::find` past the inliner and it outlines, which costs more than it saves.
         let words = AccountCache::address_words(&address);
-        let cached = match words {
-            Some((w0, w1, w2)) => {
-                account_cache.ptr != 0
-                    && account_cache.w0 == w0
-                    && account_cache.w1 == w1
-                    && account_cache.w2 == w2
-            }
-            None => false,
-        };
-        let account: *mut Account = if cached {
-            account_cache.ptr as *mut Account
-        } else {
-            let found: *mut Account = state
-                .get_mut(primitives::FastAddress::new(&address))
-                .unwrap();
-            match words {
-                Some((w0, w1, w2)) => {
-                    *account_cache = AccountCache {
-                        w0,
-                        w1,
-                        w2,
-                        ptr: found as usize,
-                    }
+        let account: *mut Account = match words.and_then(|w| account_cache.get(w)) {
+            Some(cached) => cached,
+            None => {
+                let found: *mut Account = state
+                    .get_mut(primitives::FastAddress::new(&address))
+                    .unwrap();
+                match words {
+                    // SAFETY: `found` is the account stored under `w` in `state`, and this
+                    // module empties the cache everywhere `state` can restructure.
+                    Some(w) => account_cache.put(w, found),
+                    // Not cacheable: the address cannot be compared word-wise. Clears rather
+                    // than keeps the previous addresses' entries -- a pessimisation, not a
+                    // required clear; see the note on `AccountCache`.
+                    None => account_cache.clear(),
                 }
-                // Not cacheable: the address cannot be compared word-wise. Clears rather
-                // than keeps the previous address's entry -- a pessimisation, not a
-                // required clear; see the note on `AccountCache`.
-                None => account_cache.clear(),
+                found
             }
-            found
         };
 
         // Hit path: the slot is already in the account's map. 76,069 of 76,821 calls on
