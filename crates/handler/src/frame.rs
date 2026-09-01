@@ -425,6 +425,13 @@ impl EthFrame<EthInterpreter> {
 
 impl EthFrame<EthInterpreter> {
     /// Processes the next interpreter action, either creating a new frame or returning a result.
+    ///
+    /// `#[inline]`: out of line the call boundary is 29 retired instructions -- fifteen in
+    /// the prologue, fourteen in the epilogue -- around a body whose own work averages 35,
+    /// and it runs 39,999 times per mainnet block 24006677. Inlined into `EvmTr::frame_run`
+    /// the sret slot the tail call was protecting is the caller's own and there is nothing
+    /// left to copy either.
+    #[inline(always)]
     pub fn process_next_action<
         CTX: ContextTr,
         ERROR: From<ContextTrDbError<CTX>> + FromStringError,
