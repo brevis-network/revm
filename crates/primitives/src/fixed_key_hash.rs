@@ -52,6 +52,40 @@ impl FixedKeyHasher {
     fn add_word(&mut self, word: u64) {
         self.0 = (self.0 ^ word).wrapping_mul(Self::K);
     }
+
+    /// [`Hasher::write`]'s arm for a key that does not start 8-aligned.
+    ///
+    /// Out of line, and `cold`, for the register pressure rather than for its own cost.
+    /// Inline it is forty-odd instructions -- twenty byte loads and the shift/or tree that
+    /// reassembles them -- needing a dozen live registers, and every function that hashes
+    /// anything inherits that: the caller's prologue saves the callee-saved registers the
+    /// arm would need whether it runs or not. `JournalInner::sload_slot` saved all twelve
+    /// and never once took this arm on mainnet block 24006677. Behind a call it costs the
+    /// caller one register, and the sites that do take it pay a `jal` for it.
+    ///
+    /// Folds exactly the word sequence the aligned arm folds; `arms_agree` pins that.
+    #[inline(never)]
+    #[cold]
+    fn write_misaligned(state: u64, bytes: &[u8]) -> u64 {
+        let mut this = Self(state);
+        let mut rest = bytes;
+        while let Some((chunk, tail)) = rest.split_first_chunk::<8>() {
+            this.add_word(u64::from_ne_bytes(*chunk));
+            rest = tail;
+        }
+        if let Some((chunk, tail)) = rest.split_first_chunk::<4>() {
+            this.add_word(u64::from(u32::from_ne_bytes(*chunk)));
+            rest = tail;
+        }
+        if let Some((chunk, tail)) = rest.split_first_chunk::<2>() {
+            this.add_word(u64::from(u16::from_ne_bytes(*chunk)));
+            rest = tail;
+        }
+        if let Some((&byte, _)) = rest.split_first() {
+            this.add_word(u64::from(byte));
+        }
+        this.0
+    }
 }
 
 impl Hasher for FixedKeyHasher {
@@ -89,22 +123,7 @@ impl Hasher for FixedKeyHasher {
                 self.add_word(u64::from(unsafe { *ptr.add(off) }));
             }
         } else {
-            let mut rest = bytes;
-            while let Some((chunk, tail)) = rest.split_first_chunk::<8>() {
-                self.add_word(u64::from_ne_bytes(*chunk));
-                rest = tail;
-            }
-            if let Some((chunk, tail)) = rest.split_first_chunk::<4>() {
-                self.add_word(u64::from(u32::from_ne_bytes(*chunk)));
-                rest = tail;
-            }
-            if let Some((chunk, tail)) = rest.split_first_chunk::<2>() {
-                self.add_word(u64::from(u16::from_ne_bytes(*chunk)));
-                rest = tail;
-            }
-            if let Some((&byte, _)) = rest.split_first() {
-                self.add_word(u64::from(byte));
-            }
+            self.0 = Self::write_misaligned(self.0, bytes);
         }
     }
 
