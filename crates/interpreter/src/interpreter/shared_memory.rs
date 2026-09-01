@@ -20,6 +20,12 @@ static BSWAP_M8: u64 = 0x00FF_00FF_00FF_00FF;
 static BSWAP_M16: u64 = 0x0000_FFFF_0000_FFFF;
 
 /// Loads the two masks once, to be shared by the four limbs of a 256-bit word.
+///
+/// Two `lui`s of the same page get emitted here, one per volatile load, and folding the two
+/// statics into a `static BSWAP_MASKS: [u64; 2]` read as one array does *not* remove the
+/// second instruction: LLVM keeps the base in a register with an `addi` instead, so the pair
+/// still costs `lui`/`ld`/`addi`/`ld`. Measured on block 24006677 at -641 retired over the
+/// whole guest, which is nothing. The pair is four instructions either way.
 #[inline(always)]
 fn bswap_masks() -> (u64, u64) {
     // SAFETY: volatile reads of initialised `static u64`s.
@@ -80,6 +86,56 @@ fn bswap64_masked(x: u64, _m1: u64, _m2: u64) -> u64 {
     {
         x.swap_bytes()
     }
+}
+
+/// Byte-reverses `x`, whose two 32-bit halves the caller has already swapped.
+///
+/// [`bswap64_masked`]'s three stages -- swap adjacent bytes, swap adjacent byte pairs, swap
+/// the two 32-bit halves -- commute, so a caller assembling the word out of two `u32`s gets
+/// stage 3 for free by assembling it the wrong way round. Ten instructions instead of
+/// thirteen, and the `slli`/`or` that puts the halves together was going to be paid anyway.
+///
+/// `x` must be `hi | (lo << 32)` where `lo`/`hi` are the low/high halves of the word to
+/// reverse: `bswap64_halves_masked(hi | (lo << 32)) == bswap64_masked(lo | (hi << 32))`.
+#[inline(always)]
+fn bswap64_halves_masked(x: u64, _m1: u64, _m2: u64) -> u64 {
+    #[cfg(all(target_arch = "riscv64", not(target_feature = "zbb")))]
+    {
+        let out: u64;
+        // SAFETY: pure register arithmetic; no memory, no stack, no flags.
+        unsafe {
+            core::arch::asm!(
+                "srli {t0}, {x}, 8",
+                "and  {t0}, {t0}, {m1}",
+                "and  {t1}, {x}, {m1}",
+                "slli {t1}, {t1}, 8",
+                "or   {y}, {t0}, {t1}",
+                "srli {t0}, {y}, 16",
+                "and  {t0}, {t0}, {m2}",
+                "and  {t1}, {y}, {m2}",
+                "slli {t1}, {t1}, 16",
+                "or   {y}, {t0}, {t1}",
+                x = in(reg) x,
+                m1 = in(reg) _m1,
+                m2 = in(reg) _m2,
+                t0 = out(reg) _,
+                t1 = out(reg) _,
+                y = out(reg) out,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+        }
+        return out;
+    }
+    #[cfg(not(all(target_arch = "riscv64", not(target_feature = "zbb"))))]
+    {
+        x.rotate_left(32).swap_bytes()
+    }
+}
+
+/// [`bswap64_halves_masked`] for callers outside this module.
+#[inline(always)]
+pub(crate) fn bswap64_halves_shared(x: u64, m1: u64, m2: u64) -> u64 {
+    bswap64_halves_masked(x, m1, m2)
 }
 
 /// Reads the 32-byte big-endian word at `p` into a `U256`.

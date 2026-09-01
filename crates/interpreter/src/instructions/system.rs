@@ -1,6 +1,9 @@
 use crate::{
     gas,
-    interpreter::{bswap64_shared, bswap_masks_shared, u256_from_be_aligned, Interpreter},
+    interpreter::{
+        bswap64_halves_shared, bswap64_shared, bswap_masks_shared, u256_from_be_aligned,
+        Interpreter,
+    },
     interpreter_types::{
         InputsTr, InterpreterTypes, LegacyBytecode, MemoryTr, ReturnData, RuntimeFlag, StackTr,
     },
@@ -203,7 +206,12 @@ pub fn calldataload_at<WIRE: InterpreterTypes, H: ?Sized>(
 ) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
     popn_top_at!([], offset_ptr, context.interpreter, sp, rem);
-    let offset = as_usize_saturated!(offset_ptr);
+    // See the note on `SHL`: `as_usize_saturated!` builds an all-ones sentinel out of the
+    // three high limbs so one compare can range-check the whole word. `input_len` is a
+    // `usize`, so testing the high limbs directly against zero does the same job for two
+    // instructions less.
+    let ol = *offset_ptr.as_limbs();
+    let offset = ol[0] as usize;
     // Assemble straight into the stack slot, one limb at a time. Building a `U256` first
     // keeps all four limbs live to the end, which cost this instruction a prologue that
     // saved ten callee-saved registers on every `CALLDATALOAD`.
@@ -229,7 +237,7 @@ pub fn calldataload_at<WIRE: InterpreterTypes, H: ?Sized>(
     // reversals, ~77 more. When the whole 32 bytes are inside the calldata - the case for
     // essentially every `CALLDATALOAD` a compiler emits - the limbs can be assembled
     // straight from the bytes with 8 `lbu` + 7 `slli` + 7 `or` each and neither is needed.
-    if offset >= input_len {
+    if (ol[1] | ol[2] | ol[3]) != 0 || offset >= input_len {
         // SAFETY: `dst` is the four limbs of a live stack word.
         unsafe {
             dst.write(0);
@@ -302,15 +310,22 @@ unsafe fn be_word_to(src: *const u8, count: usize, dst: *mut u64) {
         // SAFETY: `src[..32]` is readable and 4-aligned, so the eight `u32` reads are in
         // bounds and aligned. RV64 is little-endian, so the two halves recombine to the same
         // `u64` an aligned `ld` would have produced.
+        //
+        // The halves go together *swapped*, which is stage 3 of the byte reversal, so
+        // `bswap64_halves_shared` only has stages 1 and 2 left to run: three instructions a
+        // limb less than assembling the word in order and reversing all of it. `w == 0` is
+        // the same test either way, since swapping halves does not change whether a word is
+        // zero. This is the path 58% of the block's `CALLDATALOAD`s take - calldata offsets
+        // are `4 + 32k`, which is 4 mod 8.
         unsafe {
             let q = src.cast::<u32>();
             let mut k = 0;
             while k < 4 {
-                let w = (q.add(2 * k).read() as u64) | ((q.add(2 * k + 1).read() as u64) << 32);
+                let w = (q.add(2 * k + 1).read() as u64) | ((q.add(2 * k).read() as u64) << 32);
                 if w == 0 {
                     dst.add(3 - k).write(0);
                 } else {
-                    dst.add(3 - k).write(bswap64_shared(w, m1, m2));
+                    dst.add(3 - k).write(bswap64_halves_shared(w, m1, m2));
                 }
                 k += 1;
             }

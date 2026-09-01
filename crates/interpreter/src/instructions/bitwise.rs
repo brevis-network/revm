@@ -435,6 +435,13 @@ pub fn shl_at<WIRE: InterpreterTypes, H: ?Sized>(
     //gas!(context.interpreter, gas::VERYLOW);
     popn_top_at!([op1], op2, context.interpreter, sp, rem);
 
+    // Leave `as_usize_saturated!` alone here. Testing the three high limbs against zero
+    // directly and comparing limb 0 against 256 is two instructions less *in the arm's
+    // prologue*, but the sentinel is also what carries the shift amount into the four
+    // word-offset arms below as a single register: split it in two and the arms grow a phi
+    // and a duplicated zero-store path. Measured on block 24006677: SHL 43.6 -> 47.5 retired
+    // per dispatch (+296,372) and SHR 38.3 -> 43.2 (+102,303). The same rewrite *does* pay
+    // in `calldataload_at`, where the value feeds one bounds check and nothing else.
     let shift = as_usize_saturated!(op1);
     *op2 = if shift < 256 {
         u256_shl(op2, shift)
@@ -465,6 +472,13 @@ pub fn shr_at<WIRE: InterpreterTypes, H: ?Sized>(
     //gas!(context.interpreter, gas::VERYLOW);
     popn_top_at!([op1], op2, context.interpreter, sp, rem);
 
+    // Leave `as_usize_saturated!` alone here. Testing the three high limbs against zero
+    // directly and comparing limb 0 against 256 is two instructions less *in the arm's
+    // prologue*, but the sentinel is also what carries the shift amount into the four
+    // word-offset arms below as a single register: split it in two and the arms grow a phi
+    // and a duplicated zero-store path. Measured on block 24006677: SHL 43.6 -> 47.5 retired
+    // per dispatch (+296,372) and SHR 38.3 -> 43.2 (+102,303). The same rewrite *does* pay
+    // in `calldataload_at`, where the value feeds one bounds check and nothing else.
     let shift = as_usize_saturated!(op1);
     *op2 = if shift < 256 {
         u256_shr(op2, shift)
