@@ -123,6 +123,29 @@ impl AlignedAddress {
         }
     }
 
+    /// Builds an aligned address out of the three words it is made of.
+    ///
+    /// [`Self::new`] has to read the source at an alignment it cannot know, so it carries a
+    /// runtime check and two fallback arms, and LLVM then materialises the aligned arm as
+    /// 32-bit halves and reassembles them: 25 retired instructions in
+    /// `JournalInner::load_account_mut_optional_code`. A caller that has already read the
+    /// three words - to consult the account cache with them, say - can hand them over
+    /// instead, and the copy is three stores.
+    #[inline(always)]
+    pub fn from_words(w0: u64, w1: u64, w2: u32) -> Self {
+        // SAFETY: `Self` is `align(8)` and 24 bytes, so the writes at 0, 8 and 16 are in
+        // bounds and naturally aligned. They initialize all 20 bytes of the single field;
+        // the four bytes after it are padding, which `assume_init` does not require.
+        unsafe {
+            let mut this = core::mem::MaybeUninit::<Self>::uninit();
+            let p = this.as_mut_ptr().cast::<u8>();
+            p.cast::<u64>().write(w0);
+            p.add(8).cast::<u64>().write(w1);
+            p.add(16).cast::<u32>().write(w2);
+            this.assume_init()
+        }
+    }
+
     /// Compares two aligned addresses as words.
     ///
     /// `a.0 == b.0` on two `[u8; 20]`s is a `bcmp`/`memcmp` libcall on a target without

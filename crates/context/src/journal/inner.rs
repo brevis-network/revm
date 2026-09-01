@@ -616,7 +616,37 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             return None;
         }
 
+        // SAFETY: as above -- resolved out of self.state just now, and nothing has inserted
+        // into it since.
+        unsafe { self.transfer_nonzero(from, to, balance, to_account) }
+    }
+
+    /// The half of [`Self::transfer_loaded`] that actually moves value, which on mainnet block
+    /// 24006677 is 78 calls out of 16,391 - every other one is a `CALL` with no value, and
+    /// stops at the `touch_account` above.
+    ///
+    /// Out of line so the common path carries neither the second account lookup nor its
+    /// register pressure: with both halves in one body the function saved thirteen
+    /// callee-saved registers and spent 36 of its 60 retired instructions per call on its own
+    /// prologue and epilogue.
+    ///
+    /// # Safety
+    ///
+    /// `to_account` must point at the account stored under `to` in [`Self::state`], with no
+    /// insert into that map since it was resolved.
+    #[inline(never)]
+    #[cold]
+    unsafe fn transfer_nonzero(
+        &mut self,
+        from: AlignedAddress,
+        to: AlignedAddress,
+        balance: U256,
+        to_account: *mut Account,
+    ) -> Option<TransferError> {
         // sub balance from
+        //
+        // Tag 2, and this is its only call site; see `FastAddressAt`. Not cached: `to` is
+        // what the frame this transfer opens will run in, and caching `from` would evict it.
         let from_account = self
             .state
             .get_mut(primitives::FastAddressAt::<2>::new(&from.0))
@@ -629,7 +659,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         *from_balance = from_balance_decr;
 
         // add balance to
-        // SAFETY: as above - the `from` lookup above is a lookup, so no bucket moved.
+        // SAFETY: per the contract - the `from` lookup above is a lookup, so no bucket moved.
         let to_account = unsafe { &mut *to_account };
         Self::touch_account(&mut self.journal, to.0, to_account);
         let to_balance = &mut to_account.info.balance;
@@ -963,7 +993,20 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // The by-value `Address` argument sits in a slot LLVM treats as byte-aligned, and
         // this function reads it four times over: to hash it, to journal it, and to build
         // the returned `JournaledAccount`. Re-home it once; see `AlignedAddress`.
-        let address = AlignedAddress::new(&address);
+        //
+        // Through the words rather than through `AlignedAddress::new`, because the account
+        // cache wants the same three words and reading them once serves both. `new` reads the
+        // source at an alignment it cannot know and LLVM lowers even its aligned arm as 32-bit
+        // halves that it then reassembles, which measured 25 retired instructions per call
+        // against six for three loads and three stores.
+        let (address, words) = match AccountCache::address_words(&address) {
+            Some((w0, w1, w2)) => (AlignedAddress::from_words(w0, w1, w2), (w0, w1, w2)),
+            None => {
+                let address = AlignedAddress::new(&address);
+                let words = AccountCache::aligned_words(&address);
+                (address, words)
+            }
+        };
         // `entry` takes the key by value and compares it with `K: Eq`, so `Equivalent` cannot
         // redirect the bucket comparison and it stays the 20-byte `memcmp` libcall
         // `Address: PartialEq` lowers to - 32,786 of them on mainnet block 24006677, at ~39
@@ -986,7 +1029,6 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // those probes into a tag compare as well. Filling only from the occupied arm: the
         // vacant arm below inserts, which is exactly what a cached bucket pointer does not
         // survive, and it clears.
-        let words = AccountCache::aligned_words(&address);
         let occupied: Option<*mut Account> = match self.account_cache.get(words) {
             Some(cached) => Some(cached),
             None => {
