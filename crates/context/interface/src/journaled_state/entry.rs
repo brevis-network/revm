@@ -108,6 +108,7 @@ pub enum SelfdestructionRevertStatus {
 /// Journal entries that are used to track changes to the state and are used to revert it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[repr(u64)]
 pub enum JournalEntry {
     /// Used to mark account that is warm inside EVM in regard to EIP-2929 AccessList.
     /// Action: We will add Account to state.
