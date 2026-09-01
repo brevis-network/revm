@@ -40,12 +40,34 @@ use std::vec::Vec;
 /// [`JournalInner::state`]. A `hashbrown` bucket pointer survives `get`/`get_mut` and
 /// survives a `remove`, but not a growth or an in-place rehash, and neither of those is
 /// observable from outside the table - so the cache must be emptied at every point where the
-/// table can restructure. Inside this module that is exactly two places: the vacant arm of
-/// [`JournalInner::load_account_mut_optional_code`], which is the only `insert`, and
-/// [`JournalInner::finalize`], which takes the map out. `checkpoint_revert` and
-/// `discard_tx` only `get_mut` through [`JournalEntryTr::revert`], and every other method
-/// here reaches the map through `get`/`get_mut`/`entry`-occupied, none of which can move a
-/// bucket.
+/// table can restructure.
+///
+/// Seven places clear, for four different reasons.
+///
+/// *It restructures here.* Two sites: the vacant arm of
+/// [`JournalInner::load_account_mut_optional_code`] -- the module's only `insert` -- and
+/// [`JournalInner::finalize`], which takes the map out.
+///
+/// *It hands the map to someone who might.* [`JournalEntryTr::revert`] receives a bare
+/// `&mut EvmState`, and it is a *trait* method - the stock entry only ever `get_mut`s, but
+/// nothing in the type system says an implementor must, and the private field does not help
+/// because that reference goes past the accessor. That is `discard_tx`, and
+/// `checkpoint_revert` inside its `journal_i` guard, the only place a `revert` can run.
+/// [`JournalInner::state`] belongs here too: it returns `&mut self.state` wholesale, so the
+/// caller can do anything at all to the table.
+///
+/// *Nothing could be cached anyway.* One site: `sload_slot`, on the arm where the address is
+/// not 8-aligned and so cannot be read as words. Discretionary, like `commit_tx` -- that path
+/// only reaches the map through `get_mut`, so no bucket moves. Note it discards the entry for
+/// the *previous* address, which a later lookup could still have matched: a small
+/// pessimisation, not a required clear.
+///
+/// *Hygiene.* `commit_tx` clears once per transaction without needing to, to keep the window
+/// in which a bucket pointer is live short.
+///
+/// What is left - every other method here - reaches the map through
+/// `get`/`get_mut`/`entry`-occupied, none of which can move a bucket. A new method that
+/// hands out `&mut EvmState`, or that can insert, needs a clear and belongs on this list.
 #[derive(Debug, Default)]
 pub struct AccountCache {
     w0: u64,
@@ -219,9 +241,8 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // Spec precompiles and state are not changed. It is always set again execution.
         let _ = spec;
         let _ = state;
-        // The map itself is untouched here, but emptying the cache once per transaction
-        // costs one store and keeps the number of places that may hold a bucket pointer
-        // down to the two the `AccountCache` contract names.
+        // The map itself is untouched here; emptying the cache once per transaction costs
+        // one store and keeps the window in which a bucket pointer is live short.
         account_cache.clear();
         transient_storage.clear();
         *depth = 0;
@@ -250,8 +271,8 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             warm_addresses,
             account_cache,
         } = self;
-        // `revert` only ever `get_mut`s, so no bucket moves; cleared for the same reason
-        // as in `commit_tx`.
+        // Required, not hygiene: `revert` is a trait method handed a bare `&mut EvmState`,
+        // so an implementor may insert and move a bucket. See the note on `AccountCache`.
         account_cache.clear();
         let is_spurious_dragon_enabled = spec.is_enabled_in(SPURIOUS_DRAGON);
         // iterate over all journals entries and revert our global state
@@ -636,6 +657,11 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
 
         // iterate over last N journals sets and revert our global state
         if checkpoint.journal_i < self.journal.len() {
+            // `JournalEntryTr::revert` gets a bare `&mut EvmState`, so an implementor may
+            // insert and reallocate the table behind the cached bucket pointer; `discard_tx`
+            // clears for the same reason. Inside the guard because that is the only place a
+            // `revert` runs, and this path is every reverting frame return.
+            self.account_cache.clear();
             self.journal
                 .drain(checkpoint.journal_i..)
                 .rev()
@@ -1000,8 +1026,9 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
                         ptr: found as usize,
                     }
                 }
-                // Not cacheable: the address cannot be compared word-wise, so leave the cache
-                // as it is rather than storing an entry no lookup could match.
+                // Not cacheable: the address cannot be compared word-wise. Clears rather
+                // than keeps the previous address's entry -- a pessimisation, not a
+                // required clear; see the note on `AccountCache`.
                 None => account_cache.clear(),
             }
             found
@@ -1054,6 +1081,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     /// Out of line so the hit path carries neither its stack frame nor its register pressure.
     #[inline(never)]
     #[cold]
+    #[allow(clippy::too_many_arguments)]
     fn sload_slot_miss<'a, DB: Database>(
         account: &'a mut Account,
         warm_addresses: &WarmAddresses,
@@ -1244,6 +1272,32 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     }
 }
 
+/// Builds an [`SStoreResult`] limb by limb.
+///
+/// The struct is three `U256`s, and the plain literal is a 96-byte copy that LLVM lowers to a
+/// `memcpy` libcall (~74 retired instructions) rather than the twelve `ld`/`sd` pairs it
+/// actually is. `SSTORE` runs ~15 K times per mainnet block.
+#[inline(always)]
+fn sstore_result(
+    original_value: StorageValue,
+    present_value: StorageValue,
+    new_value: StorageValue,
+) -> SStoreResult {
+    // SAFETY: all three fields are initialized exactly once below, and each is a `U256` at an
+    // 8-aligned offset of an 8-aligned struct.
+    unsafe {
+        let mut r = core::mem::MaybeUninit::<SStoreResult>::uninit();
+        let p = r.as_mut_ptr();
+        primitives::copy_u256(
+            core::ptr::addr_of_mut!((*p).original_value),
+            &original_value,
+        );
+        primitives::copy_u256(core::ptr::addr_of_mut!((*p).present_value), &present_value);
+        primitives::copy_u256(core::ptr::addr_of_mut!((*p).new_value), &new_value);
+        r.assume_init()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1285,31 +1339,5 @@ mod tests {
         let state_load = result.unwrap();
         assert!(!state_load.is_cold); // Should be warm
         assert_eq!(state_load.data, U256::ZERO); // Empty slot
-    }
-}
-
-/// Builds an [`SStoreResult`] limb by limb.
-///
-/// The struct is three `U256`s, and the plain literal is a 96-byte copy that LLVM lowers to a
-/// `memcpy` libcall (~74 retired instructions) rather than the twelve `ld`/`sd` pairs it
-/// actually is. `SSTORE` runs ~15 K times per mainnet block.
-#[inline(always)]
-fn sstore_result(
-    original_value: StorageValue,
-    present_value: StorageValue,
-    new_value: StorageValue,
-) -> SStoreResult {
-    // SAFETY: all three fields are initialized exactly once below, and each is a `U256` at an
-    // 8-aligned offset of an 8-aligned struct.
-    unsafe {
-        let mut r = core::mem::MaybeUninit::<SStoreResult>::uninit();
-        let p = r.as_mut_ptr();
-        primitives::copy_u256(
-            core::ptr::addr_of_mut!((*p).original_value),
-            &original_value,
-        );
-        primitives::copy_u256(core::ptr::addr_of_mut!((*p).present_value), &present_value);
-        primitives::copy_u256(core::ptr::addr_of_mut!((*p).new_value), &new_value);
-        r.assume_init()
     }
 }

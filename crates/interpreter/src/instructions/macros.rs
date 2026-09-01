@@ -249,8 +249,13 @@ macro_rules! sync_gas_at {
 /// an *exceptional* one, and both `Frame::return_result` and `Handler::last_frame_result` hand
 /// gas back only to a result that `is_ok_or_revert()` and spend the whole limit otherwise, so
 /// the `remaining` in the action is never read. It is kept because it costs nothing -- 12.6 K
-/// retired instructions on block 24006677, i.e. noise -- and it is the reading that stays
-/// right if a non-exceptional halt is ever added here.
+/// retired instructions on block 24006677, i.e. noise.
+///
+/// It is only correct where the body has charged nothing through the gas field since its own
+/// `sync_gas_at!`: the publish writes the pre-charge register back, so on a body that has
+/// charged, it refunds. Four sites in `host.rs` charge before their fatal-load exit and halt
+/// by hand for that reason. A non-exceptional halt added after a `gas!` would make the refund
+/// consensus-visible, so this is the opposite of a free safety net.
 ///
 /// That number is regime-dependent, which is worth knowing before trusting it again: while
 /// `JUMP`/`JUMPI` were threaded too (see the note on `rem` in `Interpreter::run_plain`) the
@@ -335,8 +340,15 @@ macro_rules! push_at {
                 $crate::poison_at!($interpreter, $rem, $interpreter.halt_overflow()),
             );
         }
+        // `push_at` takes the value, so bind it outside: `$x` was the one metavariable this
+        // macro expanded *only* inside the `unsafe` block, which is what
+        // `macro_metavars_in_unsafe` fires on -- `$interpreter` and `$sp` are also expanded
+        // in safe positions above, which is the lint's own escape. Hoisting it means a caller
+        // passing an expression that needs `unsafe` of its own has to write it, rather than
+        // borrowing this block's.
+        let value = $x;
         // SAFETY: room checked above.
-        unsafe { $interpreter.stack.push_at($sp, $x) };
+        unsafe { $interpreter.stack.push_at($sp, value) };
         $sp = $sp.wrapping_add($crate::interpreter::WORD);
     };
 }

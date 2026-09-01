@@ -57,10 +57,10 @@ pub fn balance_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
             .host
             .load_account_info_skip_cold_load(address, false, false)
         else {
-            return (
-                sp,
-                poison_at!(context.interpreter, rem, context.interpreter.halt_fatal()),
-            );
+            // Poisoned by hand: the dynamic gas above was charged through the field,
+            // and republishing the loop's register here would undo that charge.
+            context.interpreter.halt_fatal();
+            return (sp, u64::MAX);
         };
         *top = account.balance;
     };
@@ -145,10 +145,10 @@ pub fn extcodesize_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
             .host
             .load_account_info_skip_cold_load(address, true, false)
         else {
-            return (
-                sp,
-                poison_at!(context.interpreter, rem, context.interpreter.halt_fatal()),
-            );
+            // Poisoned by hand: the dynamic gas above was charged through the field,
+            // and republishing the loop's register here would undo that charge.
+            context.interpreter.halt_fatal();
+            return (sp, u64::MAX);
         };
         // safe to unwrap because we are loading code
         *top = U256::from(account.code.as_ref().unwrap().len());
@@ -197,10 +197,10 @@ pub fn extcodehash_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
             .host
             .load_account_info_skip_cold_load(address, true, false)
         else {
-            return (
-                sp,
-                poison_at!(context.interpreter, rem, context.interpreter.halt_fatal()),
-            );
+            // Poisoned by hand: the dynamic gas above was charged through the field,
+            // and republishing the loop's register here would undo that charge.
+            context.interpreter.halt_fatal();
+            return (sp, u64::MAX);
         };
         account
     };
@@ -372,7 +372,11 @@ pub fn sload_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
         match res {
             Ok(storage) => {
                 if storage.is_cold {
-                    gas!(context.interpreter, COLD_SLOAD_COST_ADDITIONAL, (sp, u64::MAX));
+                    gas!(
+                        context.interpreter,
+                        COLD_SLOAD_COST_ADDITIONAL,
+                        (sp, u64::MAX)
+                    );
                 }
 
                 // `*index = storage.data` is a 32-byte store that LLVM lowers to a `memcpy`
@@ -387,10 +391,10 @@ pub fn sload_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
         }
     } else {
         let Some(storage) = context.host.sload(target, *index) else {
-            return (
-                sp,
-                poison_at!(context.interpreter, rem, context.interpreter.halt_fatal()),
-            );
+            // Poisoned by hand: the dynamic gas above was charged through the field,
+            // and republishing the loop's register here would undo that charge.
+            context.interpreter.halt_fatal();
+            return (sp, u64::MAX);
         };
         // SAFETY: as above.
         unsafe { primitives::copy_u256(index, &storage.data) };
@@ -446,7 +450,11 @@ pub fn sstore_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
     let spec_row = gas::SSTORE_SPEC[spec_id as usize];
 
     // static gas
-    gas!(context.interpreter, spec_row.static_cost as u64, (sp, u64::MAX));
+    gas!(
+        context.interpreter,
+        spec_row.static_cost as u64,
+        (sp, u64::MAX)
+    );
 
     let state_load = if spec_id.is_enabled_in(BERLIN) {
         let skip_cold = context.interpreter.gas.remaining() < COLD_SLOAD_COST_ADDITIONAL;

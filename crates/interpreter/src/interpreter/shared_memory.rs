@@ -316,7 +316,7 @@ impl<T> RefcellExt<T> for RefCell<T> {
 /// the `new` static method to ensure memory safety.
 #[derive(Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(from = "SharedMemoryDe"))]
+#[cfg_attr(feature = "serde", serde(try_from = "SharedMemoryDe"))]
 pub struct SharedMemory {
     /// The underlying buffer.
     buffer: Option<Rc<RefCell<Vec<u8>>>>,
@@ -400,27 +400,67 @@ struct SharedMemoryDe {
 }
 
 #[cfg(feature = "serde")]
-impl From<SharedMemoryDe> for SharedMemory {
-    fn from(de: SharedMemoryDe) -> Self {
+impl TryFrom<SharedMemoryDe> for SharedMemory {
+    type Error = &'static str;
+
+    fn try_from(de: SharedMemoryDe) -> Result<Self, Self::Error> {
         // INV-B: restored here, which is the only way a deserialised value can reach a
         // caller. Null when there is no buffer, exactly as `invalid()` leaves it.
         let base = match &de.buffer {
-            // SAFETY: `my_checkpoint` is in bounds of the buffer for any `SharedMemory` that
-            // was serialised from a live one (one-past-the-end at worst), so the offset is a
-            // valid pointer to form. A corrupt `my_checkpoint` on the wire would make this
-            // out of bounds -- but it would equally make every length in the struct wrong,
-            // and `check_base` asserts the bound on every access in non-guest builds.
-            Some(b) => unsafe { b.dbg_borrow_mut().as_mut_ptr().add(de.my_checkpoint) },
-            None => core::ptr::null_mut(),
+            Some(b) => {
+                let mut buf = b.dbg_borrow_mut();
+                // The wire carries two offsets and an optional buffer, and every length
+                // here is derived from them. Checked against the invariant a live value
+                // satisfies, in full - both arms of this match, because the previous three
+                // attempts at this each enforced one clause and left a sibling open:
+                //
+                //     buffer.is_some() => my_checkpoint <= child_checkpoint <= buf.len()
+                //     buffer.is_none() => my_checkpoint == 0 && child_checkpoint.is_none()
+                //
+                // The upper bound because `free_child_context` hands `child_checkpoint`
+                // straight to `Vec::set_len`, and the region between the length and the
+                // capacity is inside the allocation but uninitialised. The lower bound
+                // because `new_child_context` takes the child's checkpoint from
+                // `full_len()`, which is never below this context's own; a smaller one
+                // shrinks the buffer under our own base and `len()`, being
+                // `full_len() - my_checkpoint`, underflows into a length that passes every
+                // subsequent bound test. Neither is caught later: overflow checks are off in
+                // the guest and `check_base` is compiled out.
+                //
+                // Rejected rather than clamped -- a clamp invents a value the sender did not
+                // send -- which is why this is `try_from`; `From` has no way to say no.
+                // Equality is legal at both ends: that is what an empty child produces.
+                if de.my_checkpoint > buf.len() {
+                    return Err("SharedMemory checkpoint is past the end of its buffer");
+                }
+                if de
+                    .child_checkpoint
+                    .is_some_and(|c| c > buf.len() || c < de.my_checkpoint)
+                {
+                    return Err("SharedMemory child checkpoint is outside its parent's range");
+                }
+                // SAFETY: bounded above, one-past-the-end at worst.
+                unsafe { buf.as_mut_ptr().add(de.my_checkpoint) }
+            }
+            None => {
+                // `invalid()` is the only value without a buffer and it carries neither
+                // offset, so this arm has an invariant too. A `child_checkpoint` here walks
+                // straight past `free_child_context`'s early return into `buffer()`, which
+                // unwraps the `None` - checked in a native build, undefined in the guest.
+                if de.my_checkpoint != 0 || de.child_checkpoint.is_some() {
+                    return Err("SharedMemory without a buffer carries a checkpoint");
+                }
+                core::ptr::null_mut()
+            }
         };
-        Self {
+        Ok(Self {
             buffer: de.buffer,
             base,
             my_checkpoint: de.my_checkpoint,
             child_checkpoint: de.child_checkpoint,
             #[cfg(feature = "memory_limit")]
             memory_limit: de.memory_limit,
-        }
+        })
     }
 }
 
@@ -822,10 +862,12 @@ impl SharedMemory {
                     // worth two fills, so zero the lot, the caller's part included.
                     (old_len, new_len)
                 } else if gap {
-                    // Only the hole between the old top and where the caller writes.
-                    // `wr_start + 7 < new_len`, because `wr_start + wr_len <= new_len` and
-                    // `wr_len` is 32 for every caller in tree, so this stays in bounds.
-                    (old_len, (wr_start + 7) & !7)
+                    // Only the hole between the old top and where the caller writes. Rounding
+                    // `wr_start` up overshoots `new_len` when the caller writes fewer than 8
+                    // bytes, so clamp it: this is a `pub` method, and its bound should not
+                    // rest on a caller obligation nothing states or checks. Every in-tree
+                    // caller writes 32, for which the clamp never binds.
+                    (old_len, ((wr_start + 7) & !7).min(new_len))
                 } else {
                     // Only the round-up to a whole word above what the caller writes. The
                     // `max` also covers a caller that writes entirely below the old top.
@@ -1576,7 +1618,10 @@ mod tests {
                 }
                 _ => {
                     if let Some(mut parent) = parents.pop() {
-                        cur = SharedMemory::invalid();
+                        // Drop the child first, so `free_child_context` runs with only the
+                        // parent's handle live. Written as a `replace` because the plain
+                        // assignment reads as a dead store.
+                        drop(core::mem::replace(&mut cur, SharedMemory::invalid()));
                         parent.free_child_context();
                         cur = parent;
                         model = models.pop().unwrap();
