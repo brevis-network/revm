@@ -33,9 +33,24 @@ impl FixedKeyHasher {
     /// fxhash's 64-bit multiplier.
     const K: u64 = 0x517c_c1b7_2722_0a95;
 
+    /// Folds one word into the state.
+    ///
+    /// fxhash spells this `(state.rotate_left(5) ^ word) * K`. RV64 without `Zbb` has no
+    /// rotate, so `rotate_left(5)` is `slli`/`srli`/`or` -- three of the five instructions
+    /// this line costs, paid once per word of every key the guest hashes. Dropping it leaves
+    /// `xor`/`mul`, and the chain still gives each word its own power of `K`, so word order
+    /// is still significant and a `[a, b]` key does not hash like `[b, a]`.
+    ///
+    /// The rotate is what would let a high bit of an earlier word reach the low bits of the
+    /// digest, and hashbrown takes its bucket index from the low bits. It does not do that
+    /// job here even when it is present: a difference at bit 40 of the first word of a
+    /// 32-byte key rotates to bit 45, 50 and 55 over the remaining rounds and never wraps
+    /// past 63, so those low bits do not depend on it either way. What the low bits do depend
+    /// on -- the low bits of every word -- is unchanged. `probe_lengths_are_sane` pins that
+    /// the distribution is still usable for the key shapes this guest hashes.
     #[inline(always)]
     fn add_word(&mut self, word: u64) {
-        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(Self::K);
+        self.0 = (self.0 ^ word).wrapping_mul(Self::K);
     }
 }
 
@@ -129,6 +144,53 @@ mod tests {
     use super::*;
     use core::hash::BuildHasher;
     use std::{vec, vec::Vec};
+
+    /// The digest's low bits are what hashbrown turns into a bucket index, so they are what
+    /// decides how long a probe is. Checks the three key shapes this guest actually hashes --
+    /// sequential storage slots, keccak-shaped storage slots, and addresses -- through their
+    /// real `Hash` impls, and asserts they land evenly enough in a table of 1024 buckets that
+    /// no bucket is deep. A perfectly uniform hash puts 1 key in each; 6 leaves a lot of
+    /// still fails loudly if the fold ever stops mixing.
+    ///
+    /// A `U256` hashes its limbs, least significant first, which is why a small storage slot
+    /// carries its entropy in the *first* word the fold sees. A key shape that put the
+    /// entropy in the last word instead would collide wholesale here -- with or without
+    /// fxhash's rotate, which never reaches the low bits over a 32-byte key either way.
+    #[test]
+    fn probe_lengths_are_sane() {
+        const BUCKETS: usize = 1024;
+        let build = FixedKeyBuildHasher::default();
+
+        let mut counts = [[0usize; BUCKETS], [0; BUCKETS], [0; BUCKETS]];
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            x ^= x >> 30;
+            x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            x ^= x >> 27;
+            x
+        };
+        for i in 0..BUCKETS as u64 {
+            // Sequential storage slots.
+            let seq = crate::U256::from(i);
+            // Keccak-shaped storage slots.
+            let rnd = crate::U256::from_limbs([next(), next(), next(), next()]);
+            // Addresses: 20 bytes, the low half of a keccak output.
+            let mut bytes = [0u8; 20];
+            for chunk in bytes.chunks_mut(8) {
+                let w = next().to_le_bytes();
+                chunk.copy_from_slice(&w[..chunk.len()]);
+            }
+            let addr = Address::from(bytes);
+
+            counts[0][(build.hash_one(seq) as usize) & (BUCKETS - 1)] += 1;
+            counts[1][(build.hash_one(rnd) as usize) & (BUCKETS - 1)] += 1;
+            counts[2][(build.hash_one(addr) as usize) & (BUCKETS - 1)] += 1;
+        }
+        for (shape, counts) in counts.iter().enumerate() {
+            let max = counts.iter().copied().max().unwrap();
+            assert!(max <= 10, "shape {shape}: deepest bucket holds {max} keys");
+        }
+    }
 
     /// The aligned and unaligned arms have to agree, or map lookups break.
     #[test]
