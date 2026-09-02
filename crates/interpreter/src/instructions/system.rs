@@ -208,9 +208,15 @@ pub fn calldataload_at<WIRE: InterpreterTypes, H: ?Sized>(
     let (base, input_len) = match context.interpreter.input.input() {
         CallInput::SharedBuffer(range) => {
             let (start, end) = (range.start, range.end);
-            // SAFETY: `start` is in bounds of the shared buffer -- it is where the caller
-            // wrote this frame's calldata -- and nothing here can resize the memory.
-            let base = unsafe { context.interpreter.memory.global_ptr().add(start) };
+            // `wrapping_add`, not `add`: a call with `argsSize == 0` carries the
+            // `usize::MAX..usize::MAX` sentinel `resize_memory` uses for "no calldata", which
+            // `prepare_call_inputs` passes through untouched, and this runs before the
+            // `offset >= input_len` test below that discards it. `add` would be UB there --
+            // the offset has to fit in `isize` -- and `getelementptr inbounds` would let LLVM
+            // assume it does. The pointer is only ever dereferenced where `offset < input_len`,
+            // which the sentinel's zero length excludes, and both spellings emit the same
+            // instruction.
+            let base = context.interpreter.memory.global_ptr().wrapping_add(start);
             (base, end.saturating_sub(start))
         }
         CallInput::Bytes(bytes) => (bytes.as_ptr(), bytes.len()),
