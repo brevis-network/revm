@@ -1545,8 +1545,9 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
 
 /// Resolves an account the [`AccountCache`] does not hold, and records it.
 ///
-/// Null when it is not in the map at all; `sload_slot_warm`'s caller panics on that, which
-/// is what keeps `sload_slot_warm` free of calls.
+/// Null when it is not in the map at all. `sload_slot_warm` hands that straight back, and its
+/// callers answer it by taking the cold path, which is what keeps the case out of the warm
+/// body.
 ///
 /// Out of line and `cold` for the register pressure: the address hash, hashbrown's control
 /// word and the bucket compare want a different set of values live from the storage probe
@@ -1607,8 +1608,13 @@ fn rehome_misaligned_address(address: &Address) -> (AlignedAddress, (u64, u64, u
 /// `unwrap` and the journal push, which are calls and so need `ra` saved, gave the function
 /// thirteen callee-saved registers and a 272-byte frame: 54 of the 151 retired instructions
 /// it spent per call went on its own prologue and epilogue, more than the storage probe it
-/// exists to do. This half takes five arguments, makes no call, and hands back a pointer
-/// rather than a `Result` in an `sret` slot.
+/// exists to do. This half takes five arguments and hands back a pointer rather than a
+/// `Result` in an `sret` slot.
+///
+/// The hot path makes no call, which is the property that saving rests on -- but the function
+/// is not call-free: a cache miss calls [`resolve_account`], `inline(never)` precisely so its
+/// register demand stays out of this frame. On mainnet block 24006677 that is 1,873 of 76,821
+/// accesses.
 ///
 /// Not a method: nothing here needs `ENTRY` or `DB`, so as a free function it is one
 /// instantiation for `sload` and `sstore` together rather than one per journal entry type.
@@ -1633,9 +1639,8 @@ fn sload_slot_warm(
     // mainnet block 24006677 is 74,948 of 76,821 calls; see [`AccountCache`] for why a bucket
     // pointer may be kept and where it is dropped.
     //
-    // Keyed by `FastAddress` - tag 0 - so the bucket comparison is word-wise; see there. This
-    // is the only site that uses tag 0: a second caller of one instantiation pushes
-    // `RawTable::find` past the inliner and it outlines, which costs more than it saves.
+    // The map itself is keyed by `FastAddress`, but that lookup lives in `resolve_account` --
+    // this probes the two-way cache by raw words and only falls through to it on a miss.
     let words = AccountCache::address_words(address);
     let account: *mut Account = match words.and_then(|w| account_cache.get(w)) {
         Some(cached) => cached,

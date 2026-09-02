@@ -143,9 +143,10 @@ pub(crate) fn bswap64_halves_shared(x: u64, m1: u64, m2: u64) -> u64 {
 /// `Address::into_word().into()` builds a 32-byte `B256` first -- a 12-byte zero fill and a
 /// 20-byte copy out of an align-1 field -- and then byte-reverses all four limbs of it. An
 /// address has three non-zero limbs and the top one is 32 bits wide, so what the conversion
-/// actually needs is three scalar loads, two funnels and two-and-a-bit reversals. Measured
-/// on mainnet block 24006677: `ADDRESS` 85.0 -> 69.1 retired per dispatch, `CALLER` 78.0 ->
-/// 63.0.
+/// actually needs is three scalar loads, two funnels and two-and-a-bit reversals.
+///
+/// No per-dispatch figures here: the rungs of this ladder have been changed more than once,
+/// and a number in a comment does not move with them. The commits carry the measurements.
 ///
 /// `Address` is `[u8; 20]` with alignment 1 and RV64 has no misaligned scalar load, so there
 /// is a ladder, but unlike [`primitives::copy_address_bytes`]'s it has no 8-aligned rung --

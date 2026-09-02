@@ -483,7 +483,7 @@ macro_rules! as_usize_or_fail {
     };
 }
 
-/// [`as_usize_or_fail_ret!`] for a body that has *not* published the threaded gas counter.
+/// [`crate::as_usize_or_fail_ret!`] for a body that has *not* published the threaded gas counter.
 ///
 /// The plain form halts on the failure path, and a halt stashes `Interpreter::gas`, so it
 /// can only be used where the field is already the truth. A body that keeps the counter in
