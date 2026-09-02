@@ -168,8 +168,14 @@ mod tests {
     /// decides how long a probe is. Checks the three key shapes this guest actually hashes --
     /// sequential storage slots, keccak-shaped storage slots, and addresses -- through their
     /// real `Hash` impls, and asserts they land evenly enough in a table of 1024 buckets that
-    /// no bucket is deep. A perfectly uniform hash puts 1 key in each; 6 leaves a lot of
-    /// still fails loudly if the fold ever stops mixing.
+    /// no bucket is deep: 1024 keys over 1024 buckets, so a perfectly uniform hash puts one in
+    /// each and the bound of 10 leaves generous headroom.
+    ///
+    /// What this test can and cannot see: it is a distribution check, so it only fails if the
+    /// digest's low bits collapse. It does *not* pin that the fold mixes at all -- dropping
+    /// the multiplier entirely leaves it green, because shape 0's digest is then still a
+    /// bijection onto the buckets. Order sensitivity, the property the `add_word` comment
+    /// rests on, is pinned by [`word_order_changes_the_digest`] instead.
     ///
     /// A `U256` hashes its limbs, least significant first, which is why a small storage slot
     /// carries its entropy in the *first* word the fold sees. A key shape that put the
@@ -208,6 +214,34 @@ mod tests {
         for (shape, counts) in counts.iter().enumerate() {
             let max = counts.iter().copied().max().unwrap();
             assert!(max <= 10, "shape {shape}: deepest bucket holds {max} keys");
+        }
+    }
+
+    /// `add_word`'s comment justifies dropping fxhash's `rotate_left(5)` on the grounds that
+    /// "the chain still gives each word its own power of `K`, so word order is still
+    /// significant and a `[a, b]` key does not hash like `[b, a]`". That is the load-bearing
+    /// claim -- a commutative fold would make every permutation of a key collide -- and it is
+    /// what this pins. `probe_lengths_are_sane` cannot: it stays green under both an
+    /// xor-only fold and an additive one.
+    #[test]
+    fn word_order_changes_the_digest() {
+        let build = FixedKeyBuildHasher::default();
+        let base = [
+            0x0123_4567_89ab_cdefu64,
+            0xfedc_ba98_7654_3210,
+            0x0f1e_2d3c_4b5a_6978,
+            0x1122_3344_5566_7788,
+        ];
+        // Every adjacent transposition of the four limbs has to move the digest.
+        for i in 0..3 {
+            let mut swapped = base;
+            swapped.swap(i, i + 1);
+            assert_ne!(
+                build.hash_one(crate::U256::from_limbs(base)),
+                build.hash_one(crate::U256::from_limbs(swapped)),
+                "swapping limbs {i} and {} left the digest unchanged",
+                i + 1
+            );
         }
     }
 

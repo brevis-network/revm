@@ -406,7 +406,10 @@ pub fn signextend_at<WIRE: InterpreterTypes, H: ?Sized>(
 
 #[cfg(test)]
 mod div_fast_path_tests {
-    use super::{div_rem_128_by_32, div_small_eligible, u256_div_nonzero, u256_rem_nonzero};
+    use super::{
+        div, div_rem_128_by_32, div_small_eligible, rem, u256_div_nonzero, u256_rem_nonzero,
+    };
+    use crate::{host::DummyHost, InstructionContext, Interpreter};
     use primitives::{u256_is_zero, U256};
 
     /// SplitMix64, so the sweep needs no dependency and is reproducible.
@@ -560,28 +563,91 @@ mod div_fast_path_tests {
         st.compared += 1;
     }
 
-    /// `x / 0 == 0` and `x % 0 == 0`: the opcodes implement this by *skipping* the
-    /// assignment, leaving the zero divisor that is already on the stack. This mirrors
-    /// that guard exactly, so the fast path cannot have changed it.
+    /// `x / 0 == 0` and `x % 0 == 0`, driven through the real DIV and MOD opcodes.
+    ///
+    /// The guard is the code under test, so the test must not contain a copy of it. Setting
+    /// `top = U256::ZERO` and then wrapping the call in the opcode's own
+    /// `if !u256_is_zero(&top)` never takes the branch: the fast path is not called and every
+    /// assertion becomes `assert_eq!(ZERO, ZERO)`.
+    ///
+    /// This matters because the fast path does *not* reject a zero divisor itself; see
+    /// [`the_fast_path_accepts_a_zero_divisor`], which pins that. `div_rem_128_by_32`
+    /// answers a zero divisor with `unreachable_unchecked`, so the opcode's guard is what
+    /// stands between DIV and undefined behaviour -- not between it and a trap.
     #[test]
     fn zero_divisor_is_untouched() {
+        let mut interpreter = Interpreter::default();
+
         for n in [
             U256::ZERO,
             U256::from(1u64),
             U256::from(u128::MAX),
             U256::MAX,
         ] {
-            let mut top = U256::ZERO;
-            if !u256_is_zero(&top) {
-                top = u256_div_nonzero(n, top);
-            }
-            assert_eq!(top, U256::ZERO, "{n:#x} / 0");
+            // Divisor first: DIV pops the numerator off the top and writes the result
+            // over the divisor beneath it.
+            push!(interpreter, U256::ZERO);
+            push!(interpreter, n);
+            div(InstructionContext {
+                host: &mut DummyHost,
+                interpreter: &mut interpreter,
+            });
+            assert_eq!(
+                interpreter.stack.pop().unwrap(),
+                U256::ZERO,
+                "{n:#x} through DIV by zero"
+            );
 
-            let mut top = U256::ZERO;
-            if !u256_is_zero(&top) {
-                top = u256_rem_nonzero(n, top);
-            }
-            assert_eq!(top, U256::ZERO, "{n:#x} % 0");
+            push!(interpreter, U256::ZERO);
+            push!(interpreter, n);
+            rem(InstructionContext {
+                host: &mut DummyHost,
+                interpreter: &mut interpreter,
+            });
+            assert_eq!(
+                interpreter.stack.pop().unwrap(),
+                U256::ZERO,
+                "{n:#x} through MOD by zero"
+            );
+        }
+    }
+
+    /// The small-divisor predicate accepts `d == 0`, so the opcodes' zero test is
+    /// load-bearing: without it `div_rem_128_by_32` is reached with a divisor it declares
+    /// `unreachable_unchecked`.
+    #[test]
+    fn the_fast_path_accepts_a_zero_divisor() {
+        // A zero divisor is *accepted*: `d == 0` clears every bit the predicate tests.
+        let zero = [0u64; 4];
+        for n in [[0u64; 4], [u64::MAX, u64::MAX, 0, 0]] {
+            assert!(
+                div_small_eligible(&n, &zero),
+                "the predicate must not be relied on to reject d == 0"
+            );
+        }
+        // The shapes it does reject, so the case above is a characterisation and not one
+        // fact restated: a numerator at or above 2^128, and a divisor at or above 2^32.
+        let small_n = [1u64, 0, 0, 0];
+        for (n, d, why) in [
+            (
+                [0u64, 0, 1, 0],
+                [1u64, 0, 0, 0],
+                "numerator >= 2^128 (limb 2)",
+            ),
+            (
+                [0u64, 0, 0, 1],
+                [1u64, 0, 0, 0],
+                "numerator >= 2^128 (limb 3)",
+            ),
+            (small_n, [1u64 << 32, 0, 0, 0], "divisor >= 2^32"),
+            (small_n, [0u64, 1, 0, 0], "divisor >= 2^64 (limb 1)"),
+            (small_n, [0u64, 0, 1, 0], "divisor >= 2^128 (limb 2)"),
+            (small_n, [0u64, 0, 0, 1], "divisor >= 2^192 (limb 3)"),
+        ] {
+            assert!(
+                !div_small_eligible(&n, &d),
+                "should have been rejected: {why}"
+            );
         }
     }
 
@@ -683,6 +749,22 @@ mod div_fast_path_tests {
         }
 
         // ---- 4. randomised sweep, fixed seed ---------------------------------------
+        //
+        // Two things about the randomised loops are recorded, because the counters at the
+        // end of the test are all satisfied by the hard-coded sections 1 and 3 and so say
+        // nothing about whether these loops generated anything: how many distinct operand
+        // pairs they produced, and how many of *their* pairs took the fast path. Distinctness
+        // alone is not enough -- a generator can stay diverse while producing nothing the
+        // fast path accepts.
+        let fast_before = st.fast;
+        fn mix(n: &U256, d: &U256) -> u64 {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            for w in n.as_limbs().iter().chain(d.as_limbs().iter()) {
+                h = (h ^ w).wrapping_mul(0x100_0000_01b3);
+            }
+            h
+        }
+        let mut sampled: std::vec::Vec<u64> = std::vec::Vec::new();
         for _ in 0..40_000 {
             let nl = (rng.next() % 5) as usize;
             let dl = 1 + (rng.next() % 4) as usize;
@@ -690,6 +772,7 @@ mod div_fast_path_tests {
             let dtb = 1 + (rng.next() % 64) as u32;
             let n = rand_uint(&mut rng, nl, ntb);
             let d = rand_uint(&mut rng, dl, dtb);
+            sampled.push(mix(&n, &d));
             check(n, d, &mut st);
             expected += 1;
         }
@@ -700,6 +783,7 @@ mod div_fast_path_tests {
             let ntb = 1 + (rng.next() % 64) as u32;
             let n = rand_uint(&mut rng, nl, ntb);
             let d = U256::from(1 + rng.next() % (u32::MAX as u64));
+            sampled.push(mix(&n, &d));
             check(n, d, &mut st);
             expected += 1;
         }
@@ -713,6 +797,25 @@ mod div_fast_path_tests {
         assert_eq!(
             st.compared, expected,
             "some pairs were not actually compared"
+        );
+        // The counters below this line are bumped by `check`, so they say the sweep ran --
+        // but every one of them is already satisfied by the hard-coded sections 1 and 3, so
+        // on their own they cannot tell whether the randomised sections generated anything.
+        // A generator that returns a constant leaves all of them green. This one counts
+        // *distinct* operand pairs out of the 60,000 randomised ones, which only a live
+        // generator produces.
+        let mut distinct = sampled;
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert!(
+            distinct.len() > 50_000,
+            "the randomised sweep produced only {} distinct operand pairs out of 60,000",
+            distinct.len()
+        );
+        assert!(
+            st.fast - fast_before > 15_000,
+            "the randomised sweep drove the fast path only {} times",
+            st.fast - fast_before
         );
         // The sweep size is pinned as well as self-consistent: shrinking a loop has to
         // be a deliberate edit here, not something that happens quietly.
@@ -757,12 +860,19 @@ mod div_fast_path_tests {
         assert!(st.n_is_u128_max > 0 && st.n_is_u256_max > 0);
     }
 
-    /// The two invariants the fast path rests on, checked directly rather than through
-    /// its output: every partial remainder stays below the divisor, and every quotient
-    /// digit stays below `2^32`.
+    /// What the fast path's `r < d` invariant looks like from outside: the returned
+    /// remainder is below the divisor, and the quotient of a sub-`2^128` numerator fits in
+    /// two limbs, over the divisors that sit on the interesting boundaries.
+    ///
+    /// The per-digit invariants are internal and a test cannot see them; re-deriving them
+    /// inside the test proves nothing, because `r = cur % d` and `q = cur / d` make both true
+    /// by construction whatever `div_rem_128_by_32` does. So this checks the boundary the
+    /// function does expose, and checks it *before* the comparisons against `ruint` -- after
+    /// them the two would be implied and could never fail.
     #[test]
     fn digit_invariants_hold() {
         let mut rng = Rng(0xC0FF_EE00_1234_5678u64);
+        // Not decoration: without it, `0..2_000` becoming `0..0` leaves the test green.
         let mut checked = 0u64;
         for d in [
             1u64,
@@ -776,27 +886,23 @@ mod div_fast_path_tests {
         ] {
             for _ in 0..2_000 {
                 let n = [rng.next(), rng.next(), 0, 0];
-                let mut r = 0u64;
-                for digit in [
-                    n[1] >> 32,
-                    n[1] & 0xffff_ffff,
-                    n[0] >> 32,
-                    n[0] & 0xffff_ffff,
-                ] {
-                    assert!(r < d, "partial remainder {r} escaped divisor {d}");
-                    let cur = (r << 32) | digit;
-                    let q = cur / d;
-                    assert!(q <= u32::MAX as u64, "quotient digit {q} escaped 2^32");
-                    r = cur % d;
-                    checked += 1;
-                }
                 let (q, rem) = div_rem_128_by_32(&n, d);
+                // Named explicitly, and placed first so a failure reports the invariant
+                // rather than a quotient mismatch. They add no kill power of their own: the
+                // comparisons below imply both for any mutant.
+                assert!(rem < d, "remainder {rem} escaped divisor {d}");
+                let ql = q.as_limbs();
+                assert!(
+                    ql[2] == 0 && ql[3] == 0,
+                    "quotient of a sub-2^128 numerator overflowed two limbs"
+                );
                 let nn = U256::from_limbs(n);
                 let dd = U256::from(d);
                 assert_eq!(q, nn.wrapping_div(dd));
                 assert_eq!(U256::from(rem), nn.wrapping_rem(dd));
+                checked += 1;
             }
         }
-        assert_eq!(checked, 8 * 2_000 * 4, "digit invariant loop did not run");
+        assert_eq!(checked, 8 * 2_000, "the sweep changed size");
     }
 }
