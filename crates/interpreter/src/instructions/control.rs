@@ -213,7 +213,10 @@ pub unsafe fn jump_imm_at<const N: usize, WIRE: InterpreterTypes>(
         return (next, sp);
     }
     let target = unsafe { read_be_usize::<N>(ip.add(1)) };
-    (jump_to::<true, true, _>(interpreter, target, next, jctx), sp)
+    (
+        jump_to::<true, true, _>(interpreter, target, next, jctx),
+        sp,
+    )
 }
 
 /// Fused `PUSH<N>; JUMPI`. See [`jump_imm_at`].
@@ -248,10 +251,16 @@ pub unsafe fn jumpi_imm_at<const N: usize, WIRE: InterpreterTypes>(
             return (next, sp);
         }
         let target = unsafe { read_be_usize::<N>(ip.add(1)) };
-        return (jump_to::<true, false, _>(interpreter, target, next, jctx), sp);
+        return (
+            jump_to::<true, false, _>(interpreter, target, next, jctx),
+            sp,
+        );
     }
     let target = unsafe { read_be_usize::<N>(ip.add(1)) };
-    (jump_to::<true, false, _>(interpreter, target, next, jctx), sp)
+    (
+        jump_to::<true, false, _>(interpreter, target, next, jctx),
+        sp,
+    )
 }
 
 /// The `N` big-endian bytes at `src` as a `usize`.

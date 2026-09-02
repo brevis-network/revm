@@ -134,8 +134,15 @@ pub fn call<WIRE: InterpreterTypes, H: Host + ?Sized>(
         is_static: context.interpreter.runtime_flag.is_static(),
         return_memory_offset: 0..0,
     });
-    if prepare_call_inputs(&mut context, to, has_transfer, true, local_gas_limit, &mut inputs)
-        .is_none()
+    if prepare_call_inputs(
+        &mut context,
+        to,
+        has_transfer,
+        true,
+        local_gas_limit,
+        &mut inputs,
+    )
+    .is_none()
     {
         return;
     }
@@ -170,8 +177,15 @@ pub fn call_code<WIRE: InterpreterTypes, H: Host + ?Sized>(
         is_static: context.interpreter.runtime_flag.is_static(),
         return_memory_offset: 0..0,
     });
-    if prepare_call_inputs(&mut context, to, has_transfer, false, local_gas_limit, &mut inputs)
-        .is_none()
+    if prepare_call_inputs(
+        &mut context,
+        to,
+        has_transfer,
+        false,
+        local_gas_limit,
+        &mut inputs,
+    )
+    .is_none()
     {
         return;
     }

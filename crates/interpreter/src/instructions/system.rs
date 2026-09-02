@@ -85,9 +85,7 @@ pub fn address_at<WIRE: InterpreterTypes, H: ?Sized>(
 ) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
     // SAFETY: `target_address` is 20 readable bytes of a live `InputsImpl`.
-    let word = unsafe {
-        u256_from_be_address(context.interpreter.input.target_address_ptr())
-    };
+    let word = unsafe { u256_from_be_address(context.interpreter.input.target_address_ptr()) };
     push_at!(context.interpreter, sp, rem, word);
     (sp, rem)
 }
@@ -113,9 +111,7 @@ pub fn caller_at<WIRE: InterpreterTypes, H: ?Sized>(
 ) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
     // SAFETY: `caller_address` is 20 readable bytes of a live `InputsImpl`.
-    let word = unsafe {
-        u256_from_be_address(context.interpreter.input.caller_address_ptr())
-    };
+    let word = unsafe { u256_from_be_address(context.interpreter.input.caller_address_ptr()) };
     push_at!(context.interpreter, sp, rem, word);
     (sp, rem)
 }
