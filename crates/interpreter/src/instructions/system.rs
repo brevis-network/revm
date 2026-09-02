@@ -1,6 +1,9 @@
 use crate::{
     gas,
-    interpreter::{bswap64_shared, bswap_masks_shared, u256_from_be_aligned, Interpreter},
+    interpreter::{
+        bswap64_halves_shared, bswap64_shared, bswap_masks_shared, u256_from_be_address,
+        u256_from_be_aligned, Interpreter,
+    },
     interpreter_types::{
         InputsTr, InterpreterTypes, LegacyBytecode, MemoryTr, ReturnData, RuntimeFlag, StackTr,
     },
@@ -81,17 +84,9 @@ pub fn address_at<WIRE: InterpreterTypes, H: ?Sized>(
     rem: u64,
 ) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
-    push_at!(
-        context.interpreter,
-        sp,
-        rem,
-        context
-            .interpreter
-            .input
-            .target_address()
-            .into_word()
-            .into()
-    );
+    // SAFETY: `target_address` is 20 readable bytes of a live `InputsImpl`.
+    let word = unsafe { u256_from_be_address(context.interpreter.input.target_address_ptr()) };
+    push_at!(context.interpreter, sp, rem, word);
     (sp, rem)
 }
 
@@ -115,17 +110,9 @@ pub fn caller_at<WIRE: InterpreterTypes, H: ?Sized>(
     rem: u64,
 ) -> (usize, u64) {
     //gas!(context.interpreter, gas::BASE);
-    push_at!(
-        context.interpreter,
-        sp,
-        rem,
-        context
-            .interpreter
-            .input
-            .caller_address()
-            .into_word()
-            .into()
-    );
+    // SAFETY: `caller_address` is 20 readable bytes of a live `InputsImpl`.
+    let word = unsafe { u256_from_be_address(context.interpreter.input.caller_address_ptr()) };
+    push_at!(context.interpreter, sp, rem, word);
     (sp, rem)
 }
 
@@ -203,19 +190,44 @@ pub fn calldataload_at<WIRE: InterpreterTypes, H: ?Sized>(
 ) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
     popn_top_at!([], offset_ptr, context.interpreter, sp, rem);
-    let offset = as_usize_saturated!(offset_ptr);
+    // See the note on `SHL`: `as_usize_saturated!` builds an all-ones sentinel out of the
+    // three high limbs so one compare can range-check the whole word. `input_len` is a
+    // `usize`, so testing the high limbs directly against zero does the same job for two
+    // instructions less.
+    let ol = *offset_ptr.as_limbs();
+    let offset = ol[0] as usize;
     // Assemble straight into the stack slot, one limb at a time. Building a `U256` first
     // keeps all four limbs live to the end, which cost this instruction a prologue that
     // saved ten callee-saved registers on every `CALLDATALOAD`.
     let dst = (offset_ptr as *mut U256).cast::<u64>();
-    let input_len = context.interpreter.input.input().len();
+    // One match over the input, not two. Asking for `len()` and then matching again to get
+    // the bytes made LLVM re-test the discriminant, reload `range.start` and recompute the
+    // length -- and `global_slice` hands back a `Ref`, whose guard is three retired
+    // instructions to bump the shared buffer's borrow count and three more to drop it, on
+    // every `CALLDATALOAD`, for a pointer that dies inside the statement.
+    let (base, input_len) = match context.interpreter.input.input() {
+        CallInput::SharedBuffer(range) => {
+            let (start, end) = (range.start, range.end);
+            // `wrapping_add`, not `add`: a call with `argsSize == 0` carries the
+            // `usize::MAX..usize::MAX` sentinel `resize_memory` uses for "no calldata", which
+            // `prepare_call_inputs` passes through untouched, and this runs before the
+            // `offset >= input_len` test below that discards it. `add` would be UB there --
+            // the offset has to fit in `isize` -- and `getelementptr inbounds` would let LLVM
+            // assume it does. The pointer is only ever dereferenced where `offset < input_len`,
+            // which the sentinel's zero length excludes, and both spellings emit the same
+            // instruction.
+            let base = context.interpreter.memory.global_ptr().wrapping_add(start);
+            (base, end.saturating_sub(start))
+        }
+        CallInput::Bytes(bytes) => (bytes.as_ptr(), bytes.len()),
+    };
 
     // The word used to be assembled as a `B256` (a runtime-length `memcpy`, 72.8 retired
     // instructions) and then converted with `B256 -> U256`, which is four software byte
     // reversals, ~77 more. When the whole 32 bytes are inside the calldata - the case for
     // essentially every `CALLDATALOAD` a compiler emits - the limbs can be assembled
     // straight from the bytes with 8 `lbu` + 7 `slli` + 7 `or` each and neither is needed.
-    if offset >= input_len {
+    if (ol[1] | ol[2] | ol[3]) != 0 || offset >= input_len {
         // SAFETY: `dst` is the four limbs of a live stack word.
         unsafe {
             dst.write(0);
@@ -226,17 +238,8 @@ pub fn calldataload_at<WIRE: InterpreterTypes, H: ?Sized>(
         return (sp, rem);
     }
     let count = 32.min(input_len - offset);
-    match context.interpreter.input.input() {
-        CallInput::Bytes(bytes) => {
-            // SAFETY: `offset < input_len` and `count <= input_len - offset`.
-            unsafe { be_word_to(bytes.as_ptr().add(offset), count, dst) }
-        }
-        CallInput::SharedBuffer(range) => {
-            let input_slice = context.interpreter.memory.global_slice(range.clone());
-            // SAFETY: as above, within the shared-buffer slice.
-            unsafe { be_word_to(input_slice.as_ptr().add(offset), count, dst) }
-        }
-    }
+    // SAFETY: `offset < input_len` and `count <= input_len - offset`.
+    unsafe { be_word_to(base.add(offset), count, dst) }
     (sp, rem)
 }
 
@@ -297,15 +300,22 @@ unsafe fn be_word_to(src: *const u8, count: usize, dst: *mut u64) {
         // SAFETY: `src[..32]` is readable and 4-aligned, so the eight `u32` reads are in
         // bounds and aligned. RV64 is little-endian, so the two halves recombine to the same
         // `u64` an aligned `ld` would have produced.
+        //
+        // The halves go together *swapped*, which is stage 3 of the byte reversal, so
+        // `bswap64_halves_shared` only has stages 1 and 2 left to run: three instructions a
+        // limb less than assembling the word in order and reversing all of it. `w == 0` is
+        // the same test either way, since swapping halves does not change whether a word is
+        // zero. This is the path 58% of the block's `CALLDATALOAD`s take - calldata offsets
+        // are `4 + 32k`, which is 4 mod 8.
         unsafe {
             let q = src.cast::<u32>();
             let mut k = 0;
             while k < 4 {
-                let w = (q.add(2 * k).read() as u64) | ((q.add(2 * k + 1).read() as u64) << 32);
+                let w = (q.add(2 * k + 1).read() as u64) | ((q.add(2 * k).read() as u64) << 32);
                 if w == 0 {
                     dst.add(3 - k).write(0);
                 } else {
-                    dst.add(3 - k).write(bswap64_shared(w, m1, m2));
+                    dst.add(3 - k).write(bswap64_halves_shared(w, m1, m2));
                 }
                 k += 1;
             }

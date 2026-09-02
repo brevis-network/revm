@@ -18,12 +18,18 @@ use primitives::{
 };
 use state::{Account, EvmState, EvmStorageSlot, TransientStorage};
 use std::vec::Vec;
-/// The account [`JournalInner::sload_slot`] resolved last, and where it lives.
+/// The two accounts this module resolved most recently, and where they live.
 ///
 /// Every SLOAD and SSTORE in a call frame targets the same address - the executing
-/// contract's - so the account lookup that opens `sload_slot` finds the same bucket over and
-/// over. It is not cheap: hashing the address and walking hashbrown's control bytes measured
-/// at ~90 of the ~232 retired instructions `sload_slot` spends per call.
+/// contract's - and a `CALL` looks that same account up twice more on its way in, in
+/// [`JournalInner::load_account_mut_optional_code`] and [`JournalInner::transfer_loaded`].
+/// The lookup is not cheap: hashing the address and walking hashbrown's control bytes
+/// measured at ~90 of the ~232 retired instructions `sload_slot` spent per call. On mainnet
+/// block 24006677 the cache answers 74,948 of the 76,821 storage accesses.
+///
+/// Two ways, most-recent first. One way loses the caller of every frame that touches
+/// storage, and the caller's first access after the frame returns then pays a full probe
+/// again; the second way holds it across the call.
 ///
 /// `ptr` is a `usize` rather than a `*mut Account` so that `JournalInner` keeps its auto
 /// traits; zero means empty.
@@ -42,7 +48,7 @@ use std::vec::Vec;
 /// observable from outside the table - so the cache must be emptied at every point where the
 /// table can restructure.
 ///
-/// Seven places clear, for four different reasons.
+/// Eight places clear, for four different reasons.
 ///
 /// *It restructures here.* Two sites: the vacant arm of
 /// [`JournalInner::load_account_mut_optional_code`] -- the module's only `insert` -- and
@@ -56,11 +62,12 @@ use std::vec::Vec;
 /// [`JournalInner::state`] belongs here too: it returns `&mut self.state` wholesale, so the
 /// caller can do anything at all to the table.
 ///
-/// *Nothing could be cached anyway.* One site: `sload_slot`, on the arm where the address is
-/// not 8-aligned and so cannot be read as words. Discretionary, like `commit_tx` -- that path
-/// only reaches the map through `get_mut`, so no bucket moves. Note it discards the entry for
-/// the *previous* address, which a later lookup could still have matched: a small
-/// pessimisation, not a required clear.
+/// *Nothing could be cached anyway.* Two sites, both on the arm where the address is not
+/// 8-aligned and so cannot be read as words: `resolve_account`, reached from
+/// `sload_slot_warm`, and `JournalInner::sload_slot_cold`, which repeats the lookup.
+/// Discretionary, like `commit_tx` -- that path only reaches the map through `get_mut`, so no
+/// bucket moves. Note each discards the entries for the *previous* addresses, which a later
+/// lookup could still have matched: a small pessimisation, not a required clear.
 ///
 /// *Hygiene.* `commit_tx` clears once per transaction without needing to, to keep the window
 /// in which a bucket pointer is live short.
@@ -68,19 +75,121 @@ use std::vec::Vec;
 /// What is left - every other method here - reaches the map through
 /// `get`/`get_mut`/`entry`-occupied, none of which can move a bucket. A new method that
 /// hands out `&mut EvmState`, or that can insert, needs a clear and belongs on this list.
+///
+/// Four places fill, and each is the `Some` arm of one of the four lookups this module makes:
+/// `resolve_account` (tag 0, for `sload_slot_warm`),
+/// `JournalInner::sload_slot_cold` (tag 4),
+/// [`JournalInner::load_account_mut_optional_code`] on its occupied arm (tag 3), and
+/// [`JournalInner::transfer_loaded`] for its `to` (tag 1). All four reach the map through
+/// `get_mut`, so the bucket they name cannot have moved between the lookup and the store, and
+/// all four are inside this module, so the clear list above covers them. The vacant arm of
+/// `load_account_mut_optional_code` is the one lookup that does *not* fill: it inserts, so it
+/// clears instead.
+///
+/// # What was measured and left alone
+///
+/// A second level of the same idea - caching the *slot* the last storage access resolved,
+/// keyed by the account pointer and the storage key - was instrumented rather than built. It
+/// would hit on 15,025 of the 76,821 accesses on mainnet block 24006677 (19.6 %, which is
+/// very nearly the 14,781 SSTOREs, each preceded by an SLOAD of the same slot). At ~78
+/// instructions saved per hit that is ~1.17 M against ~1.00 M paid for the key compare on
+/// every access and the fill on every miss - inside the noise, and it would need every
+/// `&mut Account` this module hands out audited for storage inserts, because `EvmStorage`
+/// growing is not observable from here the way `EvmState` growing is.
 #[derive(Debug, Default)]
 pub struct AccountCache {
+    /// The account resolved most recently.
+    a: CachedAccount,
+    /// The one resolved before it.
+    b: CachedAccount,
+}
+
+/// One way of the [`AccountCache`]: an account, and the address it is stored under.
+///
+/// Carries the same `# Safety` contract as [`AccountCache`]: a non-zero `ptr` must point at
+/// the `Account` stored under `(w0, w1, w2)` in [`JournalInner::state`].
+#[derive(Debug, Default, Clone, Copy)]
+struct CachedAccount {
     w0: u64,
     w1: u64,
     w2: u32,
     ptr: usize,
 }
 
+impl CachedAccount {
+    /// True when this way holds an account and it is the one stored under these words.
+    #[inline(always)]
+    fn matches(&self, w0: u64, w1: u64, w2: u32) -> bool {
+        self.ptr != 0 && self.w0 == w0 && self.w1 == w1 && self.w2 == w2
+    }
+}
+
 impl AccountCache {
     /// Empties the cache.
+    ///
+    /// Both ways, always: they point into the same table, so anything that invalidates one
+    /// invalidates the other.
     #[inline(always)]
     fn clear(&mut self) {
-        self.ptr = 0;
+        self.a.ptr = 0;
+        self.b.ptr = 0;
+    }
+
+    /// The account stored under `words`, if either way holds it.
+    ///
+    /// A hit in the second way is promoted, which is what makes the cache survive a call:
+    /// the frame that is entered evicts its caller into `b`, and the caller's first storage
+    /// access after the frame returns finds it there and moves it back to `a`, so a sibling
+    /// call after that does not evict it again.
+    #[inline(always)]
+    fn get(&mut self, (w0, w1, w2): (u64, u64, u32)) -> Option<*mut Account> {
+        if self.a.matches(w0, w1, w2) {
+            return Some(self.a.ptr as *mut Account);
+        }
+        if self.b.matches(w0, w1, w2) {
+            // A swap, not a write of the words already in registers: the latter reads one
+            // field fewer but measured +95,974 on mainnet block 24006677, register allocation
+            // in the caller being worth more here than the three loads.
+            mem::swap(&mut self.a, &mut self.b);
+            return Some(self.a.ptr as *mut Account);
+        }
+        None
+    }
+
+    /// Records `account` as the most recently resolved, evicting the older way.
+    ///
+    /// # Safety
+    ///
+    /// `account` must point at the `Account` stored under `words` in
+    /// [`JournalInner::state`], and the caller must be on a path that empties the cache
+    /// before that table can restructure; see the type's safety note.
+    #[inline(always)]
+    fn put(&mut self, (w0, w1, w2): (u64, u64, u32), account: *mut Account) {
+        self.b = self.a;
+        self.a = CachedAccount {
+            w0,
+            w1,
+            w2,
+            ptr: account as usize,
+        };
+    }
+
+    /// The 20 bytes of an already 8-aligned `address` as three words.
+    ///
+    /// [`AlignedAddress`] is `align(8)` by construction, so unlike [`Self::address_words`]
+    /// this needs no runtime check and has no fallback arm.
+    #[inline(always)]
+    fn aligned_words(address: &AlignedAddress) -> (u64, u64, u32) {
+        // SAFETY: `AlignedAddress` is `#[repr(C, align(8))]` around 20 readable bytes, so the
+        // reads at 0, 8 and 16 are in bounds and naturally aligned.
+        unsafe {
+            let p = (address as *const AlignedAddress).cast::<u8>();
+            (
+                p.cast::<u64>().read(),
+                p.add(8).cast::<u64>().read(),
+                p.add(16).cast::<u32>().read(),
+            )
+        }
     }
 
     /// The 20 bytes of `address` as three words, or `None` if they cannot be read that way.
@@ -485,10 +594,26 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // A raw pointer for the same reason as in `sload_slot`: the borrow would have to
         // cover the `from` lookup and the journal pushes below. Nothing inserts into
         // `self.state` here, so the bucket cannot move.
-        let to_account: *mut Account = self
-            .state
-            .get_mut(primitives::FastAddressAt::<1>::new(&to.0))
-            .unwrap();
+        //
+        // Consults and fills the [`AccountCache`] as well: `to` is the account the frame this
+        // transfer opens is about to run in, so caching it here is what lets that frame's
+        // first `SLOAD` skip its probe too. `from` does not, both because it is only reached
+        // on the 78-in-16,391 path that actually moves value and because caching it would
+        // evict `to` again.
+        let to_words = AccountCache::aligned_words(&to);
+        let to_account: *mut Account = match self.account_cache.get(to_words) {
+            Some(cached) => cached,
+            None => {
+                let found: *mut Account = self
+                    .state
+                    .get_mut(primitives::FastAddressAt::<1>::new(&to.0))
+                    .unwrap();
+                // SAFETY: `found` is the account stored under `to_words` in `self.state`, and
+                // nothing here inserts into it.
+                self.account_cache.put(to_words, found);
+                found
+            }
+        };
 
         if from.same(&to) {
             // SAFETY: just derived from a live `&mut Account`; nothing has touched
@@ -510,7 +635,37 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             return None;
         }
 
+        // SAFETY: as above -- resolved out of self.state just now, and nothing has inserted
+        // into it since.
+        unsafe { self.transfer_nonzero(from, to, balance, to_account) }
+    }
+
+    /// The half of [`Self::transfer_loaded`] that actually moves value, which on mainnet block
+    /// 24006677 is 78 calls out of 16,391 - every other one is a `CALL` with no value, and
+    /// stops at the `touch_account` above.
+    ///
+    /// Out of line so the common path carries neither the second account lookup nor its
+    /// register pressure: with both halves in one body the function saved thirteen
+    /// callee-saved registers and spent 36 of its 60 retired instructions per call on its own
+    /// prologue and epilogue.
+    ///
+    /// # Safety
+    ///
+    /// `to_account` must point at the account stored under `to` in [`Self::state`], with no
+    /// insert into that map since it was resolved.
+    #[inline(never)]
+    #[cold]
+    unsafe fn transfer_nonzero(
+        &mut self,
+        from: AlignedAddress,
+        to: AlignedAddress,
+        balance: U256,
+        to_account: *mut Account,
+    ) -> Option<TransferError> {
         // sub balance from
+        //
+        // Tag 2, and this is its only call site; see `FastAddressAt`. Not cached: `to` is
+        // what the frame this transfer opens will run in, and caching `from` would evict it.
         let from_account = self
             .state
             .get_mut(primitives::FastAddressAt::<2>::new(&from.0))
@@ -523,7 +678,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         *from_balance = from_balance_decr;
 
         // add balance to
-        // SAFETY: as above - the `from` lookup above is a lookup, so no bucket moved.
+        // SAFETY: per the contract - the `from` lookup above is a lookup, so no bucket moved.
         let to_account = unsafe { &mut *to_account };
         Self::touch_account(&mut self.journal, to.0, to_account);
         let to_balance = &mut to_account.info.balance;
@@ -857,7 +1012,19 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // The by-value `Address` argument sits in a slot LLVM treats as byte-aligned, and
         // this function reads it four times over: to hash it, to journal it, and to build
         // the returned `JournaledAccount`. Re-home it once; see `AlignedAddress`.
-        let address = AlignedAddress::new(&address);
+        //
+        // Through the words rather than through `AlignedAddress::new`, because the account
+        // cache wants the same three words and reading them once serves both. `new` reads the
+        // source at an alignment it cannot know and LLVM lowers even its aligned arm as 32-bit
+        // halves that it then reassembles, which measured 25 retired instructions per call
+        // against six for three loads and three stores.
+        // The misaligned arm is out of line so that LLVM does not merge the two: with both
+        // here it read the last four bytes of the address one at a time on *both* paths,
+        // because one of them has to. 32,982 of 32,983 calls take the aligned arm.
+        let (address, words) = match AccountCache::address_words(&address) {
+            Some((w0, w1, w2)) => (AlignedAddress::from_words(w0, w1, w2), (w0, w1, w2)),
+            None => rehome_misaligned_address(&address),
+        };
         // `entry` takes the key by value and compares it with `K: Eq`, so `Equivalent` cannot
         // redirect the bucket comparison and it stays the 20-byte `memcmp` libcall
         // `Address: PartialEq` lowers to - 32,786 of them on mainnet block 24006677, at ~39
@@ -873,10 +1040,29 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // have to stay live across the vacant arm, which needs `self.state` again, and NLL
         // cannot see that the two arms are exclusive. Exactly one reference is created from
         // it and nothing touches `self.state` in between.
-        let occupied: Option<*mut Account> = self
-            .state
-            .get_mut(primitives::FastAddressAt::<3>::new(&address.0))
-            .map(|account| account as *mut Account);
+        //
+        // Consults and fills the same [`AccountCache`] `sload_slot` uses. The two run back to
+        // back all the time -- a `CALL` loads the callee here and then every `SLOAD` of the
+        // frame it opens asks for the same account -- so a shared cache turns the first of
+        // those probes into a tag compare as well. Filling only from the occupied arm: the
+        // vacant arm below inserts, which is exactly what a cached bucket pointer does not
+        // survive, and it clears.
+        let occupied: Option<*mut Account> = match self.account_cache.get(words) {
+            Some(cached) => Some(cached),
+            None => {
+                let found = self
+                    .state
+                    .get_mut(primitives::FastAddressAt::<3>::new(&address.0))
+                    .map(|account| account as *mut Account);
+                if let Some(account) = found {
+                    // SAFETY: `account` is the account stored under `words` in `self.state`,
+                    // and this module empties the cache everywhere that table can
+                    // restructure -- including the vacant arm just below.
+                    self.account_cache.put(words, account);
+                }
+                found
+            }
+        };
 
         let load = match occupied {
             Some(account) => {
@@ -964,7 +1150,12 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     }
 
     /// Resolves a storage slot to a mutable reference, warming it and journaling the warm
-    /// load if it was cold.
+    /// load if it was cold: everything `sload_slot_warm` declined to do.
+    ///
+    /// Redoes both lookups rather than being handed their results, which costs a probe on
+    /// a path taken 752 times in 76,821 and is what keeps all six of these arguments out of
+    /// the warm path's live set. The account lookup lands in the cache the warm path just
+    /// filled, so in practice it is a tag compare.
     ///
     /// Takes the journal's fields apart rather than `&mut self` so that the caller keeps
     /// access to [`Self::journal`] while holding the returned slot: that is what lets
@@ -974,9 +1165,10 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     /// # Panics
     ///
     /// Panics if the account is not present in the state.
-    #[inline]
+    #[inline(never)]
+    #[cold]
     #[allow(clippy::too_many_arguments)]
-    fn sload_slot<'a, DB: Database>(
+    fn sload_slot_cold<'a, DB: Database>(
         state: &'a mut EvmState,
         account_cache: &mut AccountCache,
         warm_addresses: &WarmAddresses,
@@ -998,54 +1190,43 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // it is for every SLOAD and SSTORE of a call frame after the first; see
         // [`AccountCache`] for why a bucket pointer may be kept and where it is dropped.
         //
-        // Keyed by `FastAddress` so the bucket comparison is word-wise; see there. This is
-        // the only site that uses it - a second caller of the same instantiation pushes
+        // Keyed by `FastAddressAt` so the bucket comparison is word-wise; see there. Tag 4,
+        // and this is its only call site: a second caller of one instantiation pushes
         // `RawTable::find` past the inliner and it outlines, which costs more than it saves.
         let words = AccountCache::address_words(&address);
-        let cached = match words {
-            Some((w0, w1, w2)) => {
-                account_cache.ptr != 0
-                    && account_cache.w0 == w0
-                    && account_cache.w1 == w1
-                    && account_cache.w2 == w2
-            }
-            None => false,
-        };
-        let account: *mut Account = if cached {
-            account_cache.ptr as *mut Account
-        } else {
-            let found: *mut Account = state
-                .get_mut(primitives::FastAddress::new(&address))
-                .unwrap();
-            match words {
-                Some((w0, w1, w2)) => {
-                    *account_cache = AccountCache {
-                        w0,
-                        w1,
-                        w2,
-                        ptr: found as usize,
-                    }
+        let account: *mut Account = match words.and_then(|w| account_cache.get(w)) {
+            Some(cached) => cached,
+            None => {
+                let found: *mut Account = state
+                    .get_mut(primitives::FastAddressAt::<4>::new(&address))
+                    .unwrap();
+                match words {
+                    // SAFETY: `found` is the account stored under `w` in `state`, and this
+                    // module empties the cache everywhere `state` can restructure.
+                    Some(w) => account_cache.put(w, found),
+                    // Not cacheable: the address cannot be compared word-wise. Clears rather
+                    // than keeps the previous addresses' entries -- a pessimisation, not a
+                    // required clear; see the note on `AccountCache`.
+                    None => account_cache.clear(),
                 }
-                // Not cacheable: the address cannot be compared word-wise. Clears rather
-                // than keeps the previous address's entry -- a pessimisation, not a
-                // required clear; see the note on `AccountCache`.
-                None => account_cache.clear(),
+                found
             }
-            found
         };
 
-        // Hit path: the slot is already in the account's map. 76,069 of 76,821 calls on
-        // mainnet block 24006677 land here, so everything the miss path needs -- the database
-        // read, the insert, the access-list probe -- lives in `sload_slot_miss` instead.
-        // `HashMap::entry` would drag the insert-and-grow machinery in here as well, and it is
-        // that, not the work itself, that gave this function a 464-byte frame and twelve
-        // callee-saved registers to spill.
+        // The slot is in the account's map but cold, which is one of the two reasons the warm
+        // path declines. `HashMap::entry` would drag the insert-and-grow machinery in here as
+        // well, and it is that, not the work itself, that gave this function a 464-byte frame
+        // and twelve callee-saved registers to spill; the insert stays in `sload_slot_miss`.
         //
         // SAFETY: `account` was just derived from a live `&mut Account`, and no other access
         // to `state` happens before it is used.
-        // Keyed by `FastU256` so the bucket comparison is limb-wise rather than a 32-byte
-        // `memcmp` libcall; see there.
-        if let Some(slot) = unsafe { (*account).storage.get_mut(primitives::FastU256::new(&key)) } {
+        // Keyed by `FastU256At` so the bucket comparison is limb-wise rather than a 32-byte
+        // `memcmp` libcall; see there. Tag 1, and this is its only call site.
+        if let Some(slot) = unsafe {
+            (*account)
+                .storage
+                .get_mut(primitives::FastU256At::<1>::new(&key))
+        } {
             let is_cold = slot.is_cold_transaction_id(transaction_id);
             if is_cold {
                 if skip_cold_load {
@@ -1075,7 +1256,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         )
     }
 
-    /// The half of [`Self::sload_slot`] that runs when the slot is not in the account's map
+    /// The half of [`Self::sload_slot_cold`] that runs when the slot is not in the account's map
     /// yet, which on mainnet block 24006677 is 752 calls out of 76,821.
     ///
     /// Out of line so the hit path carries neither its stack frame nor its register pressure.
@@ -1131,6 +1312,49 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         key: StorageKey,
         skip_cold_load: bool,
     ) -> Result<StateLoad<StorageValue>, JournalLoadError<DB::Error>> {
+        let slot = sload_slot_warm(
+            &mut self.state,
+            &mut self.account_cache,
+            self.transaction_id,
+            &address,
+            &key,
+        );
+        if slot.is_null() {
+            return self.sload_cold(db, address, key, skip_cold_load);
+        }
+        // `StateLoad::new(slot.present_value, ..)` is a 32-byte move that LLVM lowers to a
+        // `memcpy` libcall on this target once the value has been through `Result`'s niche
+        // layout; at 62 K SLOADs per mainnet block it was the single most frequent `memcpy`
+        // call site in the guest. Storing four limbs states the alignment at the store.
+        // SAFETY: `p` points at a fresh, 8-aligned `StateLoad<StorageValue>`, and both of its
+        // fields are written exactly once below, so `assume_init` sees an initialized value.
+        // `slot` is non-null, so it points at a slot inside `self.state`, which nothing has
+        // touched since.
+        Ok(unsafe {
+            let mut out = mem::MaybeUninit::<StateLoad<StorageValue>>::uninit();
+            let p = out.as_mut_ptr();
+            primitives::copy_u256(core::ptr::addr_of_mut!((*p).data), &(*slot).present_value);
+            core::ptr::addr_of_mut!((*p).is_cold).write(false);
+            out.assume_init()
+        })
+    }
+
+    /// [`Self::sload`] for a slot `sload_slot_warm` declined.
+    ///
+    /// Out of line, `cold`, and taking `&mut self` rather than the journal's fields: the
+    /// point of the split is that the warm path does not keep `db`, `warm_addresses`,
+    /// `journal` or `skip_cold_load` live, and marshalling nine arguments at the call site
+    /// would put them back. It also keeps `sload` small enough to stay inlined into the
+    /// interpreter; leaving that to the inliner outlined `sstore` and cost +2,532,111.
+    #[inline(never)]
+    #[cold]
+    fn sload_cold<DB: Database>(
+        &mut self,
+        db: &mut DB,
+        address: Address,
+        key: StorageKey,
+        skip_cold_load: bool,
+    ) -> Result<StateLoad<StorageValue>, JournalLoadError<DB::Error>> {
         let Self {
             state,
             account_cache,
@@ -1139,7 +1363,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             transaction_id,
             ..
         } = self;
-        let load = Self::sload_slot(
+        let load = Self::sload_slot_cold(
             state,
             account_cache,
             warm_addresses,
@@ -1150,12 +1374,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             key,
             skip_cold_load,
         )?;
-        // `StateLoad::new(slot.present_value, ..)` is a 32-byte move that LLVM lowers to a
-        // `memcpy` libcall on this target once the value has been through `Result`'s niche
-        // layout; at 62 K SLOADs per mainnet block it was the single most frequent `memcpy`
-        // call site in the guest. Storing four limbs states the alignment at the store.
-        // SAFETY: `p` points at a fresh, 8-aligned `StateLoad<StorageValue>`, and both of its
-        // fields are written exactly once below, so `assume_init` sees an initialized value.
+        // SAFETY: as in `sload`.
         Ok(unsafe {
             let mut out = mem::MaybeUninit::<StateLoad<StorageValue>>::uninit();
             let p = out.as_mut_ptr();
@@ -1179,6 +1398,63 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         new: StorageValue,
         skip_cold_load: bool,
     ) -> Result<StateLoad<SStoreResult>, JournalLoadError<DB::Error>> {
+        // assume that acc exists and load the slot. The slot reference is kept alive across
+        // the journal push below, so neither the account nor the slot is looked up twice.
+        let slot = sload_slot_warm(
+            &mut self.state,
+            &mut self.account_cache,
+            self.transaction_id,
+            &address,
+            &key,
+        );
+        if slot.is_null() {
+            return self.sstore_cold(db, address, key, new, skip_cold_load);
+        }
+        // SAFETY: non-null, so it points at a slot inside `self.state`. `self.journal` is a
+        // different field, so pushing to it below cannot disturb it.
+        let slot = unsafe { &mut *slot };
+        let present = slot.present_value;
+
+        // new value is same as present, we don't need to do anything.
+        // `!=` on `U256` is a memcmp libcall on the guest target; see `primitives::u256_eq`.
+        if !primitives::u256_eq(&present, &new) {
+            // The entry's `Address` field sits at an 8-aligned offset -- see the note on
+            // `JournalEntry`'s discriminant -- but `address` arrives by value in a slot LLVM
+            // has to treat as byte-aligned, so the field copy stays a 20-byte `memcpy`
+            // libcall for want of a source it can prove. Re-homing it makes both ends
+            // provably 8-aligned and the copy three word accesses; 11,154 storage writes are
+            // journalled on mainnet block 24006677.
+            // Through the words rather than through `AlignedAddress::new`, for the reason
+            // `load_account_mut_optional_code` gives: `new` reads the source at an alignment
+            // it cannot know, and LLVM lowers even its aligned arm as 32-bit halves that it
+            // then reassembles.
+            let address = match AccountCache::address_words(&address) {
+                Some((w0, w1, w2)) => primitives::AlignedAddress::from_words(w0, w1, w2),
+                None => rehome_misaligned_address(&address).0,
+            };
+            self.journal
+                .push(ENTRY::storage_changed(address.0, key, present));
+            // insert value into present state.
+            slot.present_value = new;
+        }
+
+        Ok(StateLoad::new(
+            sstore_result(slot.original_value(), present, new),
+            false,
+        ))
+    }
+
+    /// [`Self::sstore`] for a slot `sload_slot_warm` declined; see [`Self::sload_cold`].
+    #[inline(never)]
+    #[cold]
+    fn sstore_cold<DB: Database>(
+        &mut self,
+        db: &mut DB,
+        address: Address,
+        key: StorageKey,
+        new: StorageValue,
+        skip_cold_load: bool,
+    ) -> Result<StateLoad<SStoreResult>, JournalLoadError<DB::Error>> {
         let Self {
             state,
             account_cache,
@@ -1187,9 +1463,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             transaction_id,
             ..
         } = self;
-        // assume that acc exists and load the slot. The slot reference is kept alive across
-        // the journal push below, so neither the account nor the slot is looked up twice.
-        let load = Self::sload_slot(
+        let load = Self::sload_slot_cold(
             state,
             account_cache,
             warm_addresses,
@@ -1204,11 +1478,8 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         let slot = load.data;
         let present = slot.present_value;
 
-        // new value is same as present, we don't need to do anything.
-        // `!=` on `U256` is a memcmp libcall on the guest target; see `primitives::u256_eq`.
         if !primitives::u256_eq(&present, &new) {
             journal.push(ENTRY::storage_changed(address, key, present));
-            // insert value into present state.
             slot.present_value = new;
         }
 
@@ -1270,6 +1541,130 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     pub fn log(&mut self, log: Log) {
         self.logs.push(log);
     }
+}
+
+/// Resolves an account the [`AccountCache`] does not hold, and records it.
+///
+/// Null when it is not in the map at all. `sload_slot_warm` hands that straight back, and its
+/// callers answer it by taking the cold path, which is what keeps the case out of the warm
+/// body.
+///
+/// Out of line and `cold` for the register pressure: the address hash, hashbrown's control
+/// word and the bucket compare want a different set of values live from the storage probe
+/// that follows, and with both in one body the caller saves the union of them on every call.
+///
+/// Keyed by `FastAddress` - tag 0 - so the bucket comparison is word-wise; see there. This is
+/// the only site that uses tag 0: a second caller of one instantiation pushes
+/// `RawTable::find` past the inliner and it outlines, which costs more than it saves.
+#[inline(never)]
+#[cold]
+fn resolve_account(
+    state: &mut EvmState,
+    account_cache: &mut AccountCache,
+    words: Option<(u64, u64, u32)>,
+    address: &Address,
+) -> *mut Account {
+    match state.get_mut(primitives::FastAddress::new(address)) {
+        Some(found) => {
+            let found: *mut Account = found;
+            match words {
+                // SAFETY: `found` is the account stored under `w` in `state`, and this module
+                // empties the cache everywhere `state` can restructure.
+                Some(w) => account_cache.put(w, found),
+                // Not cacheable: the address cannot be compared word-wise. Clears rather than
+                // keeps the previous addresses' entries -- a pessimisation, not a required
+                // clear; see the note on `AccountCache`.
+                None => account_cache.clear(),
+            }
+            found
+        }
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// Re-homes an [`Address`] that does not start 8-aligned, and reads its three words.
+///
+/// Out of line, and `cold`, so that [`JournalInner::load_account_mut_optional_code`]'s
+/// aligned arm is three loads and three stores. Inline, LLVM merges the tails of the two arms
+/// and the merged tail reads the last four bytes of the address one at a time, which is what
+/// the misaligned arm needs and the aligned one does not.
+#[inline(never)]
+#[cold]
+fn rehome_misaligned_address(address: &Address) -> (AlignedAddress, (u64, u64, u32)) {
+    let address = AlignedAddress::new(address);
+    let words = AccountCache::aligned_words(&address);
+    (address, words)
+}
+
+/// The warm path of a storage access: the account is in the state map, the slot is in the
+/// account's map, and the slot is already warm.
+///
+/// Null when any of the three does not hold. The caller then takes
+/// [`JournalInner::sload_cold`] or [`JournalInner::sstore_cold`], which redo both lookups and
+/// handle the case; on mainnet block 24006677 that is 752 of 76,821 accesses.
+///
+/// The split is for the stack frame, not for the work. With one body, the four arguments only
+/// the slow half needs -- `warm_addresses`, `journal`, `db`, `skip_cold_load` -- plus the
+/// `unwrap` and the journal push, which are calls and so need `ra` saved, gave the function
+/// thirteen callee-saved registers and a 272-byte frame: 54 of the 151 retired instructions
+/// it spent per call went on its own prologue and epilogue, more than the storage probe it
+/// exists to do. This half takes five arguments and hands back a pointer rather than a
+/// `Result` in an `sret` slot.
+///
+/// The hot path makes no call, which is the property that saving rests on -- but the function
+/// is not call-free: a cache miss calls [`resolve_account`], `inline(never)` precisely so its
+/// register demand stays out of this frame. On mainnet block 24006677 that is 1,873 of 76,821
+/// accesses.
+///
+/// Not a method: nothing here needs `ENTRY` or `DB`, so as a free function it is one
+/// instantiation for `sload` and `sstore` together rather than one per journal entry type.
+///
+/// # Safety
+///
+/// A non-null return points at a slot inside `state` and is valid for as long as the caller's
+/// borrow of `state`; nothing here keeps a reference past the return.
+#[inline(never)]
+fn sload_slot_warm(
+    state: &mut EvmState,
+    account_cache: &mut AccountCache,
+    transaction_id: usize,
+    address: &Address,
+    key: &StorageKey,
+) -> *mut EvmStorageSlot {
+    // A raw pointer rather than a `&mut`: the slot returned below points into this account,
+    // and NLL cannot see that the two arms are exclusive. Exactly one reference is ever
+    // created from it, and nothing touches `state` in between.
+    //
+    // The lookup is skipped whenever the account is one of the two the cache holds, which on
+    // mainnet block 24006677 is 74,948 of 76,821 calls; see [`AccountCache`] for why a bucket
+    // pointer may be kept and where it is dropped.
+    //
+    // The map itself is keyed by `FastAddress`, but that lookup lives in `resolve_account` --
+    // this probes the two-way cache by raw words and only falls through to it on a miss.
+    let words = AccountCache::address_words(address);
+    let account: *mut Account = match words.and_then(|w| account_cache.get(w)) {
+        Some(cached) => cached,
+        // Out of line: the probe is a hash, an unaligned control-word read and a bucket
+        // compare, and the values it wants alive are not the ones the storage probe below
+        // wants. 1,873 of 76,821 accesses take it.
+        None => resolve_account(state, account_cache, words, address),
+    };
+    if account.is_null() {
+        return core::ptr::null_mut();
+    }
+
+    // SAFETY: `account` was just derived from a live `&mut Account`, and no other access to
+    // `state` happens before it is used.
+    // Keyed by `FastU256` - tag 0 - so the bucket comparison is limb-wise rather than a
+    // 32-byte `memcmp` libcall; see there. The only site that uses tag 0.
+    let Some(slot) = (unsafe { (*account).storage.get_mut(primitives::FastU256::new(key)) }) else {
+        return core::ptr::null_mut();
+    };
+    if slot.is_cold_transaction_id(transaction_id) {
+        // Warming it journals the load, and journalling needs `journal`; the cold path has it.
+        return core::ptr::null_mut();
+    }
+    slot
 }
 
 /// Builds an [`SStoreResult`] limb by limb.

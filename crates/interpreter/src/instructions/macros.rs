@@ -483,6 +483,29 @@ macro_rules! as_usize_or_fail {
     };
 }
 
+/// [`crate::as_usize_or_fail_ret!`] for a body that has *not* published the threaded gas counter.
+///
+/// The plain form halts on the failure path, and a halt stashes `Interpreter::gas`, so it
+/// can only be used where the field is already the truth. A body that keeps the counter in
+/// its register until it knows it has gas to charge -- `MLOAD`/`MSTORE`, whose hot path
+/// charges nothing -- publishes here instead, on the cold edge only. See `sync_gas_at!`.
+#[macro_export]
+#[collapse_debuginfo(yes)]
+macro_rules! as_usize_or_fail_ret_at {
+    ($interpreter:expr, $v:expr, $rem:expr, $ret:expr) => {
+        match $v.as_limbs() {
+            x => {
+                if (x[0] > usize::MAX as u64) | (x[1] != 0) | (x[2] != 0) | (x[3] != 0) {
+                    $crate::sync_gas_at!($interpreter, $rem);
+                    $interpreter.halt($crate::InstructionResult::InvalidOperandOOG);
+                    return $ret;
+                }
+                x[0] as usize
+            }
+        }
+    };
+}
+
 /// Converts a `U256` value to a `usize` and returns `ret`,
 /// failing the instruction if the value is too large.
 #[macro_export]

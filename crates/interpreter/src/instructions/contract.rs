@@ -2,7 +2,7 @@ mod call_helpers;
 
 pub use call_helpers::{
     get_memory_input_and_out_ranges, load_acc_and_calc_gas, load_account_delegated,
-    load_account_delegated_handle_error, new_account_cost, resize_memory,
+    load_account_delegated_handle_error, new_account_cost, prepare_call_inputs, resize_memory,
 };
 
 use crate::{
@@ -122,39 +122,35 @@ pub fn call<WIRE: InterpreterTypes, H: Host + ?Sized>(
             .halt(InstructionResult::CallNotAllowedInsideStatic);
         return;
     }
-    let Some((input, return_memory_offset)) = get_memory_input_and_out_ranges(context.interpreter)
-    else {
-        return;
-    };
-    let mut known_bytecode = None;
-    let Some(gas_limit) = load_acc_and_calc_gas(
+    let mut inputs = Box::new(CallInputs {
+        input: CallInput::SharedBuffer(0..0),
+        gas_limit: 0,
+        target_address: to,
+        caller: context.interpreter.input.target_address(),
+        bytecode_address: to,
+        known_bytecode: None,
+        value: CallValue::Transfer(value),
+        scheme: CallScheme::Call,
+        is_static: context.interpreter.runtime_flag.is_static(),
+        return_memory_offset: 0..0,
+    });
+    if prepare_call_inputs(
         &mut context,
         to,
         has_transfer,
         true,
         local_gas_limit,
-        &mut known_bytecode,
-    ) else {
+        &mut inputs,
+    )
+    .is_none()
+    {
         return;
-    };
+    }
 
     // Call host to interact with target contract
     context
         .interpreter
-        .set_action(InterpreterAction::NewFrame(FrameInput::Call(Box::new(
-            CallInputs {
-                input: CallInput::SharedBuffer(input),
-                gas_limit,
-                target_address: to,
-                caller: context.interpreter.input.target_address(),
-                bytecode_address: to,
-                known_bytecode,
-                value: CallValue::Transfer(value),
-                scheme: CallScheme::Call,
-                is_static: context.interpreter.runtime_flag.is_static(),
-                return_memory_offset,
-            },
-        ))));
+        .set_action(InterpreterAction::NewFrame(FrameInput::Call(inputs)));
 }
 
 /// Implements the CALLCODE instruction.
@@ -169,40 +165,35 @@ pub fn call_code<WIRE: InterpreterTypes, H: Host + ?Sized>(
     let local_gas_limit = u64::try_from(local_gas_limit).unwrap_or(u64::MAX);
     let has_transfer = !primitives::u256_is_zero(&value);
 
-    let Some((input, return_memory_offset)) = get_memory_input_and_out_ranges(context.interpreter)
-    else {
-        return;
-    };
-
-    let mut known_bytecode = None;
-    let Some(gas_limit) = load_acc_and_calc_gas(
+    let mut inputs = Box::new(CallInputs {
+        input: CallInput::SharedBuffer(0..0),
+        gas_limit: 0,
+        target_address: context.interpreter.input.target_address(),
+        caller: context.interpreter.input.target_address(),
+        bytecode_address: to,
+        known_bytecode: None,
+        value: CallValue::Transfer(value),
+        scheme: CallScheme::CallCode,
+        is_static: context.interpreter.runtime_flag.is_static(),
+        return_memory_offset: 0..0,
+    });
+    if prepare_call_inputs(
         &mut context,
         to,
         has_transfer,
         false,
         local_gas_limit,
-        &mut known_bytecode,
-    ) else {
+        &mut inputs,
+    )
+    .is_none()
+    {
         return;
-    };
+    }
 
     // Call host to interact with target contract
     context
         .interpreter
-        .set_action(InterpreterAction::NewFrame(FrameInput::Call(Box::new(
-            CallInputs {
-                input: CallInput::SharedBuffer(input),
-                gas_limit,
-                target_address: context.interpreter.input.target_address(),
-                caller: context.interpreter.input.target_address(),
-                bytecode_address: to,
-                known_bytecode,
-                value: CallValue::Transfer(value),
-                scheme: CallScheme::CallCode,
-                is_static: context.interpreter.runtime_flag.is_static(),
-                return_memory_offset,
-            },
-        ))));
+        .set_action(InterpreterAction::NewFrame(FrameInput::Call(inputs)));
 }
 
 /// Implements the DELEGATECALL instruction.
@@ -217,40 +208,26 @@ pub fn delegate_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
     // Max gas limit is not possible in real ethereum situation.
     let local_gas_limit = u64::try_from(local_gas_limit).unwrap_or(u64::MAX);
 
-    let Some((input, return_memory_offset)) = get_memory_input_and_out_ranges(context.interpreter)
-    else {
+    let mut inputs = Box::new(CallInputs {
+        input: CallInput::SharedBuffer(0..0),
+        gas_limit: 0,
+        target_address: context.interpreter.input.target_address(),
+        caller: context.interpreter.input.caller_address(),
+        bytecode_address: to,
+        known_bytecode: None,
+        value: CallValue::Apparent(context.interpreter.input.call_value()),
+        scheme: CallScheme::DelegateCall,
+        is_static: context.interpreter.runtime_flag.is_static(),
+        return_memory_offset: 0..0,
+    });
+    if prepare_call_inputs(&mut context, to, false, false, local_gas_limit, &mut inputs).is_none() {
         return;
-    };
-
-    let mut known_bytecode = None;
-    let Some(gas_limit) = load_acc_and_calc_gas(
-        &mut context,
-        to,
-        false,
-        false,
-        local_gas_limit,
-        &mut known_bytecode,
-    ) else {
-        return;
-    };
+    }
 
     // Call host to interact with target contract
     context
         .interpreter
-        .set_action(InterpreterAction::NewFrame(FrameInput::Call(Box::new(
-            CallInputs {
-                input: CallInput::SharedBuffer(input),
-                gas_limit,
-                target_address: context.interpreter.input.target_address(),
-                caller: context.interpreter.input.caller_address(),
-                bytecode_address: to,
-                known_bytecode,
-                value: CallValue::Apparent(context.interpreter.input.call_value()),
-                scheme: CallScheme::DelegateCall,
-                is_static: context.interpreter.runtime_flag.is_static(),
-                return_memory_offset,
-            },
-        ))));
+        .set_action(InterpreterAction::NewFrame(FrameInput::Call(inputs)));
 }
 
 /// Implements the STATICCALL instruction.
@@ -265,38 +242,24 @@ pub fn static_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
     // Max gas limit is not possible in real ethereum situation.
     let local_gas_limit = u64::try_from(local_gas_limit).unwrap_or(u64::MAX);
 
-    let Some((input, return_memory_offset)) = get_memory_input_and_out_ranges(context.interpreter)
-    else {
+    let mut inputs = Box::new(CallInputs {
+        input: CallInput::SharedBuffer(0..0),
+        gas_limit: 0,
+        target_address: to,
+        caller: context.interpreter.input.target_address(),
+        bytecode_address: to,
+        known_bytecode: None,
+        value: CallValue::Transfer(U256::ZERO),
+        scheme: CallScheme::StaticCall,
+        is_static: true,
+        return_memory_offset: 0..0,
+    });
+    if prepare_call_inputs(&mut context, to, false, false, local_gas_limit, &mut inputs).is_none() {
         return;
-    };
-
-    let mut known_bytecode = None;
-    let Some(gas_limit) = load_acc_and_calc_gas(
-        &mut context,
-        to,
-        false,
-        false,
-        local_gas_limit,
-        &mut known_bytecode,
-    ) else {
-        return;
-    };
+    }
 
     // Call host to interact with target contract
     context
         .interpreter
-        .set_action(InterpreterAction::NewFrame(FrameInput::Call(Box::new(
-            CallInputs {
-                input: CallInput::SharedBuffer(input),
-                gas_limit,
-                target_address: to,
-                caller: context.interpreter.input.target_address(),
-                bytecode_address: to,
-                known_bytecode,
-                value: CallValue::Transfer(U256::ZERO),
-                scheme: CallScheme::StaticCall,
-                is_static: true,
-                return_memory_offset,
-            },
-        ))));
+        .set_action(InterpreterAction::NewFrame(FrameInput::Call(inputs)));
 }

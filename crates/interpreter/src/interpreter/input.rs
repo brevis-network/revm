@@ -50,6 +50,16 @@ impl InputsTr for InputsImpl {
         self.caller_address
     }
 
+    #[inline(always)]
+    fn target_address_ptr(&self) -> *const u8 {
+        self.target_address.0.as_ptr()
+    }
+
+    #[inline(always)]
+    fn caller_address_ptr(&self) -> *const u8 {
+        self.caller_address.0.as_ptr()
+    }
+
     fn bytecode_address(&self) -> Option<&Address> {
         self.bytecode_address.get()
     }

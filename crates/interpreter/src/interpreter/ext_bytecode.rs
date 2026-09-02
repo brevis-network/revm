@@ -140,7 +140,7 @@ impl ExtBytecode {
         // fields is written again before this returns, with nothing fallible in between, so
         // it holds exactly one live value at every point an observer could look.
         unsafe {
-            core::ptr::drop_in_place(dst);
+            drop_stale(dst);
             Self::write_with_hash(dst, base, hash);
         }
     }
@@ -150,7 +150,7 @@ impl ExtBytecode {
     pub fn replace_with_optional_hash(dst: &mut Self, base: Bytecode, hash: Option<B256>) {
         // SAFETY: as in `replace_with_hash`.
         unsafe {
-            core::ptr::drop_in_place(dst);
+            drop_stale(dst);
             Self::write_with_optional_hash(dst, base, hash);
         }
     }
@@ -184,6 +184,28 @@ impl ExtBytecode {
     }
 }
 
+/// Drops an [`ExtBytecode`] that is about to be written again field by field.
+///
+/// Equivalent to `drop_in_place`, except that the `action` slot is tested inline instead of
+/// through the out-of-line `drop_in_place::<Option<InterpreterAction>>`. A frame's action is
+/// always `None` by the time the frame is re-initialised - the executor takes it before the
+/// frame can be reused - so that call was 12 retired instructions of nothing, once per frame.
+/// The branch keeps the drop correct if that ever stops holding.
+///
+/// # Safety
+///
+/// As `core::ptr::drop_in_place(dst)`: `dst` must point at a live, aligned `ExtBytecode`, and
+/// every field must be written again before anything observes it.
+#[inline]
+unsafe fn drop_stale(dst: *mut ExtBytecode) {
+    unsafe {
+        core::ptr::drop_in_place(core::ptr::addr_of_mut!((*dst).base));
+        if (*dst).action.is_some() {
+            core::ptr::drop_in_place(core::ptr::addr_of_mut!((*dst).action));
+        }
+    }
+}
+
 impl LoopControl for ExtBytecode {
     #[inline]
     fn is_not_end(&self) -> bool {
@@ -208,7 +230,12 @@ impl LoopControl for ExtBytecode {
             self.action, action,
         );
         self.continue_execution = false;
-        self.action = Some(action);
+        // The action is always `None` here - `continue_execution` is true exactly when the
+        // action slot is empty, which the debug assertions above check. Writing through the
+        // raw pointer skips the drop of the old value, which is an out-of-line
+        // `drop_in_place::<Option<InterpreterAction>>` call on every one of the ~60k actions
+        // a block sets.
+        unsafe { core::ptr::write(&mut self.action, Some(action)) };
     }
 
     #[inline]

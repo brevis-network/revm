@@ -46,6 +46,19 @@ pub trait InputsTr {
     fn bytecode_address(&self) -> Option<&Address>;
     /// Returns caller address of the call.
     fn caller_address(&self) -> Address;
+
+    /// Pointer to the 20 bytes of [`target_address`](Self::target_address), without copying
+    /// them out.
+    ///
+    /// `Address` is `[u8; 20]` with alignment 1, so returning one *by value* means a copy
+    /// into a byte-aligned slot and every reader then pays for the alignment it lost. The
+    /// two instructions that want the bytes in place -- `ADDRESS` and `CALLER`, which
+    /// byte-reverse them straight onto the stack -- take the pointer instead.
+    fn target_address_ptr(&self) -> *const u8;
+
+    /// Pointer to the 20 bytes of [`caller_address`](Self::caller_address). See
+    /// [`target_address_ptr`](Self::target_address_ptr).
+    fn caller_address_ptr(&self) -> *const u8;
     /// Returns input of the call.
     fn input(&self) -> &CallInput;
     /// Returns call value of the call.
@@ -175,6 +188,17 @@ pub trait MemoryTr {
     ///
     /// Panics if range is out of scope of allocated memory.
     fn global_slice(&self, range: Range<usize>) -> Ref<'_, [u8]>;
+
+    /// Data pointer of the whole shared buffer, without taking a borrow guard.
+    ///
+    /// [`global_slice`](Self::global_slice) hands back a `Ref`, and on the guest target that
+    /// guard is three retired instructions to bump the borrow count and three more to drop
+    /// it. `CALLDATALOAD` pays them 46,000 times on mainnet block 24006677 for a pointer
+    /// that dies inside the statement that made it.
+    ///
+    /// The pointer is invalidated by anything that can grow the memory, so read through it
+    /// before the next `resize`.
+    fn global_ptr(&self) -> *const u8;
 
     /// Offset of local context of memory.
     fn local_memory_offset(&self) -> usize;

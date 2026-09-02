@@ -5,7 +5,7 @@ use crate::{
     },
     interpreter::Interpreter,
     interpreter_types::{InterpreterTypes, MemoryTr, RuntimeFlag, StackTr},
-    InstructionContext,
+    CallInput, CallInputs, InstructionContext,
 };
 use context_interface::{host::LoadError, Host};
 use core::{cmp::min, ops::Range};
@@ -50,6 +50,74 @@ pub fn resize_memory(
         usize::MAX //unrealistic value so we are sure it is not used
     };
     Some(offset..offset + len)
+}
+
+/// The whole prologue of CALL/CALLCODE/DELEGATECALL/STATICCALL: pops the memory in/out
+/// ranges, resizes memory, loads the target account and charges the call's gas, writing
+/// every result straight into the already-boxed `CallInputs`.
+///
+/// This used to be two out-of-line calls (`get_memory_input_and_out_ranges` then
+/// `load_acc_and_calc_gas`). On RV64 each call boundary costs a 12 callee-saved-register
+/// save/restore pair plus, for the first one, an `Option<(Range, Range)>` sret round-trip,
+/// and a mainnet block runs ~20k of them.
+#[inline(never)]
+pub fn prepare_call_inputs<H: Host + ?Sized>(
+    context: &mut InstructionContext<'_, H, impl InterpreterTypes>,
+    to: Address,
+    transfers_value: bool,
+    create_empty_account: bool,
+    stack_gas_limit: u64,
+    inputs: &mut CallInputs,
+) -> Option<()> {
+    // --- memory input and output ranges ---
+    popn!(
+        [in_offset, in_len, out_offset, out_len],
+        context.interpreter,
+        None
+    );
+
+    let mut in_range = resize_memory(context.interpreter, in_offset, in_len)?;
+    if !in_range.is_empty() {
+        let offset = context.interpreter.memory.local_memory_offset();
+        in_range = in_range.start.saturating_add(offset)..in_range.end.saturating_add(offset);
+    }
+    inputs.input = CallInput::SharedBuffer(in_range);
+    inputs.return_memory_offset = resize_memory(context.interpreter, out_offset, out_len)?;
+
+    // --- gas ---
+    let spec = context.interpreter.runtime_flag.spec_id();
+    // calculate static gas first. For berlin hardfork it will take warm gas.
+    let static_gas = calc_call_static_gas(spec, transfers_value);
+    gas!(context.interpreter, static_gas, None);
+
+    // load account delegated and deduct dynamic gas.
+    let gas = load_account_delegated_handle_error(
+        context,
+        to,
+        transfers_value,
+        create_empty_account,
+        &mut inputs.known_bytecode,
+    )?;
+    let interpreter = &mut context.interpreter;
+
+    // deduct dynamic gas.
+    gas!(interpreter, gas, None);
+
+    // EIP-150: Gas cost changes for IO-heavy operations
+    let mut gas_limit = if interpreter.runtime_flag.spec_id().is_enabled_in(TANGERINE) {
+        // Take l64 part of gas_limit
+        min(interpreter.gas.remaining_63_of_64_parts(), stack_gas_limit)
+    } else {
+        stack_gas_limit
+    };
+
+    gas!(interpreter, gas_limit, None);
+    // Add call stipend if there is value to be transferred.
+    if transfers_value {
+        gas_limit = gas_limit.saturating_add(gas::CALL_STIPEND);
+    }
+    inputs.gas_limit = gas_limit;
+    Some(())
 }
 
 /// Calculates gas cost and limit for call instructions.
@@ -155,10 +223,11 @@ pub fn load_account_delegated<H: Host + ?Sized>(
     if is_berlin && account.is_cold {
         cost += COLD_ACCOUNT_ACCESS_COST_ADDITIONAL;
     }
-    *known_bytecode = Some((
-        account.code_hash(),
-        account.code.clone().unwrap_or_default(),
-    ));
+    // The clone first, then the hash: evaluated in tuple order the 32-byte hash is live
+    // across `Bytes`' indirect clone call and gets spilled to the stack and reloaded, four
+    // stores and four loads on every call frame.
+    let code = account.code.clone().unwrap_or_default();
+    *known_bytecode = Some((account.code_hash(), code));
     // New account cost, as account is empty there is no delegated account and we can return early.
     if create_empty_account && account.is_empty {
         cost += new_account_cost(is_spurious_dragon, transfers_value);
@@ -182,10 +251,9 @@ pub fn load_account_delegated<H: Host + ?Sized>(
         if delegate_account.is_cold {
             cost += COLD_ACCOUNT_ACCESS_COST_ADDITIONAL;
         }
-        *known_bytecode = Some((
-            delegate_account.code_hash(),
-            delegate_account.code.clone().unwrap_or_default(),
-        ));
+        // As above.
+        let delegate_code = delegate_account.code.clone().unwrap_or_default();
+        *known_bytecode = Some((delegate_account.code_hash(), delegate_code));
     }
 
     Ok(cost)

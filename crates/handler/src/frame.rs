@@ -122,6 +122,11 @@ impl EthFrame<EthInterpreter> {
     ///
     /// Neither the interpreter's [`InputsImpl`] nor its [`ExtBytecode`] is a parameter; see
     /// [`Interpreter::clear`].
+    ///
+    /// `#[inline]`: out of line this is ten callee-saved registers saved and restored, 37
+    /// retired instructions per call frame, around a body that assigns six fields. Both
+    /// call sites are inside `init_with_context`, which already has the frame pointer live.
+    #[inline]
     pub fn clear(
         &mut self,
         data: FrameData,
@@ -233,9 +238,20 @@ impl EthFrame<EthInterpreter> {
             return return_result(InstructionResult::Stop);
         }
 
+        let frame = this.get(EthFrame::invalid);
+
+        // Moved into the frame here, ahead of everything else, rather than left in a local
+        // until the end of the function. A `Bytecode` is four words and a `B256` is another
+        // four, and the writes below - three addresses, a `CallInput` and a `U256` - are
+        // enough register pressure that LLVM spilled and reloaded all eight across them.
+        // Written first, the pair dies one statement after it is born.
+        //
+        // In place, for the reason in `Interpreter::clear`: by value this is a 184-byte
+        // `memcpy` libcall per frame.
+        ExtBytecode::replace_with_hash(&mut frame.interpreter.bytecode, bytecode, bytecode_hash);
+
         // Create interpreter and executes call and push new CallStackFrame.
         let spec_id = ctx.cfg().spec().into();
-        let frame = this.get(EthFrame::invalid);
 
         // Written in place, field by field, rather than built on the stack and handed to
         // `clear` by value: an `InputsImpl` is 128 bytes, so by value it is two `memcpy`
@@ -256,10 +272,6 @@ impl EthFrame<EthInterpreter> {
         }
         ii.input = inputs.input.clone();
         ii.call_value = inputs.value.get();
-
-        // In place, for the reason in `Interpreter::clear`: by value this is a 184-byte
-        // `memcpy` libcall per frame.
-        ExtBytecode::replace_with_hash(&mut frame.interpreter.bytecode, bytecode, bytecode_hash);
 
         frame.clear(
             FrameData::Call(CallFrame {
@@ -382,6 +394,7 @@ impl EthFrame<EthInterpreter> {
     }
 
     /// Initializes a frame with the given context and precompiles.
+    #[inline(always)]
     pub fn init_with_context<
         CTX: ContextTr,
         PRECOMPILES: PrecompileProvider<CTX, Output = InterpreterResult>,
@@ -413,6 +426,13 @@ impl EthFrame<EthInterpreter> {
 
 impl EthFrame<EthInterpreter> {
     /// Processes the next interpreter action, either creating a new frame or returning a result.
+    ///
+    /// `#[inline]`: out of line the call boundary is 29 retired instructions -- fifteen in
+    /// the prologue, fourteen in the epilogue -- around a body whose own work averages 35,
+    /// and it runs 39,999 times per mainnet block 24006677. Inlined into `EvmTr::frame_run`
+    /// the sret slot the tail call was protecting is the caller's own and there is nothing
+    /// left to copy either.
+    #[inline(always)]
     pub fn process_next_action<
         CTX: ContextTr,
         ERROR: From<ContextTrDbError<CTX>> + FromStringError,
@@ -425,6 +445,12 @@ impl EthFrame<EthInterpreter> {
 
         // Run interpreter
 
+        // The `Return` payload is consumed inside its own arm rather than bound to a `mut`
+        // local the rest of the function reads. An `InterpreterResult` is 72 bytes -- eight
+        // over the width LLVM expands inline -- so moving it out of the by-value action into
+        // a local is a `memcpy` libcall, and the local exists only because the create arm
+        // below wants `&mut` on it. Matched in place, the call arm moves the payload straight
+        // from the argument slot into the `CallOutcome` it builds in the sret slot.
         let mut interpreter_result = match next_action {
             InterpreterAction::NewFrame(frame_input) => {
                 let depth = self.depth + 1;
@@ -434,7 +460,25 @@ impl EthFrame<EthInterpreter> {
                     memory: self.interpreter.memory.new_child_context(),
                 }));
             }
-            InterpreterAction::Return(result) => result,
+            InterpreterAction::Return(result) => {
+                if let FrameData::Call(frame) = &self.data {
+                    // Set before the result is built; see the note below.
+                    self.is_finished = true;
+                    // return_call
+                    // Revert changes or not.
+                    if result.result.is_ok() {
+                        context.journal_mut().checkpoint_commit();
+                    } else {
+                        context.journal_mut().checkpoint_revert(self.checkpoint);
+                    }
+                    let memory_offset = frame.return_memory_range.clone();
+                    return Ok(ItemOrResult::Result(FrameResult::Call(CallOutcome {
+                        result,
+                        memory_offset,
+                    })));
+                }
+                result
+            }
         };
 
         // Handle return from frame.
@@ -454,20 +498,8 @@ impl EthFrame<EthInterpreter> {
         // slot of its own, which is then `memcpy`d into the sret slot. Returning from the arm
         // lets it be built in the sret slot directly.
         match &self.data {
-            FrameData::Call(frame) => {
-                // return_call
-                // Revert changes or not.
-                if interpreter_result.result.is_ok() {
-                    context.journal_mut().checkpoint_commit();
-                } else {
-                    context.journal_mut().checkpoint_revert(self.checkpoint);
-                }
-                let memory_offset = frame.return_memory_range.clone();
-                Ok(ItemOrResult::Result(FrameResult::Call(CallOutcome {
-                    result: interpreter_result,
-                    memory_offset,
-                })))
-            }
+            // Handled in the `Return` arm above, before `interpreter_result` was bound.
+            FrameData::Call(_) => unreachable!(),
             FrameData::Create(frame) => {
                 let max_code_size = context.cfg().max_code_size();
                 let is_eip3541_disabled = context.cfg().is_eip3541_disabled();

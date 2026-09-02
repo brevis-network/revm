@@ -123,6 +123,29 @@ impl AlignedAddress {
         }
     }
 
+    /// Builds an aligned address out of the three words it is made of.
+    ///
+    /// [`Self::new`] has to read the source at an alignment it cannot know, so it carries a
+    /// runtime check and two fallback arms, and LLVM then materialises the aligned arm as
+    /// 32-bit halves and reassembles them: 25 retired instructions in
+    /// `JournalInner::load_account_mut_optional_code`. A caller that has already read the
+    /// three words - to consult the account cache with them, say - can hand them over
+    /// instead, and the copy is three stores.
+    #[inline(always)]
+    pub fn from_words(w0: u64, w1: u64, w2: u32) -> Self {
+        // SAFETY: `Self` is `align(8)` and 24 bytes, so the writes at 0, 8 and 16 are in
+        // bounds and naturally aligned. They initialize all 20 bytes of the single field;
+        // the four bytes after it are padding, which `assume_init` does not require.
+        unsafe {
+            let mut this = core::mem::MaybeUninit::<Self>::uninit();
+            let p = this.as_mut_ptr().cast::<u8>();
+            p.cast::<u64>().write(w0);
+            p.add(8).cast::<u64>().write(w1);
+            p.add(16).cast::<u32>().write(w2);
+            this.assume_init()
+        }
+    }
+
     /// Compares two aligned addresses as words.
     ///
     /// `a.0 == b.0` on two `[u8; 20]`s is a `bcmp`/`memcmp` libcall on a target without
@@ -654,12 +677,19 @@ impl<const TAG: usize> core::borrow::Borrow<FastAddressAt<TAG>> for Address {
 /// `map.get_mut(FastU256::new(&key))` and neither the map type nor a stored key changes.
 /// `Hash` forwards to `U256`'s, so the query hashes into the bucket the key was stored in;
 /// `fast_u256_finds_what_u256_stored` pins that.
+///
+/// `TAG` is [`FastAddressAt`]'s, for the same reason: one query type shared between two call
+/// sites is what makes LLVM outline hashbrown's probe, and the call then costs more than the
+/// `memcmp` it saved. Pick a tag per call site and say which in a comment there.
 #[derive(Debug, Eq)]
 #[repr(transparent)]
-pub struct FastU256(U256);
+pub struct FastU256At<const TAG: usize>(U256);
 
-impl FastU256 {
-    /// Borrows a [`U256`] as a [`FastU256`].
+/// [`FastU256At`] with the tag the warm storage lookup uses.
+pub type FastU256 = FastU256At<0>;
+
+impl<const TAG: usize> FastU256At<TAG> {
+    /// Borrows a [`U256`] as a [`FastU256At`].
     #[inline(always)]
     pub fn new(value: &U256) -> &Self {
         // SAFETY: `#[repr(transparent)]` over `U256`, so the two have the same layout and
@@ -668,24 +698,24 @@ impl FastU256 {
     }
 }
 
-impl PartialEq for FastU256 {
+impl<const TAG: usize> PartialEq for FastU256At<TAG> {
     #[inline(always)]
     fn eq(&self, other: &Self) -> bool {
         u256_eq(&self.0, &other.0)
     }
 }
 
-impl core::hash::Hash for FastU256 {
+impl<const TAG: usize> core::hash::Hash for FastU256At<TAG> {
     #[inline(always)]
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.0.hash(state);
     }
 }
 
-impl core::borrow::Borrow<FastU256> for U256 {
+impl<const TAG: usize> core::borrow::Borrow<FastU256At<TAG>> for U256 {
     #[inline(always)]
-    fn borrow(&self) -> &FastU256 {
-        FastU256::new(self)
+    fn borrow(&self) -> &FastU256At<TAG> {
+        FastU256At::new(self)
     }
 }
 
