@@ -257,6 +257,11 @@ macro_rules! sync_gas_at {
 /// by hand for that reason. A non-exceptional halt added after a `gas!` would make the refund
 /// consensus-visible, so this is the opposite of a free safety net.
 ///
+/// This macro is the only place that publishes-and-halts, so this paragraph is the whole
+/// contract for it. `as_usize_or_fail_ret_at!` expands to it rather than repeating it, and so
+/// does every other threaded halt: `popn_at!`, `popn_top_at!`, `push_at!`,
+/// `require_non_staticcall_at!` and `check_at!`.
+///
 /// That number is regime-dependent, which is worth knowing before trusting it again: while
 /// `JUMP`/`JUMPI` were threaded too (see the note on `rem` in `Interpreter::run_plain`) the
 /// publish was worth *-1.3 M*, because these cold blocks are tail-merged across the ~150 arms
@@ -489,6 +494,12 @@ macro_rules! as_usize_or_fail {
 /// can only be used where the field is already the truth. A body that keeps the counter in
 /// its register until it knows it has gas to charge -- `MLOAD`/`MSTORE`, whose hot path
 /// charges nothing -- publishes here instead, on the cold edge only. See `sync_gas_at!`.
+///
+/// The publish carries `poison_at!`'s precondition, and for the same reason: it writes the
+/// register back over the field, so a body that has charged through the field since its own
+/// `sync_gas_at!` would have that charge refunded. Both callers convert before they charge.
+/// Unlike `poison_at!` the value is not the caller's exit -- `$ret` carries that -- so the
+/// `u64::MAX` is discarded and only the publish-and-halt is shared.
 #[macro_export]
 #[collapse_debuginfo(yes)]
 macro_rules! as_usize_or_fail_ret_at {
@@ -496,8 +507,11 @@ macro_rules! as_usize_or_fail_ret_at {
         match $v.as_limbs() {
             x => {
                 if (x[0] > usize::MAX as u64) | (x[1] != 0) | (x[2] != 0) | (x[3] != 0) {
-                    $crate::sync_gas_at!($interpreter, $rem);
-                    $interpreter.halt($crate::InstructionResult::InvalidOperandOOG);
+                    $crate::poison_at!(
+                        $interpreter,
+                        $rem,
+                        $interpreter.halt($crate::InstructionResult::InvalidOperandOOG)
+                    );
                     return $ret;
                 }
                 x[0] as usize
