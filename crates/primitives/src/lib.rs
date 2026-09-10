@@ -756,6 +756,29 @@ mod fast_key_tests {
     use super::*;
     use std::vec;
 
+    /// Digest of `value` under a fixed-seed FNV-1a.
+    ///
+    /// `RandomState` is not reachable under `no_std`, and a fixed seed makes a failure
+    /// reproducible. Only used to compare two digests, so the choice of hash is irrelevant
+    /// beyond its being field-order sensitive.
+    fn hash_of<T: core::hash::Hash>(value: &T) -> u64 {
+        struct Fnv1a(u64);
+        impl core::hash::Hasher for Fnv1a {
+            fn finish(&self) -> u64 {
+                self.0
+            }
+            fn write(&mut self, bytes: &[u8]) {
+                for &b in bytes {
+                    self.0 ^= u64::from(b);
+                    self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+        }
+        let mut hasher = Fnv1a(0xcbf2_9ce4_8422_2325);
+        core::hash::Hash::hash(value, &mut hasher);
+        core::hash::Hasher::finish(&hasher)
+    }
+
     /// Every pair of start offsets in an 8-byte window - so both the wide arm and the
     /// fallback are exercised - against every position of a single differing byte.
     #[test]
@@ -881,9 +904,18 @@ mod fast_key_tests {
             let k = key(i);
             assert_eq!(map.get(FastU256::new(&k)).copied(), Some(i), "i={i}");
         }
+        // The miss half. `key` is injective -- limb 0 is `u64::from(i)`, widened rather
+        // than truncated -- so these really are absent. The sibling address sweep was not
+        // so lucky: its `key` aliased mod 256 and 0 of its 64 cases reached the miss path.
+        // Asserted rather than assumed, and expected as `None` rather than compared with
+        // the plain lookup, which agrees with a broken fast path whenever both find nothing.
         for i in 256..320u32 {
             let k = key(i);
-            assert_eq!(map.get(FastU256::new(&k)).copied(), map.get(&k).copied());
+            assert!(
+                !map.contains_key(&k),
+                "the miss sweep must query absent keys, i={i}"
+            );
+            assert_eq!(map.get(FastU256::new(&k)).copied(), None, "i={i}");
         }
     }
 
@@ -1032,6 +1064,28 @@ mod fast_key_tests {
             address: base,
         };
         assert_eq!(a, dirty);
+
+        // And `Hash` has to agree with that. `MaybeAddress` hand-writes `PartialEq`, so a
+        // derived `Hash` would fold the padding and an absent value's stale payload and let
+        // two equal values hash differently. `clippy::derived_hash_with_manual_eq` catches
+        // the derive; nothing pinned the contract once the impl was hand-written, so these
+        // are the two pairs `eq` calls equal that a field-wise hash would separate.
+        assert_eq!(
+            hash_of(&a),
+            hash_of(&dirty),
+            "dirty padding must not reach the hash"
+        );
+        let stale = MaybeAddress {
+            present: false,
+            _pad: [0; 7],
+            address: base,
+        };
+        assert_eq!(MaybeAddress::NONE, stale);
+        assert_eq!(
+            hash_of(&MaybeAddress::NONE),
+            hash_of(&stale),
+            "an absent value's payload must not reach the hash"
+        );
     }
 
     /// A `FastAddress` query has to hash into the bucket an `Address` key was stored in, and
