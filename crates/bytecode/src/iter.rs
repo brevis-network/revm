@@ -17,7 +17,14 @@ impl<'a> BytecodeIterator<'a> {
     #[inline]
     pub fn new(bytecode: &'a Bytecode) -> Self {
         let bytes = match bytecode {
-            Bytecode::LegacyAnalyzed(_) => &bytecode.bytecode()[..],
+            // `analyze_legacy` pads exactly one slack byte past the final STOP for the
+            // interpreter's speculative fetch (see the note on `padding` there). It is not
+            // part of the code, so the iterator stops before it -- which keeps the observable
+            // opcode sequence identical to what it was before the slack byte existed.
+            Bytecode::LegacyAnalyzed(_) => {
+                let all = &bytecode.bytecode()[..];
+                &all[..all.len() - 1]
+            }
             Bytecode::Eip7702(_) => &[],
         };
         Self {

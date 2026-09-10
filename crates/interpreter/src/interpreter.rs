@@ -851,10 +851,13 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
         macro_rules! dispatch_switch {
             ($($op:ident => $f:expr, $g:expr, $moves_ip:tt;)*) => {
                 loop {
-                    // SAFETY: same invariant as `ExtBytecode::opcode`. The analysis pads the
-                    // bytecode so that the last opcode is a STOP, so the pointer never walks
-                    // off the end: STOP sets an action, which poisons the gas counter and
-                    // ends the loop on the next charge.
+                    // SAFETY: `ip` is always inside the padded bytecode. `analyze_legacy` pads
+                    // so that the last opcode is a STOP *and* at least one zero byte follows
+                    // it. This read is speculative -- it happens before the gas check that
+                    // notices a halt -- so after the final STOP it lands on that slack byte,
+                    // which exists precisely for this read; the poisoned gas counter then
+                    // ends the loop before the byte is dispatched. Verified under Miri by
+                    // `tests/miri_post_stop.rs`.
                     // The cursor's type invariant, restated on the loop-carried register.
                     // `Stack::byte_len` asserts it on every *load* of the length precisely so
                     // that `byte_len < WORD` lowers as `byte_len == 0` -- see the comment

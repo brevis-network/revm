@@ -40,7 +40,8 @@ impl Default for LegacyAnalyzedBytecode {
     #[inline]
     fn default() -> Self {
         Self {
-            bytecode: Bytes::from_static(&[0]),
+            // STOP plus one byte of slack; see `analyze_legacy` for why the slack is needed.
+            bytecode: Bytes::from_static(&[0, 0]),
             original_len: 0,
             jump_table: JumpTable::default(),
         }
@@ -76,6 +77,20 @@ impl LegacyAnalyzedBytecode {
             "jump table length is less than original length"
         );
         assert!(!bytecode.is_empty(), "bytecode cannot be empty");
+        // The two invariants `Interpreter::run_plain` relies on. It fetches the byte after
+        // the instruction it just ran before it checks for a halt, so after the final STOP
+        // it reads `bytecode[len_of_code]`; `analyze_legacy` provides that byte. A caller
+        // rebuilding from serialised parts (`Bytecode::new_analyzed`) that were produced by
+        // an older analysis without the slack byte fails here, loudly, instead of handing the
+        // interpreter a buffer it will read one past.
+        assert!(
+            bytecode.len() > original_len,
+            "analyzed bytecode must carry at least one padding byte past the original code"
+        );
+        assert!(
+            *bytecode.last().unwrap() == 0,
+            "analyzed bytecode must end in a zero (STOP) byte"
+        );
         Self {
             bytecode,
             original_len,

@@ -11,7 +11,8 @@ use std::vec::Vec;
 /// Prefer using [`LegacyAnalyzedBytecode::analyze`](crate::LegacyAnalyzedBytecode::analyze) instead.
 pub fn analyze_legacy(bytecode: Bytes) -> (JumpTable, Bytes) {
     if bytecode.is_empty() {
-        return (JumpTable::default(), Bytes::from_static(&[opcode::STOP]));
+        // A STOP, plus one byte of slack past it: see the note on `padding` below.
+        return (JumpTable::default(), Bytes::from_static(&[opcode::STOP, opcode::STOP]));
     }
 
     let mut jumps: BitVec<u8> = bitvec![u8, Lsb0; 0; bytecode.len()];
@@ -39,15 +40,22 @@ pub fn analyze_legacy(bytecode: Bytes) -> (JumpTable, Bytes) {
         }
     }
 
-    let padding = (iterator as usize) - (end as usize) + (opcode != opcode::STOP) as usize;
-    let bytecode = if padding > 0 {
-        let mut padded = Vec::with_capacity(bytecode.len() + padding);
-        padded.extend_from_slice(&bytecode);
-        padded.resize(padded.len() + padding, 0);
-        Bytes::from(padded)
-    } else {
-        bytecode
-    };
+    // Three things the padding has to provide:
+    //  1. any PUSH immediate that runs past the end (`iterator - end` bytes);
+    //  2. a terminating STOP if the last opcode is not one already;
+    //  3. **one byte past the final STOP**. `Interpreter::run_plain` fetches the next opcode
+    //     *before* the gas check that notices a halt, so after the final STOP it reads
+    //     `bytecode[len]`. Without this byte that is a one-past-the-end dereference, which
+    //     Miri reports as UB (see `crates/interpreter/tests/miri_post_stop.rs`). The byte is
+    //     never executed: the poisoned gas counter ends the loop before dispatch.
+    // Because of (3) the padding is never zero, so the original `Bytes` is never returned
+    // as-is -- it may be a sub-slice with nothing addressable past its end.
+    let padding =
+        (iterator as usize) - (end as usize) + (opcode != opcode::STOP) as usize + 1;
+    let mut padded = Vec::with_capacity(bytecode.len() + padding);
+    padded.extend_from_slice(&bytecode);
+    padded.resize(padded.len() + padding, 0);
+    let bytecode = Bytes::from(padded);
 
     (JumpTable::new(jumps), bytecode)
 }
@@ -57,7 +65,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_bytecode_ends_with_stop_no_padding_needed() {
+    fn test_bytecode_ends_with_stop_gets_one_slack_byte() {
         let bytecode = vec![
             opcode::PUSH1,
             0x01,
@@ -67,35 +75,35 @@ mod tests {
             opcode::STOP,
         ];
         let (_, padded_bytecode) = analyze_legacy(bytecode.clone().into());
-        assert_eq!(padded_bytecode.len(), bytecode.len());
+        assert_eq!(padded_bytecode.len(), bytecode.len() + 1);
     }
 
     #[test]
     fn test_bytecode_ends_without_stop_requires_padding() {
         let bytecode = vec![opcode::PUSH1, 0x01, opcode::PUSH1, 0x02, opcode::ADD];
         let (_, padded_bytecode) = analyze_legacy(bytecode.clone().into());
-        assert_eq!(padded_bytecode.len(), bytecode.len() + 1);
+        assert_eq!(padded_bytecode.len(), bytecode.len() + 2);
     }
 
     #[test]
-    fn test_bytecode_ends_with_push16_requires_17_bytes_padding() {
+    fn test_bytecode_ends_with_push16_requires_18_bytes_padding() {
         let bytecode = vec![opcode::PUSH1, 0x01, opcode::PUSH16];
         let (_, padded_bytecode) = analyze_legacy(bytecode.clone().into());
-        assert_eq!(padded_bytecode.len(), bytecode.len() + 17);
+        assert_eq!(padded_bytecode.len(), bytecode.len() + 18);
     }
 
     #[test]
-    fn test_bytecode_ends_with_push2_requires_2_bytes_padding() {
+    fn test_bytecode_ends_with_push2_requires_3_bytes_padding() {
         let bytecode = vec![opcode::PUSH1, 0x01, opcode::PUSH2, 0x02];
         let (_, padded_bytecode) = analyze_legacy(bytecode.clone().into());
-        assert_eq!(padded_bytecode.len(), bytecode.len() + 2);
+        assert_eq!(padded_bytecode.len(), bytecode.len() + 3);
     }
 
     #[test]
     fn test_empty_bytecode_requires_stop() {
         let bytecode = vec![];
         let (_, padded_bytecode) = analyze_legacy(bytecode.clone().into());
-        assert_eq!(padded_bytecode.len(), 1); // Just STOP
+        assert_eq!(padded_bytecode.len(), 2); // STOP + one slack byte
     }
 
     #[test]
@@ -130,7 +138,7 @@ mod tests {
     fn test_bytecode_with_max_push32() {
         let bytecode = vec![opcode::PUSH32];
         let (_, padded_bytecode) = analyze_legacy(bytecode.clone().into());
-        assert_eq!(padded_bytecode.len(), bytecode.len() + 33); // PUSH32 + 32 bytes + STOP
+        assert_eq!(padded_bytecode.len(), bytecode.len() + 34); // PUSH32 + 32 bytes + STOP + slack
     }
 
     #[test]
@@ -156,7 +164,7 @@ mod tests {
             opcode::STOP,
         ];
         let (jump_table, padded_bytecode) = analyze_legacy(bytecode.clone().into());
-        assert_eq!(padded_bytecode.len(), bytecode.len());
+        assert_eq!(padded_bytecode.len(), bytecode.len() + 1);
         assert!(!jump_table.is_valid(0)); // PUSH1
         assert!(!jump_table.is_valid(2)); // PUSH2
         assert!(!jump_table.is_valid(5)); // PUSH4
