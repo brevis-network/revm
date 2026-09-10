@@ -29,6 +29,11 @@ serde = { workspace = true, features = ["derive", "rc"], optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true, features = ["alloc"] }
+# `tests/shared_memory_serde.rs` is `#![cfg(feature = "serde")]`, and `serde` is not a default
+# feature, so without this a plain `cargo test -p revm-interpreter` compiled zero of its ten
+# tests and reported success. A dev-dependency on ourselves turns the feature on for test
+# builds only; `cargo build` is unaffected, because dev-dependencies do not propagate.
+revm-interpreter = { path = ".", features = ["serde"] }
 
 [features]
 default = ["std"]

@@ -3678,6 +3678,7 @@ version = "29.0.1"
 dependencies = [
  "revm-bytecode",
  "revm-context-interface",
+ "revm-interpreter",
  "revm-primitives",
  "revm-state",
  "serde",
