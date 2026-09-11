@@ -286,15 +286,24 @@ impl MemoryGas {
         if new_num <= words_num {
             return None;
         }
-        // 2^32 words is 137 GB, and `memory_gas` of it is 2^55 gas. Every caller feeds the
-        // result straight to `Gas::record_cost`, and no reachable `remaining` covers that
-        // cost -- `Gas::new` caps the limit at `i64::MAX` and `u64::MAX` is the poison, which
-        // never executes an instruction -- so the charge fails and the frame is out of gas,
-        // which is what the saturating form did too. Returning early is the same answer
-        // three instructions sooner *and* it is what bounds the field: `limit` is only ever
-        // written below, so every stored word count is under 2^32 and both `memory_gas`
-        // calls lose their saturation. Leave `limit` alone on this path so that bound holds
-        // even for the frame that dies here.
+        // 2^32 words is 137 GB, and `memory_gas` of it is ~2^55 gas (`w * w` saturates, so
+        // the real figure is `u64::MAX / 512 + 3 * 2^32`). Every caller feeds the result
+        // straight to the *checked* `Gas::record_cost`, so `u64::MAX` is an out-of-gas rather
+        // than a wrap -- note this would not hold for `record_cost_unsafe`, where
+        // `remaining - u64::MAX` has a clear sign bit and reports success.
+        //
+        // What makes the shortcut equivalent to the saturating form is the size of that cost
+        // against a *real* gas limit: ~2^55 is about 1.2e9 times a mainnet block's, so no
+        // transaction can pay it and both forms end the frame out of gas. It is **not** true
+        // that no reachable `remaining` covers it -- `Gas::new` caps the limit at `i64::MAX`,
+        // which is ~250x larger, and `Interpreter::default_ext`/`invalid` are built with
+        // exactly that. Such a frame used to be charged ~2^55 and then attempt a 137 GB
+        // allocation; now it is out of gas, which is the better of the two.
+        //
+        // Returning early is also what bounds the field: `limit` is only ever written below,
+        // so every stored word count is under 2^32 and both `memory_gas` calls lose their
+        // saturation. Leave `limit` alone on this path so that bound holds even for the frame
+        // that dies here.
         if new_num >> 32 != 0 {
             return Some(u64::MAX);
         }
