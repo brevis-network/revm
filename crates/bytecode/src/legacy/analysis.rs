@@ -12,7 +12,10 @@ use std::vec::Vec;
 pub fn analyze_legacy(bytecode: Bytes) -> (JumpTable, Bytes) {
     if bytecode.is_empty() {
         // A STOP, plus one byte of slack past it: see the note on `padding` below.
-        return (JumpTable::default(), Bytes::from_static(&[opcode::STOP, opcode::STOP]));
+        return (
+            JumpTable::default(),
+            Bytes::from_static(&[opcode::STOP, opcode::STOP]),
+        );
     }
 
     let mut jumps: BitVec<u8> = bitvec![u8, Lsb0; 0; bytecode.len()];
@@ -50,8 +53,7 @@ pub fn analyze_legacy(bytecode: Bytes) -> (JumpTable, Bytes) {
     //     never executed: the poisoned gas counter ends the loop before dispatch.
     // Because of (3) the padding is never zero, so the original `Bytes` is never returned
     // as-is -- it may be a sub-slice with nothing addressable past its end.
-    let padding =
-        (iterator as usize) - (end as usize) + (opcode != opcode::STOP) as usize + 1;
+    let padding = (iterator as usize) - (end as usize) + (opcode != opcode::STOP) as usize + 1;
     let mut padded = Vec::with_capacity(bytecode.len() + padding);
     padded.extend_from_slice(&bytecode);
     padded.resize(padded.len() + padding, 0);

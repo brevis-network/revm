@@ -944,6 +944,24 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
         // SAFETY: `sp` is this stack's own cursor, threaded through the arms since the loop
         // header read it.
         unsafe { self.stack.set_sp(sp) };
+        // `jctx` is read once at the top and handed to every jump, which is sound only
+        // because nothing replaces this frame's bytecode while the loop runs -- an invariant
+        // the type system does not carry, since a `JumpCtx` is three bare values with no tie
+        // to the `ExtBytecode` they came from. No path violates it today (`replace_with_*` is
+        // reached only from `make_call_frame`/`make_create_frame`, both outside the loop),
+        // but a future edit that swapped frames in place would break it *silently*: the
+        // frame's jumps would be checked against a bitmap that no longer describes the code,
+        // and the only symptom would be a wrong state root. One re-read per frame -- 20,024
+        // of them against the 609,357 jumps the hoist serves on block 24006677 -- turns that
+        // into an abort. Failing closed is the right trade here: aborting is recoverable,
+        // proving the wrong execution is not.
+        let exit_ctx = self.bytecode.jump_ctx();
+        assert!(
+            core::ptr::eq(jctx.table_ptr, exit_ctx.table_ptr)
+                && jctx.table_len == exit_ctx.table_len
+                && core::ptr::eq(jctx.code_base, exit_ctx.code_base),
+            "the frame's bytecode changed during dispatch: the hoisted jump context is stale"
+        );
         self.end_dispatch();
         self.take_next_action()
     }

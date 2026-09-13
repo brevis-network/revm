@@ -377,4 +377,19 @@ mod tests {
         assert!(ext_bytecode.bytecode_hash.is_some());
         assert_eq!(ExtBytecode::new(bytecode).bytecode_hash.get(), None);
     }
+
+    /// The premise of the guard at `Interpreter::run_plain`'s exit: two different bytecodes
+    /// give different jump contexts, so comparing the loop's copy against a re-read is a real
+    /// check and not a tautology. That it does *not* fire on a normal frame is covered by
+    /// every test that runs the dispatch loop.
+    #[test]
+    fn jump_ctx_differs_between_bytecodes() {
+        let a = ExtBytecode::new(Bytecode::new_raw(Bytes::from(&[0x5b, 0x00][..])));
+        let b = ExtBytecode::new(Bytecode::new_raw(Bytes::from(&[0x5b, 0x5b, 0x00][..])));
+        assert!(!core::ptr::eq(
+            a.jump_ctx().table_ptr,
+            b.jump_ctx().table_ptr
+        ));
+        assert_ne!(a.jump_ctx().table_len, b.jump_ctx().table_len);
+    }
 }

@@ -31,7 +31,9 @@ fn run(code: &[u8]) -> InstructionResult {
     let table = instruction_table::<EthInterpreter, DummyHost>();
     let mut host = DummyHost;
     let action = interpreter.run_plain(&table, &mut host);
-    action.instruction_result().expect("run_plain returns a result")
+    action
+        .instruction_result()
+        .expect("run_plain returns a result")
 }
 
 /// The minimal case: one byte, STOP. Before the slack byte, `analyze_legacy` added no padding
