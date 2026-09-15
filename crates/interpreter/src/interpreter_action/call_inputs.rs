@@ -15,6 +15,24 @@ pub enum CallInput {
     ///
     /// Use it with caution, CallInput shared buffer can be overridden if context from child call is returned so
     /// recommendation is to fetch buffer at first Inspector call and clone it from [`context_interface::LocalContextTr::shared_memory_buffer_slice`] function.
+    ///
+    /// # Two properties this variant does **not** carry
+    ///
+    /// 1. **In-bounds.** The range is not bounded by the buffer by anything in this type. It is
+    ///    in bounds because `prepare_call_inputs` builds it out of `resize_memory`, which grew
+    ///    the buffer to cover it -- and `calldataload_at` relies on that premise for a raw
+    ///    pointer read, having had its checked `.get(range)` removed for six retired
+    ///    instructions. A producer of `CallInput` that is not `prepare_call_inputs` owes it.
+    /// 2. **Identity of the buffer.** Which `Rc` the range refers to is not part of the value.
+    ///    That matters across serde: serde's `rc` feature does **not** deduplicate `Rc`s, so a
+    ///    round trip gives a resumed `FrameInit`'s `SharedMemory` a buffer disjoint from
+    ///    `LocalContext`'s (measured: `Rc::ptr_eq` false, strong count 1), and a
+    ///    `SharedBuffer(range)` beside it then resolves against the wrong one -- typically to
+    ///    `Bytes::default()`, i.e. **silently empty calldata**, which `new_child_context`
+    ///    propagates by cloning the same wrong `Rc`. Nothing detects it: INV-B is pointer
+    ///    *validity*, not buffer *identity*, so the guest's assert and the host's `check_base`
+    ///    are both blind to it. Serialising an interpreter mid-frame and resuming it is
+    ///    revm-as-a-library surface; the rsp guest deserialises no interpreter type.
     SharedBuffer(Range<usize>),
     /// Bytes of the call data.
     Bytes(Bytes),

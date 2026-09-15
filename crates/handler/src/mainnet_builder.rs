@@ -89,6 +89,146 @@ mod test {
     use primitives::{hardfork::SpecId, TxKind, U256};
     use primitives::{StorageKey, StorageValue};
 
+    /// A database with one contract and one pre-existing storage slot.
+    ///
+    /// Needed because `BenchmarkDB` answers every `storage` with zero, so nothing built on it
+    /// can reach an `SSTORE` transition whose *original* value is non-zero -- which is three of
+    /// the four rungs that matter.
+    #[derive(Debug)]
+    struct OneSlotDb {
+        contract: primitives::Address,
+        code: Bytecode,
+        slot: StorageKey,
+        value: StorageValue,
+    }
+
+    impl database_interface::Database for OneSlotDb {
+        type Error = core::convert::Infallible;
+
+        fn basic(
+            &mut self,
+            address: primitives::Address,
+        ) -> Result<Option<state::AccountInfo>, Self::Error> {
+            let code = (address == self.contract).then(|| self.code.clone());
+            Ok(Some(state::AccountInfo {
+                balance: U256::from(1_000_000_000_000_000_000u64),
+                nonce: 0,
+                code_hash: code
+                    .as_ref()
+                    .map(|c| c.hash_slow())
+                    .unwrap_or(primitives::KECCAK_EMPTY),
+                code,
+            }))
+        }
+
+        fn code_by_hash(&mut self, _code_hash: primitives::B256) -> Result<Bytecode, Self::Error> {
+            Ok(self.code.clone())
+        }
+
+        fn storage(
+            &mut self,
+            address: primitives::Address,
+            index: StorageKey,
+        ) -> Result<StorageValue, Self::Error> {
+            Ok(if address == self.contract && index == self.slot {
+                self.value
+            } else {
+                StorageValue::ZERO
+            })
+        }
+
+        fn block_hash(&mut self, _number: u64) -> Result<primitives::B256, Self::Error> {
+            Ok(primitives::B256::ZERO)
+        }
+    }
+
+    /// `SSTORE`'s gas and refund, end to end, against the EIP numbers.
+    ///
+    /// **Nothing in either repository asserted SSTORE gas.** `crates/ee-tests` has 30 fixtures
+    /// and no SSTORE fixture, and the only in-tree check of the rewritten cost path is
+    /// `sstore_table_matches_the_branch_chains`, which compares the table against the branch
+    /// chains it was *generated from* -- a self-consistency check, not an oracle. A transition
+    /// mis-classified in both would pass it.
+    ///
+    /// These four are the rungs a transaction can reach on a fresh slot, priced by EIP-2200
+    /// as amended by EIP-2929 (the cold surcharge) and EIP-3529 (the reduced refund and the
+    /// one-fifth cap). Every figure below is derived from the EIPs, not read back out of this
+    /// implementation:
+    ///
+    /// * intrinsic 21,000 + two `PUSH1` at 3 = 21,006 before the `SSTORE`;
+    /// * a first touch of a slot is cold: +2,100 (`COLD_SLOAD_COST`);
+    /// * `0 -> non-zero` on a clean slot is `SSTORE_SET` = 20,000;
+    /// * `non-zero -> other non-zero` is `SSTORE_RESET` = 5,000 - 2,100 = 2,900, so 5,000 with
+    ///   the cold surcharge;
+    /// * `non-zero -> 0` is the same 5,000 and refunds 4,800, capped at `gas_used / 5`;
+    /// * `x -> x` is a no-op: the warm read, 100.
+    #[test]
+    fn sstore_gas_matches_the_eip_numbers() {
+        let contract = primitives::address!("00000000000000000000000000000000000000ff");
+        let slot = StorageKey::from(7);
+
+        // PUSH1 <new>; PUSH1 7; SSTORE; STOP
+        let code = |new_value: u8| {
+            Bytecode::new_legacy(std::vec![PUSH1, new_value, PUSH1, 0x07, SSTORE, STOP].into())
+        };
+
+        // (original, new, expected gas_used)
+        let cases: [(u64, u8, u64); 4] = [
+            // Clean zero slot set to non-zero: cold 2,100 + SSTORE_SET 20,000.
+            (0, 1, 21_006 + 2_100 + 20_000),
+            // Clean non-zero slot changed: cold 2,100 + SSTORE_RESET 2,900.
+            (1, 2, 21_006 + 2_100 + 2_900),
+            // Clean non-zero slot cleared: the same 5,000, then a 4,800 refund, which is
+            // under the one-fifth cap of 26,006 / 5 = 5,201 and so applies in full.
+            (1, 0, 21_006 + 2_100 + 2_900 - 4_800),
+            // No-op write of the value already there: cold 2,100 + a warm read, 100.
+            (3, 3, 21_006 + 2_100 + 100),
+        ];
+
+        for (original, new, expected) in cases {
+            let ctx = Context::mainnet()
+                .modify_cfg_chained(|cfg| cfg.spec = SpecId::PRAGUE)
+                .with_db(OneSlotDb {
+                    contract,
+                    code: code(new),
+                    slot,
+                    value: StorageValue::from(original),
+                });
+            let mut evm = ctx.build_mainnet();
+            let out = evm
+                .transact(
+                    TxEnv::builder()
+                        .gas_limit(1_000_000)
+                        .caller(EEADDRESS)
+                        .kind(TxKind::Call(contract))
+                        .build()
+                        .unwrap(),
+                )
+                .unwrap();
+            assert!(
+                out.result.is_success(),
+                "SSTORE {original} -> {new} reverted: {:?}",
+                out.result
+            );
+            assert_eq!(
+                out.result.gas_used(),
+                expected,
+                "SSTORE {original} -> {new}"
+            );
+            let stored = out
+                .state
+                .get(&contract)
+                .and_then(|a| a.storage.get(&slot))
+                .map(|s| s.present_value)
+                .unwrap_or(StorageValue::ZERO);
+            assert_eq!(
+                stored,
+                StorageValue::from(new),
+                "SSTORE {original} -> {new} value"
+            );
+        }
+    }
+
     /// A three-account database: a caller, a parent contract, a child contract, and one
     /// address whose `basic` always fails.
     ///

@@ -1260,6 +1260,18 @@ impl SharedMemory {
     /// `src` must point at four readable `u64`s, `offset + 32` must be in bounds, and `src`
     /// must not overlap the 32 bytes at `offset` -- the misaligned arm interleaves its reads
     /// with its writes. See [`MemoryTr::set_u256_ptr`].
+    ///
+    /// **Nothing enforces the bound in a shipping build**, and that is worth stating where the
+    /// pointer is formed. The `assert!` added for this went on `get_u256`/`set_u256`, which
+    /// have no interpreter callers; what `MLOAD`/`MSTORE` actually reach is this function,
+    /// whose bound is a `debug_assert!` plus a `check_base` gated on
+    /// `#[cfg(not(target_os = "zkvm"))]` -- so neither runs in the guest, and only the first
+    /// runs in a native *debug* build. The invariant is held instead by the caller's gas
+    /// accounting: `MLOAD`/`MSTORE` test `offset >= gas.memory().word_limit()` and grow
+    /// through `grow_memory_word*`, so a reachable `offset` has been paid for, and the
+    /// quadratic memory-gas curve saturates long before an offset gets near the buffer's end.
+    /// That is a gas argument, not a memory argument, and two reviewers failed to turn it into
+    /// an out-of-bounds access -- but it is the whole of it.
     #[inline(always)]
     pub unsafe fn set_u256_ptr(&mut self, offset: usize, src: *const u64) {
         // SAFETY: see `get_u256` - single-threaded guest, no live borrow, bounds already
