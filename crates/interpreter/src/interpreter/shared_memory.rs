@@ -745,6 +745,17 @@ impl MemoryTr for SharedMemory {
         })
     }
 
+    /// The shared buffer's data pointer, with no borrow taken.
+    ///
+    /// This is a **safe** `&self` method handing out the whole buffer's data pointer, and it
+    /// replaced a checked `Ref`. What that costs is host-*debug* detection and nothing else:
+    /// the pre-image panics on a live conflicting borrow and this does not (executed), while
+    /// Miri flags neither under stacked or tree borrows, and `dbg_borrow`'s `Err` arm is
+    /// `debug_unreachable!` -- i.e. `unreachable_unchecked` -- in release anyway. So the
+    /// release guest never had the check; only the test suite did.
+    ///
+    /// The one caller is `calldataload_at`, which dereferences the pointer only where
+    /// `offset < input_len`.
     #[inline]
     fn global_ptr(&self) -> *const u8 {
         // SAFETY: the guest is single threaded and no other borrow of the shared buffer is

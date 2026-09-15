@@ -4,11 +4,14 @@ concurrency:
   cancel-in-progress: true
   group: ${{github.workflow}}-${{github.ref}}
 
+# `pico-v98-31-0-2` is this fork's integration branch: every campaign PR targeted it, and
+# with the trigger gated to `main` alone neither this workflow nor the EF statetest suite ran
+# for any of PRs #2-#7. The guard was that the CI never ran, which is not a guard.
 on:
   push:
-    branches: [main, "release/**"]
+    branches: [main, "release/**", "pico-v98-31-0-2"]
   pull_request:
-    branches: [main, "release/**"]
+    branches: [main, "release/**", "pico-v98-31-0-2"]
 
 env:
   CARGO_TERM_COLOR: always
