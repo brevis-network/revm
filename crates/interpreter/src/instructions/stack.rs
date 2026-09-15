@@ -102,7 +102,17 @@ pub fn dup_at<const N: usize, WIRE: InterpreterTypes, H: ?Sized>(
     // The switch dispatch of `Interpreter::run_plain` does not come through here -- `DUP` is
     // tagged `(6, N)` and tests the same two bounds against a pinned register -- so this form
     // is the readable one rather than the one unsigned compare it used to fold into.
-    if sp == BYTE_LIMIT - WORD || (sp as isize) <= too_shallow_for(N) {
+    // A *signed* `>=`, not `==`. An equality test is a false upper bound: it rejects exactly
+    // one value of `sp` and accepts every larger one, so `dup_at(ctx, BYTE_LIMIT, 1)` passes
+    // both guards and writes 32 bytes past the end of the 32 KiB stack buffer. The
+    // pre-image's fused single compare carried a real upper bound; splitting it in two lost
+    // it.
+    //
+    // Signed because the cursor is biased: it is the byte offset of the *topmost* word, so an
+    // empty stack is `-WORD` (see `StackTr::sp`), which an unsigned `>=` would read as a
+    // colossal offset and reject. Same one instruction on the target either way (`bge`
+    // against `bne`).
+    if (sp as isize) >= (BYTE_LIMIT - WORD) as isize || (sp as isize) <= too_shallow_for(N) {
         return (
             sp,
             poison_at!(
@@ -139,7 +149,11 @@ pub fn swap_at<const N: usize, WIRE: InterpreterTypes, H: ?Sized>(
     rem: u64,
 ) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
-    assert!(N != 0);
+    // `const`, not a runtime `assert!`. `N` is a const generic, so the runtime form is
+    // const-folded out of every monomorphisation and enforces nothing in a release build --
+    // and what it is guarding is `exchange_at`'s distinctness precondition, i.e. an `unsafe`
+    // block. In `const` position a `swap_at::<0, _, _>` is a compile error instead.
+    const { assert!(N != 0, "swap_at with N == 0 aliases the two words it swaps") };
     // Same bound as `Stack::exchange` with `n = 0`, `m = N`.
     if (sp as isize) <= too_shallow_for(1 + N) {
         return (
@@ -154,4 +168,86 @@ pub fn swap_at<const N: usize, WIRE: InterpreterTypes, H: ?Sized>(
     // SAFETY: depth checked above, and `N` is non-zero, so the two words are distinct.
     unsafe { context.interpreter.stack.exchange_at(sp, 0, N) };
     (sp, rem)
+}
+
+#[cfg(test)]
+mod bound_tests {
+    use super::*;
+    use crate::{
+        host::DummyHost, interpreter::EthInterpreter, interpreter_types::LoopControl, Interpreter,
+    };
+
+    /// The `*_at` family takes the stack cursor as a plain `usize` argument of a **safe**
+    /// `pub fn`, and turns it into a pointer without an `unsafe` token anywhere in the
+    /// caller. The dispatch loop never hands over a cursor outside the invariant -- that was
+    /// established by execution, 3,269,750 calls with no violation -- but these are
+    /// cross-crate public API, and the room checks are what stands between an out-of-range
+    /// cursor and a write past the 32 KiB stack buffer.
+    ///
+    /// Two shapes must be rejected: the full stack (`BYTE_LIMIT - WORD`, the one an equality
+    /// test did catch) and anything above it (which an equality test does not). The biased
+    /// empty cursor must still be *accepted* by the room check, which is what makes the
+    /// comparison signed rather than unsigned.
+    #[test]
+    fn room_checks_reject_every_out_of_range_cursor() {
+        // `sp` values that must be refused by a push: full, and past full.
+        let refused = [
+            BYTE_LIMIT - WORD,
+            BYTE_LIMIT,
+            BYTE_LIMIT + WORD,
+            BYTE_LIMIT * 2,
+            32800,
+            usize::MAX / 2,
+        ];
+        for sp in refused {
+            let mut interpreter = Interpreter::<EthInterpreter>::default();
+            let mut host = DummyHost;
+            let (out_sp, out_rem) = push0_at(
+                InstructionContext {
+                    interpreter: &mut interpreter,
+                    host: &mut host,
+                },
+                sp,
+                1_000,
+            );
+            assert_eq!(out_sp, sp, "push0_at moved the cursor for sp {sp}");
+            assert_eq!(out_rem, u64::MAX, "push0_at accepted sp {sp}");
+            assert_eq!(
+                interpreter.bytecode.instruction_result(),
+                Some(InstructionResult::StackOverflow),
+                "push0_at did not halt for sp {sp}"
+            );
+
+            let mut interpreter = Interpreter::<EthInterpreter>::default();
+            let mut host = DummyHost;
+            let (out_sp, out_rem) = dup_at::<1, EthInterpreter, DummyHost>(
+                InstructionContext {
+                    interpreter: &mut interpreter,
+                    host: &mut host,
+                },
+                sp,
+                1_000,
+            );
+            assert_eq!(out_sp, sp, "dup_at moved the cursor for sp {sp}");
+            assert_eq!(out_rem, u64::MAX, "dup_at accepted sp {sp}");
+        }
+
+        // And the biased empty cursor is still accepted by the *room* check -- an unsigned
+        // comparison reads it as a huge offset and would refuse every push on an empty
+        // stack, which the whole EVM suite notices at once.
+        let empty_sp = 0usize.wrapping_sub(WORD);
+        let mut interpreter = Interpreter::<EthInterpreter>::default();
+        let mut host = DummyHost;
+        let (out_sp, out_rem) = push0_at(
+            InstructionContext {
+                interpreter: &mut interpreter,
+                host: &mut host,
+            },
+            empty_sp,
+            1_000,
+        );
+        assert_eq!(out_sp, 0, "push0_at refused the empty cursor");
+        assert_eq!(out_rem, 1_000);
+        assert_eq!(interpreter.bytecode.instruction_result(), None);
+    }
 }

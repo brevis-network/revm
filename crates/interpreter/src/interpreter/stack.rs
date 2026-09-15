@@ -34,10 +34,25 @@ pub const BYTE_LIMIT: usize = STACK_LIMIT * WORD;
 /// WORD` as `li 32` plus a signed compare rather than `blez`. Handing it `sp <= 0` directly
 /// was 2.08 M retired instructions on block 24006677, because two operands is the commonest
 /// arity there is.
+/// # The clamp
+///
+/// `(words as isize - 2) * WORD` wraps for a `words` anywhere near `usize::MAX`, and it wraps
+/// *negative*, so the guard built on it accepts a shallow stack for an absurd depth request.
+/// Every in-tree caller passes a literal or a const generic in `1..=17`, so the clamp below
+/// const-folds away at all of them -- but this is a safe `pub const fn`, and the value it
+/// returns is the sole depth precondition of several `unsafe` blocks. Anything past the stack
+/// limit can never be satisfied, so saturating to "reject" is both correct and the only
+/// answer that cannot wrap.
 #[inline(always)]
 pub const fn too_shallow_for(words: usize) -> isize {
     if words >= 2 {
-        (words as isize - 2) * WORD as isize
+        if words > STACK_LIMIT {
+            // `sp` is a byte offset inside a `BYTE_LIMIT`-sized buffer, so `sp > isize::MAX`
+            // is impossible and `(sp as isize) > isize::MAX` is never true: rejected.
+            isize::MAX
+        } else {
+            (words as isize - 2) * WORD as isize
+        }
     } else {
         -1
     }
@@ -632,7 +647,14 @@ impl Stack {
         // `limit` saturates so that an absurd `n` (this is a safe, public method) can not
         // wrap it to a huge value: a saturated limit of 0 only accepts `bl == n * WORD`,
         // which such an `n` can never reach.
-        let need = n * WORD;
+        // `checked_mul`, not `*`: `n` comes from a safe public method, and `n * WORD` wraps
+        // to a *small* product for `n` near `2^59` -- `dup(1 << 59)` gives `need == 0`, which
+        // the compare below accepts on an empty stack and `top_mut().sub(n)` then turns into
+        // a `ptr::sub` of 2^64 bytes. The saturating `limit` below was written to stop
+        // exactly this and cannot, because by then the wrap has already happened.
+        let Some(need) = n.checked_mul(WORD) else {
+            return false;
+        };
         let limit = (BYTE_LIMIT - WORD).saturating_sub(need);
         if bl.wrapping_sub(need) > limit {
             false
@@ -670,8 +692,17 @@ impl Stack {
     pub fn exchange(&mut self, n: usize, m: usize) -> bool {
         assume!(m > 0, "overlapping exchange");
         let bl = self.byte_len();
-        let n_m_index = n + m;
-        if n_m_index * WORD >= bl {
+        // Checked on both operations, for the reason spelled out in `dup`: this is a safe
+        // public method, and both `n + m` and the scaling by `WORD` wrap for large inputs,
+        // which turns the bound below into an accept and `top.sub(n_m_index)` into
+        // out-of-allocation pointer arithmetic.
+        let Some(n_m_index) = n.checked_add(m) else {
+            return false;
+        };
+        let Some(need) = n_m_index.checked_mul(WORD) else {
+            return false;
+        };
+        if need >= bl {
             return false;
         }
         // SAFETY: `n` and `n_m` are checked to be within bounds, and they don't overlap.
@@ -874,11 +905,97 @@ mod tests {
 
     fn run(f: impl FnOnce(&mut Stack)) {
         let mut stack = Stack::new();
-        // Fill capacity with non-zero values
+        // Fill the whole capacity with non-zero values. `write_bytes` counts *elements* of
+        // the pointee type and `base_mut()` is a `*mut U256`, so the count is words, not
+        // bytes: the previous `STACK_LIMIT` poisoned the first 32 words of 1024 and left
+        // every test that relies on reading garbage above them reading zeros instead.
         unsafe {
             core::ptr::write_bytes(stack.base_mut(), 0xff, STACK_LIMIT);
         }
+        debug_assert_eq!(core::mem::size_of::<U256>(), WORD);
         f(&mut stack);
+    }
+
+    /// [`too_shallow_for`] must never return a value that *accepts* a request it cannot
+    /// serve. The hazard is the multiply: `(words as isize - 2) * WORD` wraps negative for
+    /// large `words`, and a negative threshold accepts an empty stack.
+    #[test]
+    fn too_shallow_for_never_wraps_into_an_accept() {
+        // The real domain: the answer is exactly "fewer than `words` words on the stack".
+        for words in 1..=STACK_LIMIT + 1 {
+            for len in 0..=64usize.min(words + 2) {
+                let sp = (len * WORD).wrapping_sub(WORD);
+                assert_eq!(
+                    (sp as isize) <= too_shallow_for(words),
+                    len < words,
+                    "words {words}, len {len}"
+                );
+            }
+        }
+        // Out of domain: every `sp` a real stack can hold must be rejected, including the
+        // full stack, and including the values that used to wrap.
+        for words in [
+            STACK_LIMIT + 1,
+            usize::MAX / WORD,
+            usize::MAX / 2,
+            (1usize << 59) + 2,
+            usize::MAX - 1,
+            usize::MAX,
+        ] {
+            for len in [0usize, 1, 2, 512, STACK_LIMIT] {
+                let sp = (len * WORD).wrapping_sub(WORD);
+                assert!(
+                    (sp as isize) <= too_shallow_for(words),
+                    "accepted words {words} at len {len}"
+                );
+            }
+        }
+    }
+
+    /// `dup` and `exchange` are safe public methods whose guards scale their argument by
+    /// `WORD` before bounding it. `dup(1 << 59)` makes that product *zero*, which the guard
+    /// then accepts on an empty stack, and `top_mut().sub(n)` is pointer arithmetic with a
+    /// 2^64-byte offset.
+    #[test]
+    fn dup_and_exchange_reject_wrapping_depths() {
+        let wrapping = [
+            1usize << 59,
+            (1usize << 59) + 1,
+            usize::MAX / WORD + 1,
+            usize::MAX / 2,
+            usize::MAX - 1,
+            usize::MAX,
+        ];
+        for n in wrapping {
+            run(|stack| {
+                assert!(!stack.dup(n), "dup({n}) accepted on an empty stack");
+                assert!(!stack.exchange(0, n), "exchange(0, {n}) accepted");
+                assert!(!stack.exchange(n, 1), "exchange({n}, 1) accepted");
+                assert!(!stack.exchange(n, n), "exchange({n}, {n}) accepted");
+            });
+            run(|stack| {
+                for i in 0..4 {
+                    assert!(stack.push(U256::from(i)));
+                }
+                let before = stack.len();
+                assert!(!stack.dup(n), "dup({n}) accepted at depth 4");
+                assert!(
+                    !stack.exchange(0, n),
+                    "exchange(0, {n}) accepted at depth 4"
+                );
+                assert_eq!(stack.len(), before);
+            });
+        }
+        // The in-domain answers are unchanged.
+        run(|stack| {
+            assert!(stack.push(U256::from(7)));
+            assert!(stack.dup(1));
+            assert_eq!(stack.peek(0), Ok(U256::from(7)));
+            assert_eq!(stack.len(), 2);
+            assert!(!stack.dup(3));
+            assert!(stack.exchange(0, 1));
+            assert!(!stack.exchange(0, 2));
+        });
     }
 
     /// The biased cursor: what `sp()` returns, what `set_sp` stores, and that the threaded

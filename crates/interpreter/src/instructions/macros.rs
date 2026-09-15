@@ -339,7 +339,11 @@ macro_rules! popn_top_at {
 #[collapse_debuginfo(yes)]
 macro_rules! push_at {
     ($interpreter:expr, $sp:ident, $rem:ident, $x:expr) => {
-        if $sp == $crate::interpreter::BYTE_LIMIT - $crate::interpreter::WORD {
+        // A *signed* `>=`, not `==`: see the note on `dup_at` for both halves of that --
+        // why an equality is a false upper bound, and why the comparison has to be signed
+        // when the cursor is biased. This macro is the room check of eighteen instructions.
+        if ($sp as isize) >= ($crate::interpreter::BYTE_LIMIT - $crate::interpreter::WORD) as isize
+        {
             return (
                 $sp,
                 $crate::poison_at!($interpreter, $rem, $interpreter.halt_overflow()),

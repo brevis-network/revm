@@ -1206,7 +1206,9 @@ impl SharedMemory {
     ///
     /// # Safety
     ///
-    /// `src` must point at four readable `u64`s and `offset + 32` must be in bounds.
+    /// `src` must point at four readable `u64`s, `offset + 32` must be in bounds, and `src`
+    /// must not overlap the 32 bytes at `offset` -- the misaligned arm interleaves its reads
+    /// with its writes. See [`MemoryTr::set_u256_ptr`].
     #[inline(always)]
     pub unsafe fn set_u256_ptr(&mut self, offset: usize, src: *const u64) {
         // SAFETY: see `get_u256` - single-threaded guest, no live borrow, bounds already
@@ -1237,7 +1239,8 @@ impl SharedMemory {
     ///
     /// # Safety
     ///
-    /// `dst` must point at four writable `u64`s and `offset + 32` must be in bounds.
+    /// `dst` must point at four writable `u64`s, `offset + 32` must be in bounds, and `dst`
+    /// must not overlap the 32 bytes at `offset`. See [`MemoryTr::get_u256_to`].
     #[inline(always)]
     pub unsafe fn get_u256_to(&self, offset: usize, dst: *mut u64) {
         // SAFETY: as in `get_u256`.
@@ -1967,5 +1970,80 @@ mod tests {
         assert_eq!(sm1.buffer_ref().len(), 32);
         assert_eq!(sm1.len(), 32);
         assert_eq!(sm1.buffer_ref().get(0..32), Some(&[0_u8; 32] as &[u8]));
+    }
+
+    /// The zero ladder of [`store_be_word_aligned`]/[`load_be_word_aligned`], against the
+    /// only oracle that is independent of it: `U256`'s own big-endian conversion.
+    ///
+    /// Both the rung (which limbs are zero) and the arm (`offset % 8`) are chosen by the
+    /// *stored value* and the *stored offset*, i.e. by EVM code. Before this test, four of
+    /// five arm-specific mutants survived the whole workspace suite -- including transposing
+    /// limbs 1 and 2 in the `l3 == 0` rung, which is the arm every value below `2^192`
+    /// takes, i.e. every address. So the values below are built so that no two limbs are
+    /// equal and no limb is symmetric under byte reversal: a transposition, a dropped
+    /// reversal or a mis-indexed limb all change the bytes.
+    #[test]
+    fn be_word_ladder_matches_u256() {
+        // One representative per rung, plus the boundaries. Limb `i` gets a distinct
+        // non-palindromic byte pattern so any permutation of the four is visible.
+        const L: [u64; 4] = [
+            0x0102_0304_0506_0708,
+            0x1112_1314_1516_1718,
+            0x2122_2324_2526_2728,
+            0x3132_3334_3536_3738,
+        ];
+        let mut values = std::vec![
+            U256::ZERO,
+            U256::from_limbs([L[0], 0, 0, 0]),          // < 2^64
+            U256::from_limbs([L[0], L[1], 0, 0]),       // < 2^128
+            U256::from_limbs([L[0], L[1], L[2], 0]),    // < 2^192, the address rung
+            U256::from_limbs([L[0], L[1], L[2], L[3]]), // full
+            U256::from_limbs([0, L[1], 0, 0]),
+            U256::from_limbs([0, 0, L[2], 0]),
+            U256::from_limbs([0, 0, 0, L[3]]),
+            U256::from_limbs([0, L[1], L[2], 0]),
+            U256::from_limbs([L[0], 0, 0, L[3]]),
+            U256::MAX,
+        ];
+        // A 20-byte address, the shape the `l3 == 0` rung exists for.
+        values.push(U256::from_be_bytes({
+            let mut b = [0u8; 32];
+            for (i, slot) in b[12..].iter_mut().enumerate() {
+                *slot = 0xA0 + i as u8;
+            }
+            b
+        }));
+
+        // Every alignment class of the destination, not just the 8-aligned one: the
+        // misaligned arms are a second implementation of the same function.
+        for offset in 0..16usize {
+            let mut mem = SharedMemory::new();
+            mem.resize(64);
+            for v in &values {
+                let limbs = *v.as_limbs();
+                // SAFETY: `offset + 32 <= 64`, and `limbs` is a live `[u64; 4]` that does
+                // not overlap the memory buffer.
+                unsafe { mem.set_u256_ptr(offset, limbs.as_ptr()) };
+
+                let expected = v.to_be_bytes::<32>();
+                assert_eq!(
+                    &mem.slice_len(offset, 32)[..],
+                    &expected[..],
+                    "store, offset {offset}, value {v:#x}"
+                );
+
+                let mut back = [0u64; 4];
+                // SAFETY: as above.
+                unsafe { mem.get_u256_to(offset, back.as_mut_ptr()) };
+                assert_eq!(
+                    U256::from_limbs(back),
+                    *v,
+                    "load, offset {offset}, value {v:#x}"
+                );
+
+                // And the untyped reader, which is a third implementation of the load.
+                assert_eq!(mem.get_u256(offset), *v, "get_u256, offset {offset}");
+            }
+        }
     }
 }

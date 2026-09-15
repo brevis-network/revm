@@ -295,12 +295,17 @@ impl MemoryGas {
         // written below, so every stored word count is under 2^32 and both `memory_gas`
         // calls lose their saturation. Leave `limit` alone on this path so that bound holds
         // even for the frame that dies here.
-        if new_num >> 32 != 0 {
+        // `> u32::MAX as usize`, not `>> 32 != 0`. The shift is the full width of a 32-bit
+        // `usize`, which is a deny-by-default `arithmetic_overflow` error, so this crate did
+        // not *build* for a 32-bit target -- fail-closed, but it made the whole fork
+        // 64-bit-only for the sake of one comparison. Same single compare against a constant
+        // on a 64-bit target.
+        if new_num > u32::MAX as usize {
             return Some(u64::MAX);
         }
         self.limit = (new_num << 5) - 31;
         // SAFETY(assert_unchecked): the bound established above, on the value read back.
-        unsafe { core::hint::assert_unchecked(words_num >> 32 == 0) };
+        unsafe { core::hint::assert_unchecked(words_num <= u32::MAX as usize) };
         // The cost of the current length used to be memoised in an `expansion_cost`
         // field. It is a pure function of `words_num`, and keeping it made `Gas` 8 bytes
         // wider, which is paid on every `InterpreterAction` / `FrameResult` move rather

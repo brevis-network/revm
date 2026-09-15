@@ -84,14 +84,24 @@ pub trait LegacyBytecode {
 /// bytecode's data pointer. None of them can change while one frame runs -- only the
 /// instruction *pointer* moves -- so `Interpreter::run_plain` reads them once into a local
 /// and hands that local to the two arms that need it.
+/// # Why the fields are private
+///
+/// Every value in here is a memory-safety precondition of a *safe* function:
+/// [`Jumps::absolute_ip_with`] turns `code_base + offset` into the interpreter's instruction
+/// pointer after [`Jumps::is_valid_legacy_jump_with`] has bounded `offset` against
+/// `table_len` alone. With `pub` fields and no constructor, safe code containing no `unsafe`
+/// token at all could build a `JumpCtx` out of three arbitrary values and hand it to
+/// `control::jump_to`, which is how a struct of raw pointers launders an obligation. Building
+/// one now takes [`JumpCtx::new`], which is `unsafe` and states the obligation; reading one
+/// back is still safe, so an out-of-crate [`Jumps`] implementation can answer from it.
 #[derive(Clone, Copy, Debug)]
 pub struct JumpCtx {
     /// Base of the jump-destination bitmap, one bit per byte of the original bytecode.
-    pub table_ptr: *const u8,
+    table_ptr: *const u8,
     /// Number of bits in the bitmap, i.e. the original (unpadded) bytecode length.
-    pub table_len: usize,
+    table_len: usize,
     /// Base of the (padded) bytecode bytes.
-    pub code_base: *const u8,
+    code_base: *const u8,
 }
 
 impl JumpCtx {
@@ -105,6 +115,44 @@ impl JumpCtx {
         table_len: 0,
         code_base: core::ptr::null(),
     };
+
+    /// # Safety
+    ///
+    /// For the whole lifetime of the returned value:
+    ///
+    /// * `table_ptr` must be readable for `table_len.div_ceil(8)` bytes;
+    /// * `code_base` must be readable for **more** than `table_len` bytes -- strictly more,
+    ///   because the dispatch loop reads the byte one past the opcode it halts on, and
+    ///   because the fused `JUMPDEST` arm lands on `target + 1`. This is exactly what
+    ///   `LegacyAnalyzedBytecode`'s constructor asserts (`jump_table.len() == original_len`
+    ///   and `original_len < bytecode.len()`);
+    /// * neither allocation may move or be freed.
+    #[inline]
+    pub const unsafe fn new(table_ptr: *const u8, table_len: usize, code_base: *const u8) -> Self {
+        Self {
+            table_ptr,
+            table_len,
+            code_base,
+        }
+    }
+
+    /// Base of the jump-destination bitmap.
+    #[inline]
+    pub const fn table_ptr(&self) -> *const u8 {
+        self.table_ptr
+    }
+
+    /// Number of bits in the bitmap, i.e. the original (unpadded) bytecode length.
+    #[inline]
+    pub const fn table_len(&self) -> usize {
+        self.table_len
+    }
+
+    /// Base of the (padded) bytecode bytes.
+    #[inline]
+    pub const fn code_base(&self) -> *const u8 {
+        self.code_base
+    }
 }
 
 /// Trait for Interpreter to be able to jump
@@ -255,14 +303,25 @@ pub trait MemoryTr {
     /// The pointer form exists for register pressure, not convenience. Passing a `U256` by
     /// value keeps all four limbs live from the pop to the last byte store, and on RV64
     /// that pushed the allocator into 13 callee-saved registers, whose save/restore ran on
-    /// every `MSTORE`. Reading a limb through a pointer that may alias the destination
-    /// stops LLVM hoisting the next load above the previous stores, so only one limb is
-    /// live at a time.
+    /// every `MSTORE`.
+    ///
+    /// (The original rationale said the limbs stay one-at-a-time live because a possibly
+    /// aliasing load cannot be hoisted. That is stale for [`SharedMemory`]'s override, whose
+    /// 8-aligned arm reads all four limbs up front to test them against zero; the register
+    /// saving comes from not passing the word by value, not from the load ordering.)
     ///
     /// # Safety
     ///
-    /// `src` must point at four readable `u64`s, and `offset + 32` must be within the
-    /// current memory.
+    /// * `src` must point at four readable `u64`s;
+    /// * `offset + 32` must be within the current memory;
+    /// * **`src` must not overlap the 32 bytes at `offset`.** This default implementation
+    ///   reads the whole word before writing anything, and `SharedMemory`'s aligned arm does
+    ///   too, but its misaligned arm interleaves reads with writes -- so under overlap the
+    ///   answer depends on the destination's alignment and matches no implementation of the
+    ///   trait. The interpreter satisfies it structurally: the source is always a stack slot,
+    ///   and the stack and the memory buffer are separate allocations.
+    ///
+    /// [`SharedMemory`]: crate::interpreter::SharedMemory
     #[inline]
     unsafe fn set_u256_ptr(&mut self, offset: usize, src: *const u64) {
         // SAFETY: the caller guarantees four readable limbs.
@@ -275,8 +334,10 @@ pub trait MemoryTr {
     ///
     /// # Safety
     ///
-    /// `dst` must point at four writable `u64`s, and `offset + 32` must be within the
-    /// current memory.
+    /// * `dst` must point at four writable `u64`s;
+    /// * `offset + 32` must be within the current memory;
+    /// * **`dst` must not overlap the 32 bytes at `offset`**, for the reason given on
+    ///   [`MemoryTr::set_u256_ptr`].
     #[inline]
     unsafe fn get_u256_to(&self, offset: usize, dst: *mut u64) {
         let limbs = *self.get_u256(offset).as_limbs();

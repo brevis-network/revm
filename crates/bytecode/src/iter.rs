@@ -16,8 +16,13 @@ impl<'a> BytecodeIterator<'a> {
     /// Creates a new iterator from a bytecode reference.
     #[inline]
     pub fn new(bytecode: &'a Bytecode) -> Self {
+        // The *original* bytes, not the padded buffer. The analysis appends `STOP`s to make
+        // the last instruction complete and to leave the dispatch loop a byte to read past
+        // its halt (see `analyze_legacy`); those are an execution detail and were never
+        // opcodes the contract contains. Iterating the padded buffer reported them, so the
+        // opcode stream of a contract not ending in `STOP` carried trailing phantom `STOP`s.
         let bytes = match bytecode {
-            Bytecode::LegacyAnalyzed(_) => &bytecode.bytecode()[..],
+            Bytecode::LegacyAnalyzed(analyzed) => analyzed.original_byte_slice(),
             Bytecode::Eip7702(_) => &[],
         };
         Self {

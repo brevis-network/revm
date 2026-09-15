@@ -195,7 +195,6 @@ pub fn calldataload_at<WIRE: InterpreterTypes, H: ?Sized>(
     // `usize`, so testing the high limbs directly against zero does the same job for two
     // instructions less.
     let ol = *offset_ptr.as_limbs();
-    let offset = ol[0] as usize;
     // Assemble straight into the stack slot, one limb at a time. Building a `U256` first
     // keeps all four limbs live to the end, which cost this instruction a prologue that
     // saved ten callee-saved registers on every `CALLDATALOAD`.
@@ -227,7 +226,13 @@ pub fn calldataload_at<WIRE: InterpreterTypes, H: ?Sized>(
     // reversals, ~77 more. When the whole 32 bytes are inside the calldata - the case for
     // essentially every `CALLDATALOAD` a compiler emits - the limbs can be assembled
     // straight from the bytes with 8 `lbu` + 7 `slli` + 7 `or` each and neither is needed.
-    if (ol[1] | ol[2] | ol[3]) != 0 || offset >= input_len {
+    // The bound is tested on the `u64` limb, not on `ol[0] as usize`. The two are the same
+    // test only because `usize` is 64 bits here, and the difference fails *open*: on a 32-bit
+    // target `ol[0] as usize` truncates, so `ol[0] = 0x1_0000_0000` would read
+    // `calldata[0..32]` where the saturating form it replaced pushes zero. Nothing in this
+    // crate asserts the width, and the 32-bit no-std job in `ethereum-tests.yml` is gated to
+    // branches this fork never pushes, so the assumption was held by nothing.
+    if (ol[1] | ol[2] | ol[3]) != 0 || ol[0] >= input_len as u64 {
         // SAFETY: `dst` is the four limbs of a live stack word.
         unsafe {
             dst.write(0);
@@ -237,8 +242,16 @@ pub fn calldataload_at<WIRE: InterpreterTypes, H: ?Sized>(
         }
         return (sp, rem);
     }
+    let offset = ol[0] as usize;
     let count = 32.min(input_len - offset);
-    // SAFETY: `offset < input_len` and `count <= input_len - offset`.
+    // SAFETY: `offset < input_len` and `count <= input_len - offset`, so the read stays
+    // inside the calldata. That `base[..input_len]` is itself readable is the premise this
+    // rests on, and it differs per arm: for `CallInput::Bytes` it is the slice's own length;
+    // for `CallInput::SharedBuffer(range)` it is `range.end <= buffer.len()`, an invariant of
+    // the range `prepare_call_inputs` builds -- it comes out of `resize_memory`, which grew
+    // the buffer to cover it -- and *not* of the enum, which carries no bound of its own.
+    // The `usize::MAX..usize::MAX` "no calldata" sentinel is excluded here by its zero
+    // length. The checked `.get(range)` this replaced did not need the premise; this does.
     unsafe { be_word_to(base.add(offset), count, dst) }
     (sp, rem)
 }
@@ -538,9 +551,18 @@ pub fn memory_resize(
     // called on every one of those dispatches, growing or not. The hint pays for MSTORE
     // because 36.5 % of MSTOREs grow and the skipped fill is a whole word each time.
     //
-    // MCOPY was measured with it too, taking the `dst >= src` half (the only sound one --
-    // when `src` is the max, the bytes grown into are the copy's *source* and must read as
-    // zero): a further +652. Not worth the branch.
+    // MCOPY was measured with it too, on the `dst >= src` half: a further +652. Not worth
+    // the branch.
+    //
+    // **`dst >= src` is not the sound predicate**, and the note that used to claim it was is
+    // exactly the kind of warrant a future edit leans on. It is false whenever the two ranges
+    // *overlap*: with `dst >= src` and `src + len > max(old_len, dst)`, part of the copy's
+    // own source lies in memory the grow has just created, which the EVM requires to read as
+    // zero -- executed, `(dst, src, len)` of `(0, 0, 32)`, `(0, 0, 64)`, `(32, 0, 64)` and
+    // `(64, 32, 64)` all leave 32-64 stale bytes where zeros belong, while the
+    // non-overlapping cases agree. The sound predicate is `src + len <= max(old_len, dst)`.
+    // Nothing relies on it today -- MCOPY goes through the zero-filling `resize_memory!` --
+    // but do not reintroduce the hint on a `dst >= src` test.
     resize_memory!(interpreter, memory_offset, len, None);
 
     Some(memory_offset)

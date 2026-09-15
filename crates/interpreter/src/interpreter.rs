@@ -1131,6 +1131,46 @@ fn test_mstore_big_offset_memory_oog() {
     );
 }
 
+/// The `MLOAD` half of [`test_mstore_big_offset_memory_limit_oog`]. Both opcodes lost the
+/// `memory_limit` guard when their expansion moved off `resize_memory!`; only `MSTORE` had a
+/// test, which is why the regression was invisible for one of the two.
+#[test]
+#[cfg(feature = "memory_limit")]
+fn test_mload_big_offset_memory_limit_oog() {
+    use super::*;
+    use crate::{host::DummyHost, instructions::instruction_table};
+    use bytecode::Bytecode;
+    use primitives::Bytes;
+
+    let code = Bytes::from(
+        &[
+            0x61, 0x27, 0x10, // PUSH2 0x2710  (10,000)
+            0x51, // MLOAD
+            0x00, // STOP
+        ][..],
+    );
+    let bytecode = Bytecode::new_raw(code);
+
+    let mut interpreter = Interpreter::<EthInterpreter>::new(
+        SharedMemory::new_with_memory_limit(1000),
+        ExtBytecode::new(bytecode),
+        InputsImpl::default(),
+        false,
+        SpecId::default(),
+        100000,
+    );
+
+    let table = instruction_table::<EthInterpreter, DummyHost>();
+    let mut host = DummyHost;
+    let action = interpreter.run_plain(&table, &mut host);
+
+    assert!(action.is_return());
+    assert_eq!(
+        action.instruction_result(),
+        Some(InstructionResult::MemoryLimitOOG)
+    );
+}
+
 #[test]
 #[cfg(feature = "memory_limit")]
 fn test_mstore_big_offset_memory_limit_oog() {

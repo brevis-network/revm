@@ -139,9 +139,12 @@ pub fn jump_to<const FUSE_JUMPDEST: bool, const PRECHARGED: bool, WIRE: Interpre
     // spending `gas::JUMPDEST`. So charge that gas here and land one byte past it: the
     // dispatch loop never spends a fetch/table-lookup/indirect-call round on it.
     //
-    // Safety of `target + 1`: `analyze_legacy` pads the bytecode so that the last opcode
-    // is a STOP, which for a trailing JUMPDEST means at least one padding byte, so
-    // `target + 1` is still inside the padded bytes.
+    // Safety of `target + 1`: `LegacyAnalyzedBytecode::new` pins
+    // `jump_table.len() == original_len` and `original_len < bytecode.len()`, so any target
+    // the bitmap accepts satisfies `target < original_len < bytecode.len()` and therefore
+    // `target + 1 <= original_len < bytecode.len()`. That holds structurally -- it does not
+    // rest on the table agreeing with the bytes it describes, which matters because the table
+    // reaches this interpreter through a deserializer.
     //
     // Gas equivalence: the only way the fused charge differs from charging it one dispatch
     // later is when it is the charge that runs out of gas, and out-of-gas is an exceptional
@@ -158,11 +161,15 @@ pub fn jump_to<const FUSE_JUMPDEST: bool, const PRECHARGED: bool, WIRE: Interpre
             interpreter.halt_oog();
             return ip;
         }
-        // SAFETY: `is_valid_jump` ensures that `dest` is in bounds, and the analysis pads
-        // the bytecode so that one byte past a trailing JUMPDEST still exists.
+        // SAFETY: `is_valid_legacy_jump_with` (`interpreter_types.rs`, overridden in
+        // `ext_bytecode.rs`) bounds `target` by the jump table's bit length, which
+        // `LegacyAnalyzedBytecode::new` pins to `original_len`; the same constructor requires
+        // `original_len < bytecode.len()`, so `target + 1` is in bounds. (`is_valid_jump` --
+        // the name this comment used to give -- exists in neither repository.)
         interpreter.bytecode.absolute_ip_with(jctx, target + 1)
     } else {
-        // SAFETY: `is_valid_jump` ensures that `dest` is in bounds.
+        // SAFETY: `is_valid_legacy_jump_with` bounds `target` by the jump table's bit
+        // length, which is `original_len`, which is under `bytecode.len()`.
         interpreter.bytecode.absolute_ip_with(jctx, target)
     }
 }
