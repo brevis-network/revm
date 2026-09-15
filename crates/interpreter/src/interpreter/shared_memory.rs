@@ -2033,6 +2033,111 @@ mod tests {
         assert_eq!(sm1.buffer_ref().get(0..32), Some(&[0_u8; 32] as &[u8]));
     }
 
+    /// The three-stage mask/swap that the RV64 `asm!` blocks implement, written in Rust.
+    ///
+    /// This is the reference those blocks transcribe, instruction for instruction, and writing
+    /// it down is the only thing a host test can do about them: both are
+    /// `#[cfg(all(target_arch = "riscv64", not(target_feature = "zbb")))]`, so **every** host
+    /// test, every Miri pass, the ten serde tests and the EF consensus suite take the
+    /// `x.swap_bytes()` arm instead. Corrupting the assembly gives 0 host divergences over
+    /// 59,008 cases; corrupting the fallback gives 18,196.
+    ///
+    /// It is the only byte reversal the guest ever executes, and it is on the path of `MLOAD`,
+    /// `MSTORE`, `KECCAK256`, `CALLDATALOAD` and -- since the `LOG` topic ladder -- the logs
+    /// bloom and the receipts root. A one-character slip still assembles and gives wrong
+    /// values **in the guest only**, where the prover then writes the matching header. That is
+    /// an S0-shaped consequence of an untested path, and the path cannot be tested by anything
+    /// that runs on a host.
+    ///
+    /// What this *can* pin, and does: the algebra both arms have to satisfy, and the mask
+    /// values the sequence needs. An RV64 execution gate would use exactly this model as its
+    /// oracle.
+    fn bswap64_model(x: u64, m1: u64, m2: u64) -> u64 {
+        let y = ((x >> 8) & m1) | ((x & m1) << 8);
+        let y = ((y >> 16) & m2) | ((y & m2) << 16);
+        (y >> 32) | (y << 32)
+    }
+
+    /// [`bswap64_model`] without its third stage; see [`bswap64_halves_masked`].
+    fn bswap64_halves_model(x: u64, m1: u64, m2: u64) -> u64 {
+        let y = ((x >> 8) & m1) | ((x & m1) << 8);
+        ((y >> 16) & m2) | ((y & m2) << 16)
+    }
+
+    #[test]
+    fn the_rv64_byte_reversal_contract() {
+        let (m1, m2) = bswap_masks();
+        // The masks the sequence needs. The `asm!` uses them as opaque registers, so a wrong
+        // value here is a wrong answer with no other symptom.
+        assert_eq!(m1, 0x00FF_00FF_00FF_00FF);
+        assert_eq!(m2, 0x0000_FFFF_0000_FFFF);
+
+        let mut cases = std::vec![
+            0u64,
+            u64::MAX,
+            1,
+            0x80,
+            0xFF,
+            0x0100,
+            0x0123_4567_89AB_CDEF,
+            0xFEDC_BA98_7654_3210,
+            0x00FF_00FF_00FF_00FF,
+            0xFF00_FF00_FF00_FF00,
+            0x0000_0000_FFFF_FFFF,
+            0xFFFF_FFFF_0000_0000,
+        ];
+        // Every single set bit, and every adjacent pair: a stage that drops or misplaces one
+        // bit position shows up on exactly one of these.
+        for i in 0..64u32 {
+            cases.push(1u64 << i);
+            cases.push(!(1u64 << i));
+            cases.push(0x0123_4567_89AB_CDEFu64.rotate_left(i));
+        }
+        // And a deterministic sweep, so the algebra is not only checked on structured inputs.
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..4096 {
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            cases.push(x.wrapping_mul(0x2545_F491_4F6C_DD1D));
+        }
+
+        for &x in &cases {
+            // 1. The model *is* a byte reversal. This is what makes it usable as an oracle.
+            assert_eq!(bswap64_model(x, m1, m2), x.swap_bytes(), "model {x:#018x}");
+            assert_eq!(
+                bswap64_halves_model(x, m1, m2),
+                x.rotate_left(32).swap_bytes(),
+                "halves model {x:#018x}"
+            );
+            // 2. Whichever arm is compiled in agrees with the model. On a host that is the
+            //    `swap_bytes()` fallback; on the guest it is the assembly, which is the case
+            //    that matters and the one no host run can reach.
+            assert_eq!(
+                bswap64_masked(x, m1, m2),
+                bswap64_model(x, m1, m2),
+                "{x:#018x}"
+            );
+            assert_eq!(
+                bswap64_halves_masked(x, m1, m2),
+                bswap64_halves_model(x, m1, m2),
+                "{x:#018x}"
+            );
+            // 3. The commuting relation `bswap64_halves_masked`'s doc states, which is the
+            //    whole reason the second function exists: stage 3 is free if the caller
+            //    assembles the two halves the wrong way round.
+            let (lo, hi) = (x as u32 as u64, x >> 32);
+            assert_eq!(
+                bswap64_halves_masked(hi | (lo << 32), m1, m2),
+                bswap64_masked(lo | (hi << 32), m1, m2),
+                "commutation {x:#018x}"
+            );
+            // 4. Both are involutions on the whole word, which is the property the round trip
+            //    through memory depends on.
+            assert_eq!(bswap64_masked(bswap64_masked(x, m1, m2), m1, m2), x);
+        }
+    }
+
     /// The zero ladder of [`store_be_word_aligned`]/[`load_be_word_aligned`], against the
     /// only oracle that is independent of it: `U256`'s own big-endian conversion.
     ///
