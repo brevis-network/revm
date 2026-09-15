@@ -2064,6 +2064,10 @@ mod tests {
     /// What this *can* pin, and does: the algebra both arms have to satisfy, and the mask
     /// values the sequence needs. An RV64 execution gate would use exactly this model as its
     /// oracle.
+    // `clippy::manual_rotate` would collapse stage 3 into `y.rotate_left(32)`. The point of
+    // this function is to be the assembly written out stage for stage; folding one of the
+    // three away is exactly the edit it exists to make impossible.
+    #[allow(clippy::manual_rotate)]
     fn bswap64_model(x: u64, m1: u64, m2: u64) -> u64 {
         let y = ((x >> 8) & m1) | ((x & m1) << 8);
         let y = ((y >> 16) & m2) | ((y & m2) << 16);
