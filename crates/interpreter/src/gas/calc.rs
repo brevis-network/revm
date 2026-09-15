@@ -610,52 +610,6 @@ pub struct SStoreSpec {
     pub cold_extra: u32,
 }
 
-/// Exhaustiveness tripwire for [`ALL_SPECS`] and the two tables indexed by `spec_id as usize`.
-///
-/// `ALL_SPECS` is a fixed-size array *literal*, not a generated list, and the tables it drives
-/// are indexed by the discriminant with no bound. A 22nd hard fork therefore compiles clean
-/// and panics at run time on its first `SSTORE` -- there is nothing to notice it, and this
-/// module is the only table-driven dispatch in the crate that had no such guard while the
-/// receipts encoder in rsp does.
-///
-/// The `match` below is exhaustive with no `_` arm, so adding a variant is a compile error
-/// here; the `while` then pins that each entry sits at its own discriminant, which is what the
-/// indexing relies on.
-const _: () = {
-    const fn discriminant_is_covered(s: SpecId) -> usize {
-        match s {
-            SpecId::FRONTIER => 0,
-            SpecId::FRONTIER_THAWING => 1,
-            SpecId::HOMESTEAD => 2,
-            SpecId::DAO_FORK => 3,
-            SpecId::TANGERINE => 4,
-            SpecId::SPURIOUS_DRAGON => 5,
-            SpecId::BYZANTIUM => 6,
-            SpecId::CONSTANTINOPLE => 7,
-            SpecId::PETERSBURG => 8,
-            SpecId::ISTANBUL => 9,
-            SpecId::MUIR_GLACIER => 10,
-            SpecId::BERLIN => 11,
-            SpecId::LONDON => 12,
-            SpecId::ARROW_GLACIER => 13,
-            SpecId::GRAY_GLACIER => 14,
-            SpecId::MERGE => 15,
-            SpecId::SHANGHAI => 16,
-            SpecId::CANCUN => 17,
-            SpecId::PRAGUE => 18,
-            SpecId::OSAKA => 19,
-            SpecId::AMSTERDAM => 20,
-        }
-    }
-    assert!(discriminant_is_covered(SpecId::AMSTERDAM) + 1 == ALL_SPECS.len());
-    let mut i = 0;
-    while i < ALL_SPECS.len() {
-        assert!(ALL_SPECS[i] as usize == i);
-        assert!(discriminant_is_covered(ALL_SPECS[i]) == i);
-        i += 1;
-    }
-};
-
 /// Every [`SpecId`], in discriminant order, so the tables below can be indexed by
 /// `spec_id as usize`.
 const ALL_SPECS: [SpecId; 21] = [
@@ -681,6 +635,57 @@ const ALL_SPECS: [SpecId; 21] = [
     SpecId::OSAKA,
     SpecId::AMSTERDAM,
 ];
+
+/// `ALL_SPECS` has to be **every** [`SpecId`], in discriminant order: both tables below are
+/// indexed by `spec_id as usize` with no bound of their own, from a `SpecId` that came out of
+/// the block's configuration.
+///
+/// The `while` loop below catches a reordering or a duplicate. This `match` catches the
+/// likelier mistake, and is the reason any of this exists: this is a fork that gets rebased
+/// on upstream revm, and a hard fork added there leaves both tables 21 rows long. Nothing
+/// about that fails to compile -- `[SpecId; 21]` is still well-formed and the `while` loop
+/// still passes -- and the first `SSTORE` of the new fork then panics on an out-of-bounds
+/// index inside the guest. With no `_` arm here, a new variant is a compile error instead,
+/// which is where the fix belongs.
+///
+/// Compile-time only on purpose: `sstore_at` still indexes with `spec_id as usize`, so this
+/// adds nothing to the guest.
+const fn spec_row(spec: SpecId) -> usize {
+    match spec {
+        SpecId::FRONTIER => 0,
+        SpecId::FRONTIER_THAWING => 1,
+        SpecId::HOMESTEAD => 2,
+        SpecId::DAO_FORK => 3,
+        SpecId::TANGERINE => 4,
+        SpecId::SPURIOUS_DRAGON => 5,
+        SpecId::BYZANTIUM => 6,
+        SpecId::CONSTANTINOPLE => 7,
+        SpecId::PETERSBURG => 8,
+        SpecId::ISTANBUL => 9,
+        SpecId::MUIR_GLACIER => 10,
+        SpecId::BERLIN => 11,
+        SpecId::LONDON => 12,
+        SpecId::ARROW_GLACIER => 13,
+        SpecId::GRAY_GLACIER => 14,
+        SpecId::MERGE => 15,
+        SpecId::SHANGHAI => 16,
+        SpecId::CANCUN => 17,
+        SpecId::PRAGUE => 18,
+        SpecId::OSAKA => 19,
+        SpecId::AMSTERDAM => 20,
+    }
+}
+
+const _: () = {
+    let mut i = 0;
+    while i < ALL_SPECS.len() {
+        assert!(
+            spec_row(ALL_SPECS[i]) == i && ALL_SPECS[i] as usize == i,
+            "ALL_SPECS must be every SpecId, in discriminant order"
+        );
+        i += 1;
+    }
+};
 
 /// A representative `SStoreResult` for each [`SStoreStatus`], in discriminant order.
 /// `1`, `2` and `3` stand in for the distinct non-zero `X`, `Y` and `Z`.
