@@ -1084,6 +1084,42 @@ mod tests {
         assert_eq!(top, U256::from(1));
     }
 
+    /// `Deserialize` is the one constructor that takes a length from untrusted bytes, and the
+    /// `STACK_LIMIT` bound is the only thing between that length and a `copy_nonoverlapping`
+    /// into a fixed 32 KiB inline buffer -- i.e. a wild write, not a wrong answer.
+    ///
+    /// Nothing exercised it: the only serde coverage was a round trip of a *valid* interpreter,
+    /// so replacing the bound with `if false` left the whole suite green, `--features serde`
+    /// included. Deserialisation is also where `SharedMemory`'s cached base pointer went wrong
+    /// twice (`facf121b`, then `9c837406` finishing what it started), so it is worth a test of
+    /// its own here rather than an argument.
+    #[test]
+    #[cfg(feature = "serde")]
+    fn deserialize_rejects_an_over_long_stack() {
+        // Exactly at the limit: accepted, and the length round-trips.
+        let at_limit = std::format!("{{\"data\":[{}]}}", ["\"0x1\""; STACK_LIMIT].join(","));
+        let ok: Stack =
+            serde_json::from_str(&at_limit).expect("STACK_LIMIT words must deserialize");
+        assert_eq!(ok.len(), STACK_LIMIT);
+        assert_eq!(ok.data().len(), STACK_LIMIT);
+
+        // One past it: rejected. Without the bound this is a write past the inline buffer.
+        //
+        // `let`-else rather than `expect_err`, which would `Debug`-format the `Ok` value to
+        // build its panic message -- and `Debug` goes through `data()`, so on the failing run
+        // the guard would perform the very out-of-bounds read it exists to catch. That aborts
+        // the process mid-panic and takes the test name, the message and the rest of the
+        // binary's results with it.
+        let over = std::format!("{{\"data\":[{}]}}", ["\"0x1\""; STACK_LIMIT + 1].join(","));
+        let Err(err) = serde_json::from_str::<Stack>(&over) else {
+            panic!("a stack longer than STACK_LIMIT must be rejected");
+        };
+        assert!(
+            std::format!("{err}").contains("stack size exceeds limit"),
+            "rejected, but not by the bound: {err}"
+        );
+    }
+
     #[test]
     fn stack_clone() {
         // Test cloning an empty stack
