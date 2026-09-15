@@ -111,8 +111,15 @@ pub enum SelfdestructionRevertStatus {
 #[repr(u64)]
 pub enum JournalEntry {
     /// Used to mark account that is warm inside EVM in regard to EIP-2929 AccessList.
-    /// Action: We will add Account to state.
-    /// Revert: we will remove account from state.
+    ///
+    /// Action: we will mark the account warm (loading it into state if it was not there).
+    /// Revert: we will mark the account **cold** again -- see `revert` below, which calls
+    /// `mark_cold()`. It does *not* remove the account from state, and must not start to:
+    /// `JournalInner`'s `AccountCache` holds a `hashbrown` bucket pointer that survives
+    /// `get`/`get_mut` but whose *value* is moved out by a `remove`, and nothing in either
+    /// repository removes from `state` today. This line used to say "we will remove account
+    /// from state", which is the single most likely prompt for the edit that turns that
+    /// into a use-after-move.
     AccountWarmed {
         /// Address of warmed account.
         address: Address,

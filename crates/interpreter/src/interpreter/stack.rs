@@ -11,7 +11,7 @@ pub const STACK_LIMIT: usize = 1024;
 /// Size of one stack word in bytes.
 pub const WORD: usize = core::mem::size_of::<U256>();
 
-/// [`STACK_LIMIT`] expressed in bytes, i.e. the largest legal [`Stack::byte_len`].
+/// [`STACK_LIMIT`] expressed in bytes, i.e. the largest legal `Stack::byte_len`.
 pub const BYTE_LIMIT: usize = STACK_LIMIT * WORD;
 
 /// The largest cursor value that is **too shallow** to hold `words` operands.
@@ -797,6 +797,13 @@ impl Stack {
         }
 
         let n_words = slice.len().div_ceil(32);
+        // Neither of these can overflow, and the reason is not local: `[u8]::len()` is at
+        // most `isize::MAX`, so `n_words * WORD` -- `div_ceil(32)` then times 32 -- is at
+        // most `isize::MAX` rounded up, and `byte_len()` is at most `BYTE_LIMIT`. Stated
+        // because the two `*`/`+` here are the same shape as the three that *did* wrap in
+        // `dup`, `exchange` and `too_shallow_for`, and the only thing separating them is a
+        // property of the argument type.
+        debug_assert!(slice.len() <= isize::MAX as usize);
         let new_byte_len = self.byte_len() + n_words * WORD;
         if new_byte_len > BYTE_LIMIT {
             return false;

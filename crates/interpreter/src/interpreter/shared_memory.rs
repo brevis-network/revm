@@ -476,10 +476,20 @@ pub struct SharedMemory {
     ///
     /// # Invariant (INV-B)
     ///
-    /// `base == buffer.as_ptr().add(my_checkpoint)` whenever `buffer` is `Some`, and
-    /// `base` is null when it is `None`. Unlike a length, there is no safe fallback value:
-    /// every read of `base` turns straight into a load or a store, so it has to be exactly
-    /// right, and the three things that can break it each have to restore it:
+    /// `base == buffer.borrow().as_ptr().add(my_checkpoint)` whenever `buffer` is `Some`, and
+    /// `base` is null when it is `None`.
+    ///
+    /// Note which `as_ptr` that is: `Vec::as_ptr`, the address of the *elements*. This
+    /// formula used to read `buffer.as_ptr()`, which on an `Option<Rc<RefCell<Vec<u8>>>>`
+    /// resolves to `RefCell::as_ptr` and yields a `*mut Vec<u8>` -- the address of the
+    /// header, not the data. A restore site implemented from it literally computes the wrong
+    /// pointer; the restore sites below all get it right.
+    ///
+    /// Unlike a length, there is no safe fallback value: every read of `base` turns straight
+    /// into a load or a store, so it has to be exactly right, and the **six** things that can
+    /// break it each have to restore it. (This sentence said "three" above a five-item list
+    /// for as long as the list existed, and the sixth -- `Clone` -- was created by the commit
+    /// that wrote the list.)
     ///
     /// 1. **`my_checkpoint` changes.** Only ever at construction, so every constructor and
     ///    [`new_child_context`](Self::new_child_context) sets `base` from the buffer.
@@ -509,6 +519,19 @@ pub struct SharedMemory {
     ///    standing there is `check_base` -- which is a panic in a native build and nothing
     ///    at all in the guest. Closing it properly means not exposing the `Rc`, which is an
     ///    upstream API change.
+    ///
+    ///    Not exposing the `Rc` is also not sufficient on its own:
+    ///    `LocalContext.shared_memory_buffer` is a `pub` field, so the trait method is not
+    ///    the only door, and `LocalContextTr::clear`'s doc states no legality window for a
+    ///    call whose body is `unsafe { set_len(0) }` on a buffer live `SharedMemory` values
+    ///    index into.
+    /// 6. **`Clone`.** A clone is a second live handle on the same `Rc` carrying a *byte
+    ///    copy* of `base`, so growing either through the safe [`resize`](Self::resize)
+    ///    reallocates the shared `Vec` and strands the other's pointer, with no restore site
+    ///    anywhere -- and `PartialEq` cannot tell the two apart, because `base` is excluded
+    ///    from it as derived state. In tree the derive exists for `Interpreter: Clone` and
+    ///    the clones are never used side by side with their source, but nothing says so, and
+    ///    unlike case 5 this one needs no external consumer at all.
     ///
     /// Checked on every access in non-guest builds, which is where the test suite runs;
     /// see the `assert_eq!` in [`get_u256`](Self::get_u256) and friends.
@@ -926,8 +949,25 @@ impl SharedMemory {
     }
 
     /// Returns the length of the current memory range.
+    ///
+    /// # The subtraction is unchecked, and the bound it needs is not local
+    ///
+    /// `full_len() >= my_checkpoint` holds for the *active* frame chain only.
+    /// [`free_child_context`](Self::free_child_context) shrinks the buffer to the child
+    /// checkpoint, which is below the checkpoint of every frame deeper than the one being
+    /// freed -- so a retained `SharedMemory` for such a frame answers `len()` with a wrapped
+    /// value (executed: `my_checkpoint = 128`, `full_len() = 64`, `len() == usize::MAX - 63`)
+    /// and `assert_inv_b` still passes, because INV-B is about the *pointer*, not the length.
+    ///
+    /// Nothing in tree retains one: frames are freed innermost-first and a freed frame's
+    /// memory is not touched again. That is an argument spanning four files and it is written
+    /// down here because it is written down nowhere else.
     #[inline]
     pub fn len(&self) -> usize {
+        debug_assert!(
+            self.full_len() >= self.my_checkpoint,
+            "len() on a SharedMemory whose frame has been freed"
+        );
         self.full_len() - self.my_checkpoint
     }
 
@@ -1658,7 +1698,17 @@ unsafe fn zero_tail(p: *mut u8, n: usize) {
     }
 }
 
-/// Grows the shared buffer past its capacity. See [`zero_tail`] for why this is outlined.
+/// Resizes the shared buffer to `new_len`, zeroing any new tail.
+///
+/// **Also the shrink path.** Both [`SharedMemory::resize`] and
+/// [`SharedMemory::resize_written`] route a `new_len` *below* the current length here too,
+/// where `Vec::resize` truncates -- so the name, the `#[cold]` and the `#[inline(never)]` all
+/// describe the growing half only. It is deliberate (a shrink is as rare as a realloc and
+/// neither is worth inlining), but a reader looking for where EVM memory can shrink will not
+/// find it under this name.
+///
+/// It is still true that this is the *only* place the `Vec` can outgrow its capacity, which
+/// is what INV-B case 2 rests on. See [`zero_tail`] for why this is outlined.
 #[cold]
 #[inline(never)]
 fn grow_zeroed(buf: &mut Vec<u8>, new_len: usize) {

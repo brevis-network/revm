@@ -107,6 +107,18 @@ pub unsafe fn copy_address_bytes(dst: *mut u8, src: *const u8) {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct AlignedAddress(pub Address);
 
+// INV-L, in the file's own idiom rather than as an attribute alone.
+//
+// Four accessors across two crates read this type as three words at offsets 0, 8 and 16 --
+// `new`, `from_words` and `same` here, and the `AccountCache` probe in `revm-context` -- and
+// three of them index from the *struct base* rather than through `addr_of!((*p).0)`. All of
+// that is sound exactly while the payload starts at offset 0 of a 24-byte, 8-aligned struct.
+// `#[repr(C, align(8))]` gives that today and nothing was checking it; an added field, or a
+// `repr` change, would silently move the payload.
+const _: () = assert!(core::mem::align_of::<AlignedAddress>() == 8);
+const _: () = assert!(core::mem::size_of::<AlignedAddress>() == 24);
+const _: () = assert!(core::mem::offset_of!(AlignedAddress, 0) == 0);
+
 impl AlignedAddress {
     /// Copies `src` into an 8-aligned slot.
     #[inline(always)]
@@ -233,7 +245,7 @@ const _: () = assert!(core::mem::size_of::<Option<Address>>() == 21);
 /// `Option<Address>` has no niche, so it is a tag byte plus a 20-byte payload, and building
 /// one with `Some(addr)` copies the payload with a `memcpy` libcall for the reason in
 /// [`copy_address_bytes`]. Where the payload sits inside the `Option` is not something this
-/// code may assume, so it asks: [`SOME_ADDRESS_PROBE`] is a `Some`, and the distance from
+/// code may assume, so it asks: `SOME_ADDRESS_PROBE` is a `Some`, and the distance from
 /// its base to the `Address` its `as_ref` yields is the offset.
 ///
 /// The previous spelling asked the same question of the *destination* - store
@@ -302,11 +314,12 @@ pub unsafe fn write_some_b256(dst: *mut Option<B256>, src: *const u8) {
 /// An `Option<Address>` whose payload the compiler knows is 8-aligned.
 ///
 /// [`MaybeB256`]'s story for the 20-byte type. `Option<Address>` is a tag byte plus a
-/// 20-byte align-1 payload, so the payload sits at an odd offset of a 21-byte align-1
-/// object and is never 8-aligned however the enclosing struct is laid out: writing one
-/// takes [`copy_address_bytes`]'s byte path, 20 `lbu`/`sb` pairs, every single time.
-/// `InputsImpl`'s `bytecode_address` did that 20,024 times on mainnet block 24006677, once
-/// per call frame.
+/// 20-byte align-1 payload at offset 1 of a 21-byte align-1 object, so -- as for
+/// [`MaybeB256`], and with the same caveat -- the payload is 8-aligned only when the
+/// `Option`'s own address happens to be 7 mod 8, and writing one takes
+/// [`copy_address_bytes`]'s byte path, 20 `lbu`/`sb` pairs, essentially every time.
+/// `InputsImpl`'s `bytecode_address` did that 20,024 times out of 20,024 on mainnet block
+/// 24006677, once per call frame.
 ///
 /// `#[repr(C)]` plus explicit padding puts the payload at offset 8 of an align-8 struct by
 /// construction, so `copy_address_bytes` sees a destination it can prove and takes its three
@@ -420,12 +433,16 @@ impl MaybeAddress {
 
 /// An `Option<B256>` whose payload the compiler knows is 8-aligned.
 ///
-/// `Option<B256>` is a tag byte plus a 32-byte align-1 payload, so the payload sits at an odd
-/// offset of a 33-byte align-1 object: whatever the enclosing struct's alignment,
-/// `&option.payload` is *never* 8-aligned, and every write of one takes
-/// [`write_some_b256`]'s `memcpy` fallback rather than its four `sd`. Measured on mainnet
-/// block 24006677: `ExtBytecode`'s bytecode hash took the fallback 20,024 times out of
-/// 20,024, once per call frame.
+/// `Option<B256>` is a tag byte plus a 32-byte align-1 payload, so the payload sits at offset
+/// 1 of a 33-byte align-1 object. That makes `&option.payload` 8-aligned exactly when the
+/// `Option`'s own address is 7 mod 8 -- which is to say, essentially never, and never
+/// *predictably*, so every write of one takes [`write_some_b256`]'s `memcpy` fallback rather
+/// than its four `sd`. Measured on mainnet block 24006677: `ExtBytecode`'s bytecode hash took
+/// the fallback 20,024 times out of 20,024, once per call frame.
+///
+/// (That measurement is a site observation, not a law: this doc used to state the payload is
+/// *never* 8-aligned whatever the enclosing struct's alignment, which is not true of the
+/// one-in-eight placement above. The fix below does not depend on which it is.)
 ///
 /// `#[repr(C)]` plus the explicit padding puts the payload at offset 8 of an align-8 struct
 /// by construction, so no probing and no runtime check are needed -- and the "absent" case
@@ -617,21 +634,30 @@ pub fn address_eq(a: &Address, b: &Address) -> bool {
 /// `map.get(FastAddress::new(&addr))` and nothing else changes.
 ///
 /// `Hash` forwards to `Address`'s, so a `FastAddress` query hashes to exactly the bucket an
-/// `Address` key was stored in; `hash_agrees_with_address` pins that.
+/// `Address` key was stored in; `fast_address_finds_what_address_stored` pins that.
+///
+/// (This line used to name `hash_agrees_with_address`, a test that has never existed in
+/// either repository. The property is covered; the name was not.)
 ///
 /// `TAG` carries no information and is never read. It is there so that each call site can ask
 /// for its own monomorphisation of the lookup: hashbrown's `RawTable::find` is generic over
 /// the query type, and with one query type shared between two call sites LLVM decides the
 /// probe is worth outlining - at which point the call costs more than the `memcmp` it saved.
 /// Measured, on mainnet block 24006677: making `JournalInner::transfer_loaded` share
-/// `sload_slot`'s query type outlined `HashMap::get_inner_mut` and cost +1,351,731 retired
+/// `sload_slot_warm`'s query type outlined `HashMap::get_inner_mut` and cost +1,351,731 retired
 /// instructions, against the ~1.3 M of `memcmp` it removed. Distinct tags keep both copies
 /// inline. Pick a tag per call site and say which in a comment there.
 #[derive(Debug, Eq)]
 #[repr(transparent)]
 pub struct FastAddressAt<const TAG: usize>(Address);
 
-/// [`FastAddressAt`] with the tag `JournalInner::sload_slot` uses.
+/// [`FastAddressAt`] with the tag `resolve_account` uses -- the sole user of tag 0 on the
+/// address side, reached from `JournalInner::sload_slot_warm` on a cache miss.
+///
+/// (`de7caf9c` split `sload_slot` into `sload_slot_cold` and the free `sload_slot_warm`, and
+/// this line kept the old name. It was the one stale reference that *misdirected*: the heir
+/// to the name, `sload_slot_cold`, uses tag **4**, so a reader following this sentence landed
+/// on the wrong function for the one invariant the tags have.)
 pub type FastAddress = FastAddressAt<0>;
 
 impl<const TAG: usize> FastAddressAt<TAG> {
@@ -670,7 +696,7 @@ impl<const TAG: usize> core::borrow::Borrow<FastAddressAt<TAG>> for Address {
 /// The [`FastAddress`] story for the storage maps. A storage lookup ends in comparing the
 /// query with the key in the bucket it landed on, and that comparison is `U256: PartialEq`,
 /// so `[u64; 4]` equality, so - for the reason in [`u256_eq`] - a 32-byte `memcmp` libcall.
-/// `JournalInner::sload_slot` alone makes one per SLOAD and per SSTORE.
+/// `JournalInner::sload_slot_warm` alone makes one per SLOAD and per SSTORE.
 ///
 /// Same mechanism as [`FastAddress`]: a `#[repr(transparent)]` wrapper with its own
 /// `PartialEq`, reached through `Borrow`, so `map.get_mut(&key)` becomes

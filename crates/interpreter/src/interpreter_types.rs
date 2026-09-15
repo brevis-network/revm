@@ -366,9 +366,15 @@ pub trait MemoryTr {
     ///
     /// # Correctness
     ///
-    /// This is not `unsafe` - breaking the promise leaves stale EVM memory, not undefined
-    /// behaviour - but it *is* a contract, and `wr_off + wr_len` has to be within
-    /// `new_size`.
+    /// This is a contract, and `wr_off + wr_len` has to be within `new_size`.
+    ///
+    /// It is not `unsafe` only because the *signature* cannot express the hazard, not because
+    /// there is none. Breaking the promise leaves stale EVM memory wherever the tail was
+    /// previously written -- consensus-wrong, but defined. Where the tail is capacity the
+    /// `Vec` has never written, reading it is an **uninitialised read**, which is undefined
+    /// behaviour and was demonstrated under Miri. An implementation that skips the zero fill
+    /// is therefore relying on the caller, and the caller is relying on it to skip no more
+    /// than `wr_off..wr_off + wr_len`.
     #[inline]
     fn resize_written(&mut self, new_size: usize, wr_off: usize, wr_len: usize) -> bool {
         let _ = (wr_off, wr_len);

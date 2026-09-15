@@ -118,7 +118,7 @@ fn jump_inner<const FUSE_JUMPDEST: bool, const PRECHARGED: bool, WIRE: Interpret
     jump_to::<FUSE_JUMPDEST, PRECHARGED, _>(interpreter, target, ip, jctx)
 }
 
-/// [`jump_inner`] once the destination is already a `usize`.
+/// `jump_inner` once the destination is already a `usize`.
 ///
 /// Split out for the fused `PUSH2; JUMP`/`PUSH2; JUMPI` arms, whose destination comes
 /// straight from the two immediate bytes and so is known to fit in a `usize` -- the four

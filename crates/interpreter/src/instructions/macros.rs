@@ -154,7 +154,8 @@ macro_rules! resize_memory {
 ///
 /// Charges exactly the same gas - the memory-expansion cost is consensus and is computed
 /// from the new word count, which is unchanged - and only skips zeroing bytes the
-/// instruction is about to write anyway. See [`MemoryTr::resize_written`].
+/// instruction is about to write anyway. See
+/// [`MemoryTr::resize_written`](crate::interpreter_types::MemoryTr::resize_written).
 #[macro_export]
 #[collapse_debuginfo(yes)]
 macro_rules! resize_memory_written {
@@ -334,7 +335,7 @@ macro_rules! popn_top_at {
     };
 }
 
-/// The threaded form of [`push`]. See [`popn_at`].
+/// The threaded form of [`push`](crate::push). See [`popn_at`].
 #[macro_export]
 #[collapse_debuginfo(yes)]
 macro_rules! push_at {

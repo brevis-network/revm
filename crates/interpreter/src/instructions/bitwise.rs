@@ -357,6 +357,16 @@ fn funnel_right(lo: u64, hi: u64, shift: usize) -> u64 {
 
 /// `x << shift` for `shift < 256`, computed entirely in registers.
 ///
+/// # Precondition
+///
+/// `shift < 256`, and it is **load-bearing**. What this replaced -- ruint's
+/// `overflowing_shl` -- is *total*: any shift of 256 or more gives `ZERO`. This is partial
+/// and silently wrong out of domain, because every arm masks the shift down to its low bits:
+/// `u256_shl(x, 256) == x`, and 320 aliases 64. The `shift < 256` test at both call sites was
+/// redundant against the library call and became the only thing holding this up, codified by
+/// nothing until now. Expect this shape wherever a library call was replaced by hand-written
+/// arithmetic.
+///
 /// `U256`'s `Shl` goes through ruint's `overflowing_shl`, which builds the result with
 /// `array::from_fn` over a *dynamic* limb offset. LLVM cannot keep that in registers: on the
 /// guest target the `SHL` arm of the dispatch loop zeroes a four-word frame buffer, spills
@@ -380,6 +390,7 @@ fn funnel_right(lo: u64, hi: u64, shift: usize) -> u64 {
 /// 24006677: `SHL` 59.6 -> 43.4 retired per dispatch, `SHR` 59.9 -> 39.1.
 #[inline(always)]
 fn u256_shl(x: &U256, shift: usize) -> U256 {
+    debug_assert!(shift < 256, "u256_shl is partial: shift must be < 256");
     let l = x.as_limbs();
     let b = (shift & 63) as u32;
     if shift & 128 != 0 {
@@ -405,9 +416,11 @@ fn u256_shl(x: &U256, shift: usize) -> U256 {
     }
 }
 
-/// `x >> shift` for `shift < 256`, computed entirely in registers. See [`u256_shl`].
+/// `x >> shift` for `shift < 256`, computed entirely in registers. Same precondition, for
+/// the same reason. See [`u256_shl`].
 #[inline(always)]
 fn u256_shr(x: &U256, shift: usize) -> U256 {
+    debug_assert!(shift < 256, "u256_shr is partial: shift must be < 256");
     let l = x.as_limbs();
     let b = (shift & 63) as u32;
     if shift & 128 != 0 {
@@ -564,6 +577,61 @@ mod shift_tests {
             for shift in 0..256usize {
                 assert_eq!(u256_shl(&x, shift), x << shift, "shl {x:?} by {shift}");
                 assert_eq!(u256_shr(&x, shift), x >> shift, "shr {x:?} by {shift}");
+            }
+        }
+    }
+
+    /// The guard the two helpers' partiality now rests on, pinned at the opcode boundary
+    /// rather than at the helper: `as_usize_saturated!` is what carries an out-of-domain
+    /// shift into `SHL`/`SHR`, and the `shift < 256` test is what stops it reaching the
+    /// helpers. The values below are the ones the helpers get *wrong* -- 256 is the identity
+    /// and 320 aliases 64 -- so a lost guard shows up here as `x` or `x << 64` where the EVM
+    /// requires zero.
+    #[test]
+    fn out_of_domain_shifts_are_zero_at_the_opcode() {
+        use crate::{host::DummyHost, InstructionContext, Interpreter};
+        use primitives::hardfork::SpecId;
+
+        let x = U256::from_limbs([0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210, 1, 0xff]);
+        // Every shape that reaches the saturating conversion: exactly 256, an alias of a
+        // legal shift, the 64-bit boundary, and a value with high limbs set.
+        let shifts = [
+            U256::from(256u64),
+            U256::from(257u64),
+            U256::from(320u64),
+            U256::from(u64::MAX),
+            U256::from_limbs([0, 1, 0, 0]),
+            U256::from_limbs([64, 0, 0, 1]),
+            U256::MAX,
+        ];
+        for s in shifts {
+            for (name, op) in [
+                (
+                    "shl",
+                    super::shl::<crate::interpreter::EthInterpreter, DummyHost>
+                        as fn(
+                            InstructionContext<'_, DummyHost, crate::interpreter::EthInterpreter>,
+                        ),
+                ),
+                (
+                    "shr",
+                    super::shr::<crate::interpreter::EthInterpreter, DummyHost>,
+                ),
+            ] {
+                let mut interpreter = Interpreter::default();
+                interpreter.runtime_flag.spec_id = SpecId::CONSTANTINOPLE;
+                assert!(interpreter.stack.push(x));
+                assert!(interpreter.stack.push(s));
+                let mut host = DummyHost;
+                op(InstructionContext {
+                    interpreter: &mut interpreter,
+                    host: &mut host,
+                });
+                assert_eq!(
+                    interpreter.stack.peek(0),
+                    Ok(U256::ZERO),
+                    "{name} by {s:#x} must be zero"
+                );
             }
         }
     }

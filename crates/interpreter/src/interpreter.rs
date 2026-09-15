@@ -35,13 +35,19 @@ use primitives::{hardfork::SpecId, Bytes};
 
 /// Main interpreter structure that contains all components defined in [`InterpreterTypes`].
 ///
-/// `repr(C)` with [`Interpreter::stack`] **last**, on purpose. The EVM stack keeps its
-/// 1024 words inline (see `Stack`), which is 32 KiB; laid out anywhere but at the end it
-/// would push the other fields past the 12-bit displacement a RISC-V load or store can
-/// encode, and every access to the gas counter or the instruction pointer would grow an
-/// address computation. Last, the fields the dispatch loop touches stay within a few
-/// hundred bytes of the base and the stack words are reached as `base + byte_len` with the
-/// field offset folded into the displacement.
+/// `repr(C)` with [`Interpreter::stack`] **last among the fields the dispatch loop
+/// touches**, on purpose. The EVM stack keeps its 1024 words inline (see `Stack`), which is
+/// 32 KiB; laid out anywhere but at the end it would push the other fields past the 12-bit
+/// displacement a RISC-V load or store can encode, and every access to the gas counter or
+/// the instruction pointer would grow an address computation. Placed there, the fields the
+/// dispatch loop touches stay within a few hundred bytes of the base and the stack words are
+/// reached as `base + byte_len` with the field offset folded into the displacement.
+///
+/// **Not literally last**: `gas_stash: u64` follows it, and exactly eight bytes do -- which
+/// is what `da338152`'s `const _` size assertion proves. It is cold (written once per halt,
+/// read once per frame exit), so it is past the stack on purpose too; the three statements
+/// in this file that called `stack` "the last field" were describing the intent, not the
+/// layout.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(C)]
@@ -62,7 +68,8 @@ pub struct Interpreter<WIRE: InterpreterTypes = EthInterpreter> {
     pub extend: WIRE::Extend,
     /// EVM stack for computation.
     ///
-    /// Last field; see the note on the struct.
+    /// Last of the hot fields -- only the cold `gas_stash` follows it. See the note on the
+    /// struct.
     pub stack: WIRE::Stack,
     /// Backup of `gas.remaining` while the gas counter is poisoned by
     /// [`Interpreter::set_action`], or `u64::MAX` when it is not poisoned.
@@ -421,7 +428,8 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
     /// # Instruction table
     ///
     /// `instruction_table` is **ignored**: the arms are generated from
-    /// [`for_each_builtin_instruction`], i.e. from the same list that builds
+    /// [`for_each_builtin_instruction`](crate::for_each_builtin_instruction), i.e. from the
+    /// same list that builds
     /// [`instruction_table`](crate::instructions::instruction_table), so a default table
     /// behaves identically. A table customised through
     /// `EthInstructions::insert_instruction` is *not* honoured here; such a caller has to
@@ -669,6 +677,16 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
             // The two tests can only stay split because `byte_limit` is opaque: LLVM folds
             // `sp < a || sp >= b` back into one range compare whenever it knows both
             // constants, which is exactly what `dup_at` gets.
+            //
+            // The `sp != byte_limit` equality is sound *here* and nowhere else: `sp` is the
+            // loop-local cursor, which starts as `Stack::sp()` and moves by whole words with
+            // each arm checking the bound it crosses, so it is never above `byte_limit`. The
+            // same test in the `*_at` entry points -- reachable from outside the crate with
+            // an arbitrary `sp` -- is a false upper bound, and is a signed `>=` there.
+            //
+            // Both exits below report `StackOverflow` even when it was the *depth* test that
+            // failed, which is pre-existing and is not consensus-visible: both halts are
+            // exceptional, so the frame spends its whole gas limit either way.
             ((6, $n:literal), $_f:expr) => {{
                 ip = unsafe { ip.add(1) };
                 if sp != byte_limit && (sp as isize) > too_shallow_for($n) {

@@ -15,23 +15,11 @@ use primitives::{
 };
 use state::Bytecode;
 
-/// Gets memory input and output ranges for call instructions.
-#[inline]
-pub fn get_memory_input_and_out_ranges(
-    interpreter: &mut Interpreter<impl InterpreterTypes>,
-) -> Option<(Range<usize>, Range<usize>)> {
-    popn!([in_offset, in_len, out_offset, out_len], interpreter, None);
-
-    let mut in_range = resize_memory(interpreter, in_offset, in_len)?;
-
-    if !in_range.is_empty() {
-        let offset = interpreter.memory.local_memory_offset();
-        in_range = in_range.start.saturating_add(offset)..in_range.end.saturating_add(offset);
-    }
-
-    let ret_range = resize_memory(interpreter, out_offset, out_len)?;
-    Some((in_range, ret_range))
-}
+// `get_memory_input_and_out_ranges` used to live here. It lost its last call site when
+// `prepare_call_inputs` absorbed it, and what remained was a second, *independently
+// maintained* copy of the call prologue's range preparation -- the shape where a fix lands in
+// one and not the other. Deleted rather than left `pub` and unreachable; the logic is in
+// `prepare_call_inputs` below.
 
 /// Resize memory and return range of memory.
 /// If `len` is 0 dont touch memory and return `usize::MAX` as offset and 0 as length.
@@ -49,6 +37,15 @@ pub fn resize_memory(
     } else {
         usize::MAX //unrealistic value so we are sure it is not used
     };
+    // `offset + len` is unchecked, and the guest ships with `overflow-checks = false`, so on
+    // that profile it would *wrap* rather than panic. It cannot be reached: on the `len != 0`
+    // arm, `resize_memory!` above has already charged the quadratic expansion gas for
+    // `offset + len` words, which no reachable gas limit covers for anything near
+    // `usize::MAX`; and on the `len == 0` arm the addend is zero, so the `usize::MAX`
+    // sentinel passes through exactly (which `calldataload_at` relies on). That ordering is
+    // the whole argument and it was stated nowhere -- moving this line above the
+    // `resize_memory!`, or adding a caller that skips it, is what breaks it.
+    debug_assert!(offset.checked_add(len).is_some());
     Some(offset..offset + len)
 }
 

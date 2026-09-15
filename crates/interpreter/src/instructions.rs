@@ -94,9 +94,13 @@ pub type InstructionTable<W, H> = [Instruction<W, H>; 256];
 ///   returns the new pair rather than storing either.
 /// * `(4, f)` -- the stack cursor *and the gas counter* threaded, the instruction pointer
 ///   untouched. `f` takes both and returns the new pair. This is most of the hot list: the
-///   arithmetic and bitwise opcodes, `POP`/`PUSH0`/`DUP`/`SWAP`, `MLOAD`/`MSTORE`/`MSTORE8`/
+///   arithmetic and bitwise opcodes, `POP`/`PUSH0`/`SWAP`, `MLOAD`/`MSTORE`/`MSTORE8`/
 ///   `MSIZE`, and the one-word opcodes that ask the host or the block for a value.
 /// * `5` -- touches neither (`JUMPDEST`).
+/// * `(6, N)` -- `DUP1`..`DUP16`, and *not* `(4, dup_at)`: the arm tests the two bounds
+///   itself, against the `byte_limit` the dispatch loop keeps pinned in a register, because
+///   `dup_at` has to fold them into one compare against a materialised constant. It also
+///   carries the fused `DUP2; MSTORE` peek. See the `execute!` rule for the numbers.
 ///
 /// The gas counter rides along on `(2, N)` and `(4, f)` but **not** on `(3, f)`: `JUMP`/
 /// `JUMPI` publish and reload it like tag `0` does. They are the only hot arms that *change*

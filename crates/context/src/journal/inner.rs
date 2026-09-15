@@ -24,7 +24,7 @@ use std::vec::Vec;
 /// contract's - and a `CALL` looks that same account up twice more on its way in, in
 /// [`JournalInner::load_account_mut_optional_code`] and [`JournalInner::transfer_loaded`].
 /// The lookup is not cheap: hashing the address and walking hashbrown's control bytes
-/// measured at ~90 of the ~232 retired instructions `sload_slot` spent per call. On mainnet
+/// measured at ~90 of the ~232 retired instructions `sload_slot_warm` spent per call. On mainnet
 /// block 24006677 the cache answers 74,948 of the 76,821 storage accesses.
 ///
 /// Two ways, most-recent first. One way loses the caller of every frame that touches
@@ -43,10 +43,15 @@ use std::vec::Vec;
 /// # Safety
 ///
 /// A non-zero `ptr` must point at the `Account` stored under `addr` in
-/// [`JournalInner::state`]. A `hashbrown` bucket pointer survives `get`/`get_mut` and
-/// survives a `remove`, but not a growth or an in-place rehash, and neither of those is
-/// observable from outside the table - so the cache must be emptied at every point where the
-/// table can restructure.
+/// [`JournalInner::state`]. A `hashbrown` bucket pointer survives `get`/`get_mut`, but not a
+/// growth or an in-place rehash, and neither of those is observable from outside the table -
+/// so the cache must be emptied at every point where the table can restructure.
+///
+/// A `remove` is **not** in the surviving set, whatever the shape of the table afterwards:
+/// `RawTable::remove` reads the value *out* of its bucket, so a cached pointer to the removed
+/// entry dangles even though every other bucket is where it was. Nothing in either repository
+/// removes from `state` -- which is why this is a precondition and not a clear site -- and
+/// `JournalEntry::AccountWarmed`'s doc has been corrected to stop inviting one.
 ///
 /// Eight places clear, for four different reasons.
 ///
@@ -197,7 +202,7 @@ impl AccountCache {
     /// `Address` is `[u8; 20]` with alignment 1, so a wide read needs a runtime check; where
     /// it fails the caller skips the cache rather than paying twenty byte loads to consult
     /// it. On this guest the check has not been observed to fail - the addresses reaching
-    /// `sload_slot` are 8-aligned - so the fallback is a correctness arm, not a fast path.
+    /// `sload_slot_warm` are 8-aligned - so the fallback is a correctness arm, not a fast path.
     #[inline(always)]
     fn address_words(address: &Address) -> Option<(u64, u64, u32)> {
         let p = address.as_ptr();
@@ -287,7 +292,7 @@ pub struct JournalInner<ENTRY> {
     pub spec: SpecId,
     /// Warm addresses containing both coinbase and current precompiles.
     pub warm_addresses: WarmAddresses,
-    /// The account `sload_slot` resolved last; see [`AccountCache`].
+    /// The account `sload_slot_warm` resolved last; see [`AccountCache`].
     ///
     /// Not serialized: it is a cache over the map above, and a deserialized `JournalInner`
     /// gets a fresh allocation, so it has to start empty.
@@ -588,10 +593,10 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // One lookup site per account, and its own tag for each, because the inline
         // comparison makes the probe big enough for LLVM to want to outline it and the call
         // then costs more than the `memcmp` did. Four sites sharing one tag measured at
-        // +586,870, and sharing `sload_slot`'s tag 0 at +1,351,731; see `FastAddressAt`.
+        // +586,870, and sharing `sload_slot_warm`'s tag 0 at +1,351,731; see `FastAddressAt`.
         // `to` is wanted on all three paths, so it is resolved up front.
         //
-        // A raw pointer for the same reason as in `sload_slot`: the borrow would have to
+        // A raw pointer for the same reason as in `sload_slot_warm`: the borrow would have to
         // cover the `from` lookup and the journal pushes below. Nothing inserts into
         // `self.state` here, so the bucket cannot move.
         //
@@ -635,8 +640,9 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             return None;
         }
 
-        // SAFETY: as above -- resolved out of self.state just now, and nothing has inserted
-        // into it since.
+        // SAFETY: `to_account` was resolved out of `self.state` just now and nothing has
+        // inserted into it since; and `from != to`, which the `from.same(&to)` arm above
+        // returned on. Both clauses of `transfer_nonzero`'s contract, in its order.
         unsafe { self.transfer_nonzero(from, to, balance, to_account) }
     }
 
@@ -651,8 +657,28 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     ///
     /// # Safety
     ///
-    /// `to_account` must point at the account stored under `to` in [`Self::state`], with no
-    /// insert into that map since it was resolved.
+    /// * `to_account` must point at the account stored under `to` in [`Self::state`], with no
+    ///   insert into that map since it was resolved; **and**
+    /// * **`from` must not equal `to`.**
+    ///
+    /// The second clause is the one with teeth, and it was missing. The hazard is not a moved
+    /// bucket -- the `from` lookup below is a lookup, so nothing rehashes -- it is *aliasing*:
+    /// that lookup mints a `&mut Account` through the same table, and if `from` and `to` are
+    /// one key, the retag invalidates `to_account`, which the second half of this function
+    /// then dereferences. Executed under Miri with `-Zmiri-permissive-provenance`: a probe
+    /// satisfying the first clause verbatim with `from == to` reports *"trying to retag from
+    /// &lt;tag&gt; for Unique permission ... but that tag does not exist in the borrow stack"*
+    /// at the `&mut *to_account` below, naming the `get_mut` above as the invalidating retag.
+    ///
+    /// It holds today because [`Self::transfer_loaded`]'s `from.same(&to)` early return sits
+    /// one frame up -- and because [`AlignedAddress::same`] reads exactly the 20 payload
+    /// bytes and never the `repr(C, align(8))` tail padding, so it cannot miss an equality.
+    /// Both of those are a caller's property, which is what makes this a clause and not a
+    /// comment. `8e8355d5` had the guard and the deref in one body, where the compiler
+    /// enforced it; moving the deref across a function boundary turned a compiler-enforced
+    /// fact into a doc sentence, and the sentence left this out.
+    ///
+    /// [`AlignedAddress::same`]: primitives::AlignedAddress::same
     #[inline(never)]
     #[cold]
     unsafe fn transfer_nonzero(
@@ -678,7 +704,9 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         *from_balance = from_balance_decr;
 
         // add balance to
-        // SAFETY: per the contract - the `from` lookup above is a lookup, so no bucket moved.
+        // SAFETY: per the contract, in both its clauses - the `from` lookup above is a
+        // lookup, so no bucket moved, *and* `from != to`, so the `&mut` it minted is not a
+        // second reference to this account and cannot have invalidated this pointer.
         let to_account = unsafe { &mut *to_account };
         Self::touch_account(&mut self.journal, to.0, to_account);
         let to_balance = &mut to_account.info.balance;
@@ -1041,7 +1069,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // cannot see that the two arms are exclusive. Exactly one reference is created from
         // it and nothing touches `self.state` in between.
         //
-        // Consults and fills the same [`AccountCache`] `sload_slot` uses. The two run back to
+        // Consults and fills the same [`AccountCache`] `sload_slot_warm` uses. The two run back to
         // back all the time -- a `CALL` loads the callee here and then every `SLOAD` of the
         // frame it opens asks for the same account -- so a shared cache turns the first of
         // those probes into a tag compare as well. Filling only from the occupied arm: the
@@ -1218,8 +1246,15 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // well, and it is that, not the work itself, that gave this function a 464-byte frame
         // and twelve callee-saved registers to spill; the insert stays in `sload_slot_miss`.
         //
-        // SAFETY: `account` was just derived from a live `&mut Account`, and no other access
-        // to `state` happens before it is used.
+        // SAFETY, in both arms -- the note this replaced covered only the miss:
+        //   * miss: `account` was just derived from a live `&mut Account` out of `state`, and
+        //     no other access to `state` happens before it is used.
+        //   * hit: `account` is an `AccountCache` bucket pointer, whose contract is that a
+        //     non-zero entry points at the `Account` stored under that address in `state`;
+        //     the cache is emptied at every point where the table can restructure, and the
+        //     `state` borrow this function holds is what keeps it from restructuring here.
+        // The cached arm is the one that runs 74,948 times in 76,821, and it is the one the
+        // comment did not describe.
         // Keyed by `FastU256At` so the bucket comparison is limb-wise rather than a 32-byte
         // `memcmp` libcall; see there. Tag 1, and this is its only call site.
         if let Some(slot) = unsafe {
@@ -1554,7 +1589,9 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
 /// that follows, and with both in one body the caller saves the union of them on every call.
 ///
 /// Keyed by `FastAddress` - tag 0 - so the bucket comparison is word-wise; see there. This is
-/// the only site that uses tag 0: a second caller of one instantiation pushes
+/// the only site that uses tag 0 *of `FastAddressAt`* -- `FastU256`'s tag 0 is a different
+/// type with its own sole user, in `sload_slot_warm`: a second caller of one instantiation
+/// pushes
 /// `RawTable::find` past the inliner and it outlines, which costs more than it saves.
 #[inline(never)]
 #[cold]
@@ -1653,10 +1690,15 @@ fn sload_slot_warm(
         return core::ptr::null_mut();
     }
 
-    // SAFETY: `account` was just derived from a live `&mut Account`, and no other access to
-    // `state` happens before it is used.
+    // SAFETY, in both arms: on a cache miss `account` was just derived from a live
+    // `&mut Account` out of `state`; on a hit it is an `AccountCache` bucket pointer, whose
+    // contract is that a non-zero entry points at the `Account` stored under that address in
+    // `state`, and the cache is emptied wherever the table can restructure. No other access
+    // to `state` happens before it is used either way.
     // Keyed by `FastU256` - tag 0 - so the bucket comparison is limb-wise rather than a
-    // 32-byte `memcmp` libcall; see there. The only site that uses tag 0.
+    // 32-byte `memcmp` libcall; see there. The only site that uses tag 0 *of `FastU256At`*;
+    // `FastAddressAt`'s tag 0 is a separate instantiation with its own sole user,
+    // `resolve_account`.
     let Some(slot) = (unsafe { (*account).storage.get_mut(primitives::FastU256::new(key)) }) else {
         return core::ptr::null_mut();
     };
@@ -1672,6 +1714,19 @@ fn sload_slot_warm(
 /// The struct is three `U256`s, and the plain literal is a 96-byte copy that LLVM lowers to a
 /// `memcpy` libcall (~74 retired instructions) rather than the twelve `ld`/`sd` pairs it
 /// actually is. `SSTORE` runs ~15 K times per mainnet block.
+/// The exhaustive-initialisation check [`sstore_result`]'s `MaybeUninit` writer traded away;
+/// see the same tripwire on `ExtBytecode`. `SStoreResult` lives in another crate, so an added
+/// field would land here with no local diff at all.
+#[allow(dead_code)]
+fn assert_sstore_result_fields_are_all_written(v: SStoreResult) {
+    let SStoreResult {
+        original_value,
+        present_value,
+        new_value,
+    } = v;
+    let _ = (original_value, present_value, new_value);
+}
+
 #[inline(always)]
 fn sstore_result(
     original_value: StorageValue,

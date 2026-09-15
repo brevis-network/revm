@@ -153,6 +153,17 @@ impl Gas {
     /// Records an explicit cost.
     ///
     /// Returns `false` if the gas limit is exceeded.
+    ///
+    /// # The poison interacts with this
+    ///
+    /// `checked_sub` means a *poisoned* counter (`remaining == u64::MAX`, written by
+    /// [`Interpreter::set_action`](crate::Interpreter::set_action)) **accepts** a cost of
+    /// `u64::MAX` -- which is exactly what [`MemoryGas::record_new_len`] returns for a word
+    /// count at or above `2^32`. The two only fail to meet because `set_action` poisons on
+    /// frame *exit*, after the last instruction has run, so no instruction ever charges
+    /// against a poisoned counter. That coupling is load-bearing and lives in a different
+    /// file, so it is restated here: an edit that poisons earlier, or that makes an
+    /// instruction charge after a halt, turns this into a free `u64::MAX` of gas.
     #[inline]
     #[must_use = "prefer using `gas!` instead to return an out-of-gas error on failure"]
     pub fn record_cost(&mut self, cost: u64) -> bool {
@@ -227,6 +238,7 @@ pub enum MemoryExtensionResult {
 /// It allows us to split gas accounting from memory structure.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "MemoryGasDe"))]
 pub struct MemoryGas {
     /// The current memory length, held as `words_num * 32 - 31` (and `0` when no memory has
     /// been allocated) rather than as the word count itself.
@@ -255,6 +267,48 @@ pub struct MemoryGas {
     limit: usize,
 }
 
+/// What a [`MemoryGas`] deserialises through, so that `limit`'s shape is checked.
+///
+/// `limit` is not a free `usize`: it is `words_num * 32 - 31`, or `0` for "no memory". Every
+/// reader depends on that -- [`MemoryGas::words_num`] inverts it as `(limit + 31) / 32` and
+/// [`MemoryGas::word_limit`] hands it straight to a `>=` that decides whether a word access
+/// needs charging. A derived `Deserialize` accepted any `usize`, so a wire value of, say,
+/// `usize::MAX` reported a word count that no charge had ever been paid for, and one of
+/// `32` reported `words_num() == 1` while claiming a limit no expansion could have produced.
+///
+/// Not reachable from the rsp guest, which deserialises no interpreter type; this is
+/// revm-as-a-library surface. The check is one modulo on a path that runs once per resumed
+/// frame.
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+struct MemoryGasDe {
+    limit: usize,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<MemoryGasDe> for MemoryGas {
+    type Error = &'static str;
+
+    fn try_from(de: MemoryGasDe) -> Result<Self, Self::Error> {
+        if de.limit != 0 && de.limit % 32 != 1 {
+            return Err("MemoryGas::limit must be 0 or words_num * 32 - 31");
+        }
+        // The second half of the shape, and the one with teeth: `record_new_len` refuses to
+        // store a word count at or above `2^32` precisely so that the `assert_unchecked` on
+        // the value read back holds. A deserialised `limit` bypasses that write, so the same
+        // bound has to be restated here or the hint becomes a lie about wire data.
+        let words = de
+            .limit
+            .checked_add(31)
+            .map(|n| n >> 5)
+            .unwrap_or(usize::MAX);
+        if words > u32::MAX as usize {
+            return Err("MemoryGas::limit implies a word count at or above 2^32");
+        }
+        Ok(Self { limit: de.limit })
+    }
+}
+
 impl MemoryGas {
     /// Creates a new `MemoryGas` instance with zero memory allocation.
     #[inline]
@@ -280,6 +334,21 @@ impl MemoryGas {
 
     /// Records a new memory length and calculates additional cost if memory is expanded.
     /// Returns the additional gas cost required, or None if no expansion is needed.
+    ///
+    /// # It commits before the charge can be refused
+    ///
+    /// `self.limit` is written below and the caller only then feeds the returned cost to
+    /// [`Gas::record_cost`], which may refuse it. So on an out-of-gas expansion the field
+    /// says the memory grew and the gas says it did not.
+    ///
+    /// That is safe because the refusal is **terminal**, which was confirmed by two
+    /// independent traces rather than assumed: every caller returns immediately on a refusal,
+    /// the halt is exceptional so the frame spends its whole limit, and
+    /// [`Interpreter::clear`](crate::Interpreter::clear) resets `*gas` when a pooled frame is
+    /// reused. Nothing reads the stale limit. An edit that lets execution continue past a
+    /// refused memory charge -- a non-exceptional halt here, or a caller that recovers --
+    /// makes the stale limit consensus-visible, because the next word access would then be
+    /// free.
     #[inline]
     pub fn record_new_len(&mut self, new_num: usize) -> Option<u64> {
         let words_num = self.words_num();
@@ -314,5 +383,49 @@ impl MemoryGas {
         let old_cost = crate::gas::calc::memory_gas(words_num);
         // Safe to subtract because `memory_gas` is monotonic and `new_num > words_num`.
         Some(crate::gas::calc::memory_gas(new_num) - old_cost)
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod memory_gas_serde_tests {
+    use super::MemoryGas;
+
+    /// `limit` is `words_num * 32 - 31`, not a free `usize`, and a derived `Deserialize`
+    /// accepted any value. Round-tripping must still work; a shape no expansion could have
+    /// produced must not.
+    #[test]
+    fn memory_gas_rejects_a_limit_no_expansion_could_produce() {
+        for words in [0usize, 1, 2, 3, 1024, 1 << 20] {
+            let mut g = MemoryGas::new();
+            if words > 0 {
+                let _ = g.record_new_len(words);
+            }
+            assert_eq!(g.words_num(), words);
+            let json = serde_json::to_string(&g).unwrap();
+            let back: MemoryGas = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, g);
+            assert_eq!(back.words_num(), words);
+        }
+        // Wrong residue: `limit` is `words_num * 32 - 31`, so `limit % 32 == 1` or zero.
+        // (33 is *legal* -- it is two words -- which is why the residue is the test and not
+        // the parity.)
+        for bad in [2usize, 32, 64, usize::MAX, usize::MAX - 1] {
+            let json = std::format!("{{\"limit\":{bad}}}");
+            assert!(
+                serde_json::from_str::<MemoryGas>(&json).is_err(),
+                "accepted limit {bad}"
+            );
+        }
+        // Right residue, but a word count at or above `2^32` -- the bound
+        // `record_new_len`'s `assert_unchecked` reads back.
+        let over = (1usize << 32) * 32 - 31;
+        assert!(
+            serde_json::from_str::<MemoryGas>(&std::format!("{{\"limit\":{over}}}")).is_err(),
+            "accepted a limit implying 2^32 words"
+        );
+        let just_under = ((1usize << 32) - 1) * 32 - 31;
+        assert!(
+            serde_json::from_str::<MemoryGas>(&std::format!("{{\"limit\":{just_under}}}")).is_ok()
+        );
     }
 }
