@@ -1949,7 +1949,18 @@ mod tests {
             }
         }
         // The walk has to have hit the two interesting events, or it proves nothing.
-        assert!(reallocs > 5, "only {reallocs} reallocations");
+        //
+        // `nested` is deterministic. `reallocs` is not: it counts the times the buffer
+        // actually *moved*, and whether a `Vec` growth moves the block is the allocator's
+        // choice -- a CI runner returned 5 here where this machine returns more, which failed
+        // a `> 5` threshold tuned to one allocator. What the walk proves does not rest on the
+        // count: `assert_inv_b` and the model comparison run on every one of the 2000 steps,
+        // so one move is enough to catch a stale base, and dropping either the
+        // `free_child_context` or the `grow_zeroed` refresh still fails it.
+        assert!(
+            reallocs > 0,
+            "the buffer never moved; the walk proves nothing"
+        );
         assert!(nested > 20, "only {nested} child contexts");
     }
 
