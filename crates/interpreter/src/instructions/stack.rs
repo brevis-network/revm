@@ -142,10 +142,9 @@ pub fn swap_at<const N: usize, WIRE: InterpreterTypes, H: ?Sized>(
     rem: u64,
 ) -> (usize, u64) {
     //gas!(context.interpreter, gas::VERYLOW);
-    // `const`, not a runtime `assert!`. `N` is a const generic, so the runtime form is
-    // const-folded out of every monomorphisation and enforces nothing in a release build --
-    // and what it is guarding is `exchange_at`'s distinctness precondition, i.e. an `unsafe`
-    // block. In `const` position a `swap_at::<0, _, _>` is a compile error instead.
+    // `const`, not a runtime `assert!`: `N` is a const generic, so the runtime form folds
+    // away in release while guarding `exchange_at`'s distinctness precondition. In `const`
+    // position `swap_at::<0, _, _>` is a compile error instead.
     const { assert!(N != 0, "swap_at with N == 0 aliases the two words it swaps") };
     // Same bound as `Stack::exchange` with `n = 0`, `m = N`.
     if (sp as isize) <= too_shallow_for(1 + N) {
@@ -173,15 +172,11 @@ mod bound_tests {
         Interpreter,
     };
 
-    /// The `*_at` family takes the stack cursor as a plain `usize` argument of a **safe**
-    /// `pub fn`, and turns it into a pointer without an `unsafe` token anywhere in the
-    /// caller. The dispatch loop never hands over a cursor outside the invariant -- that was
-    /// established by execution, 3,269,750 calls with no violation -- but these are
-    /// cross-crate public API, and the room checks are what stands between an out-of-range
-    /// cursor and a write past the 32 KiB stack buffer.
-    ///
-    /// Three shapes must be rejected -- the full stack, anything above it, and everything
-    /// from `2^63` up -- while the biased empty cursor is still accepted.
+    /// The `*_at` family turns a plain `usize` into a pointer with no `unsafe` token in the
+    /// caller, and is cross-crate public API, so the room checks are what stands between an
+    /// out-of-range cursor and a write past the 32 KiB buffer. Three shapes must be rejected
+    /// -- the full stack, anything above it, everything from `2^63` up -- while the biased
+    /// empty cursor is still accepted.
     #[test]
     fn room_checks_reject_every_out_of_range_cursor() {
         // Full, past full, and the negative-as-`isize` half that the signed compare let in.
@@ -232,9 +227,8 @@ mod bound_tests {
             assert_eq!(out_rem, u64::MAX, "dup_at accepted sp {sp}");
         }
 
-        // And the biased empty cursor is still accepted by the *room* check -- an unsigned
-        // comparison on `sp` itself reads it as a huge offset and would refuse every push on
-        // an empty stack, which the whole EVM suite notices at once.
+        // The biased empty cursor is still accepted: an unsigned compare on `sp` itself
+        // would read it as a huge offset and refuse every push on an empty stack.
         let empty_sp = 0usize.wrapping_sub(WORD);
         let mut interpreter = Interpreter::<EthInterpreter>::default();
         let mut host = DummyHost;

@@ -7,16 +7,11 @@ use std::vec::Vec;
 /// The bytecode returned by [`analyze_legacy`] always has **at least one readable byte past
 /// the terminating `STOP`**.
 ///
-/// `Interpreter::run_plain` reads the opcode at the instruction pointer at the top of every
-/// iteration, *before* any arm tests the poisoned gas counter that ends the loop. Executing
-/// the analysis's trailing `STOP` leaves the pointer one past that `STOP`, and the next
-/// iteration dereferences it. Without this byte that read is out of the allocation -- it is
-/// reached by any contract whose code runs to the end, so it is not an edge case.
-///
-/// Paying for it here rather than in the loop is deliberate: the alternative is a bounds or
-/// poison test on every single dispatch, which is the test the loop was restructured to
-/// remove. It is not free at analysis time, though: the returned buffer is always longer
-/// than the input, so `analyze_legacy` has no zero-copy arm.
+/// `Interpreter::run_plain` reads the opcode *before* any arm tests the poison that ends the
+/// loop, so executing the trailing `STOP` leaves the pointer one past it and the next
+/// iteration dereferences that -- reached by any contract whose code runs to the end. The
+/// alternative is a bounds test on every dispatch. The cost is that the buffer is always
+/// longer than the input, so there is no zero-copy arm.
 pub const GUARD_BYTES: usize = 1;
 
 /// Analyzes the bytecode for use in [`LegacyAnalyzedBytecode`](crate::LegacyAnalyzedBytecode).
@@ -27,16 +22,15 @@ pub const GUARD_BYTES: usize = 1;
 ///
 /// # Post-conditions
 ///
-/// Every one of these is relied on somewhere else, and
+/// Each is relied on elsewhere, and
 /// [`LegacyAnalyzedBytecode::new`](crate::LegacyAnalyzedBytecode::new) restates the first two
-/// as assertions because it is also reachable from a wire format:
+/// as assertions, being reachable from a wire format:
 ///
-/// 1. `jump_table.len() == bytecode.len()` of the **input**, i.e. the returned table has one
-///    bit per original byte and no more. A jump destination is therefore always inside the
-///    original code, which is what bounds the `absolute_ip` the interpreter builds from it.
-/// 2. the returned buffer is strictly longer than the input, by [`GUARD_BYTES`] at minimum.
-/// 3. the last opcode of the returned buffer is a `STOP`, and no `PUSH` immediate is
-///    truncated -- this is what lets `PUSH*` skip its bounds check.
+/// 1. one table bit per byte of the **input**, so a jump destination is always inside the
+///    original code -- which is what bounds the interpreter's `absolute_ip`;
+/// 2. the returned buffer is longer than the input, by [`GUARD_BYTES`] at minimum;
+/// 3. its last opcode is a `STOP` and no `PUSH` immediate is truncated, which is what lets
+///    `PUSH*` skip its bounds check.
 pub fn analyze_legacy(bytecode: Bytes) -> (JumpTable, Bytes) {
     if bytecode.is_empty() {
         // `STOP` plus the guard byte: the interpreter reads one past the `STOP` it halts on.
@@ -48,10 +42,8 @@ pub fn analyze_legacy(bytecode: Bytes) -> (JumpTable, Bytes) {
 
     let len = bytecode.len();
     let mut jumps: BitVec<u8> = bitvec![u8, Lsb0; 0; len];
-    // Indices, not pointers. The `PUSH` skip below steps past the end of the code by up to
-    // 32 bytes on a truncated immediate, and `<*const u8>::add` requires the result to stay
-    // inside the allocation (or one past it), so the pointer form was out-of-allocation
-    // pointer arithmetic on every bytecode ending in a truncated `PUSH`. `i` is bounded by
+    // Indices, not pointers: the `PUSH` skip steps up to 32 bytes past the end on a
+    // truncated immediate, which `<*const u8>::add` does not allow. `i` is bounded by
     // `len + 32`, so it cannot overflow either.
     let mut i = 0usize;
     let mut opcode = 0;
@@ -212,8 +204,7 @@ mod tests {
         assert!(!jump_table.is_valid(5)); // PUSH4
     }
 
-    /// Both ownership arms are on the consensus path, so they must agree byte for byte,
-    /// including the zero fill over whatever the reused allocation held.
+    /// Both ownership arms are on the consensus path, so they must agree byte for byte.
     #[test]
     fn both_padding_arms_produce_the_same_buffer() {
         let cases: &[&[u8]] = &[
@@ -236,8 +227,7 @@ mod tests {
             let _keep_alive = shared.clone();
             let (t_copy, b_copy) = analyze_legacy(shared);
 
-            // A slice of a larger unique allocation: the result must still be the slice and
-            // nothing around it.
+            // A slice of a larger unique allocation: the result is the slice, nothing more.
             let mut backing = std::vec![0xaa_u8; 8];
             backing.extend_from_slice(case);
             backing.extend_from_slice(&[0xbb; 8]);

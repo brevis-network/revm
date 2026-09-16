@@ -636,20 +636,11 @@ const ALL_SPECS: [SpecId; 21] = [
     SpecId::AMSTERDAM,
 ];
 
-/// `ALL_SPECS` has to be **every** [`SpecId`], in discriminant order: both tables below are
-/// indexed by `spec_id as usize` with no bound of their own, from a `SpecId` that came out of
-/// the block's configuration.
-///
-/// The `while` loop below catches a reordering or a duplicate. This `match` catches the
-/// likelier mistake, and is the reason any of this exists: this is a fork that gets rebased
-/// on upstream revm, and a hard fork added there leaves both tables 21 rows long. Nothing
-/// about that fails to compile -- `[SpecId; 21]` is still well-formed and the `while` loop
-/// still passes -- and the first `SSTORE` of the new fork then panics on an out-of-bounds
-/// index inside the guest. With no `_` arm here, a new variant is a compile error instead,
-/// which is where the fix belongs.
-///
-/// Compile-time only on purpose: `sstore_at` still indexes with `spec_id as usize`, so this
-/// adds nothing to the guest.
+/// `ALL_SPECS` has to be **every** [`SpecId`] in discriminant order: both tables below are
+/// indexed by `spec_id as usize` with no bound of their own. The `while` loop catches a
+/// reordering; this exhaustive `match` catches the one it cannot -- a hard fork added
+/// upstream leaves the tables 21 rows long and well-formed, and the first `SSTORE` under the
+/// new revision indexes out of bounds in the guest. Compile-time only.
 const fn spec_row(spec: SpecId) -> usize {
     match spec {
         SpecId::FRONTIER => 0,

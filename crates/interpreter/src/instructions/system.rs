@@ -242,14 +242,11 @@ pub fn calldataload_at<WIRE: InterpreterTypes, H: ?Sized>(
     }
     let offset = ol[0] as usize;
     let count = 32.min(input_len - offset);
-    // SAFETY: `offset < input_len` and `count <= input_len - offset`, so the read stays
-    // inside the calldata. That `base[..input_len]` is itself readable is the premise this
-    // rests on, and it differs per arm: for `CallInput::Bytes` it is the slice's own length;
-    // for `CallInput::SharedBuffer(range)` it is `range.end <= buffer.len()`, an invariant of
-    // the range `prepare_call_inputs` builds -- it comes out of `resize_memory`, which grew
-    // the buffer to cover it -- and *not* of the enum, which carries no bound of its own.
-    // The `usize::MAX..usize::MAX` "no calldata" sentinel is excluded here by its zero
-    // length.
+    // SAFETY: `offset < input_len` and `count <= input_len - offset`. The premise is that
+    // `base[..input_len]` is readable, which differs per arm: for `CallInput::Bytes` it is
+    // the slice's own length; for `SharedBuffer(range)` it is `range.end <= buffer.len()`, an
+    // invariant of the range `prepare_call_inputs` builds out of `resize_memory` and *not* of
+    // the enum. The `usize::MAX..usize::MAX` sentinel is excluded by its zero length.
     unsafe { be_word_to(base.add(offset), count, dst) }
     (sp, rem)
 }
@@ -549,17 +546,10 @@ pub fn memory_resize(
     // called on every one of those dispatches, growing or not. The hint pays for MSTORE
     // because 36.5 % of MSTOREs grow and the skipped fill is a whole word each time.
     //
-    // MCOPY was measured with it too, on the `dst >= src` half: a further +652. Not worth
-    // the branch.
-    //
-    // **`dst >= src` is not the sound predicate.** It is false whenever the two ranges
-    // *overlap*: with `dst >= src` and `src + len > max(old_len, dst)`, part of the copy's
-    // own source lies in memory the grow has just created, which the EVM requires to read as
-    // zero -- executed, `(dst, src, len)` of `(0, 0, 32)`, `(0, 0, 64)`, `(32, 0, 64)` and
-    // `(64, 32, 64)` all leave 32-64 stale bytes where zeros belong, while the
-    // non-overlapping cases agree. The sound predicate is `src + len <= max(old_len, dst)`.
-    // Nothing relies on it today -- MCOPY goes through the zero-filling `resize_memory!` --
-    // but do not reintroduce the hint on a `dst >= src` test.
+    // MCOPY was measured on the `dst >= src` half too: a further +652, not worth the branch.
+    // And **`dst >= src` is not the sound predicate** anyway -- under overlap, part of the
+    // copy's source lies in memory the grow just created, which must read as zero. The sound
+    // one is `src + len <= max(old_len, dst)`; do not reintroduce the hint on `dst >= src`.
     resize_memory!(interpreter, memory_offset, len, None);
 
     Some(memory_offset)

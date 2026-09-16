@@ -51,12 +51,10 @@ fn external_growth_is_caught_before_descending_into_a_child() {
     let mut m = SharedMemory::new_with_buffer(buf.clone());
     m.resize(32);
 
-    // Move the buffer through the other handle, leaving `m`'s cached `base` dangling.
-    //
-    // By swapping the allocation, not by `reserve`: `reserve` may realloc *in place*, and
-    // when it does the probe tests nothing. It grew in place on CI's stable runner while
-    // moving on 1.88 and nightly in the same run. `mem::replace` allocates the new buffer
-    // while the old one is still live, so the two addresses cannot coincide.
+    // Move the buffer through the other handle, leaving `m`'s cached `base` dangling. By
+    // swapping the allocation, not by `reserve`, which may realloc in place and then test
+    // nothing: `mem::replace` allocates while the old buffer is still live, so the two
+    // addresses cannot coincide.
     let old = core::mem::replace(&mut *buf.borrow_mut(), vec![0u8; 1 << 16]);
     assert_ne!(buf.borrow().as_ptr(), old.as_ptr());
 

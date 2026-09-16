@@ -41,26 +41,18 @@ pub use alloy_primitives::{
     Bytes, FixedBytes, Log, LogData, TxKind, B256, I128, I256, U128, U256,
 };
 
-/// Declares the exhaustive-initialisation check that a `MaybeUninit` writer trades away.
+/// Declares the exhaustive-initialisation check that a `MaybeUninit` writer trades away: a
+/// constructor writing its fields through `addr_of_mut!` is not checked for completeness, so
+/// adding one compiles clean and leaves it uninitialised.
 ///
-/// A constructor writing its fields through `addr_of_mut!` is no longer checked for
-/// completeness: adding a field compiles clean and leaves it uninitialised, and Miri then
-/// reports *"encountered uninitialized memory"*. An exhaustive destructuring is a compile
-/// error the moment a field is added.
-///
-/// # Usage
+/// Generic parameters go in square brackets, ahead of the value type:
 ///
 /// ```
-/// use revm_primitives::assert_all_fields_written;
-///
+/// # use revm_primitives::assert_all_fields_written;
 /// struct Pair { a: u8, b: u8 }
-/// assert_all_fields_written!(assert_pair_fields_are_all_written(Pair) = Pair { a, b });
-///
-/// // Generic types put their parameters in square brackets, ahead of the value type:
 /// struct Wrap<'a, T> { inner: &'a mut T }
-/// assert_all_fields_written!(
-///     assert_wrap_fields_are_all_written['a, T](Wrap<'a, T>) = Wrap { inner }
-/// );
+/// assert_all_fields_written!(assert_pair_written(Pair) = Pair { a, b });
+/// assert_all_fields_written!(assert_wrap_written['a, T](Wrap<'a, T>) = Wrap { inner });
 /// ```
 #[macro_export]
 macro_rules! assert_all_fields_written {
@@ -143,14 +135,10 @@ pub unsafe fn copy_address_bytes(dst: *mut u8, src: *const u8) {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct AlignedAddress(pub Address);
 
-// INV-L, in the file's own idiom rather than as an attribute alone.
-//
-// Four accessors across two crates read this type as three words at offsets 0, 8 and 16 --
-// `new`, `from_words` and `same` here, and the `AccountCache` probe in `revm-context` -- and
-// three of them index from the *struct base* rather than through `addr_of!((*p).0)`. All of
-// that is sound exactly while the payload starts at offset 0 of a 24-byte, 8-aligned struct.
-// `#[repr(C, align(8))]` gives that today and nothing was checking it; an added field, or a
-// `repr` change, would silently move the payload.
+// INV-L. Four accessors across two crates read this as three words at offsets 0, 8 and 16,
+// three of them from the struct base rather than through `addr_of!((*p).0)` -- sound only
+// while the payload starts at offset 0 of a 24-byte, 8-aligned struct. An added field or a
+// `repr` change would move it silently.
 const _: () = assert!(core::mem::align_of::<AlignedAddress>() == 8);
 const _: () = assert!(core::mem::size_of::<AlignedAddress>() == 24);
 const _: () = assert!(core::mem::offset_of!(AlignedAddress, 0) == 0);
@@ -469,14 +457,10 @@ impl MaybeAddress {
 
 /// An `Option<B256>` whose payload the compiler knows is 8-aligned.
 ///
-/// `Option<B256>` is a tag byte plus a 32-byte align-1 payload, so the payload sits at offset
-/// 1 of a 33-byte align-1 object. That makes `&option.payload` 8-aligned exactly when the
-/// `Option`'s own address is 7 mod 8 -- which is to say, essentially never, and never
-/// *predictably*, so every write of one takes [`write_some_b256`]'s `memcpy` fallback rather
-/// than its four `sd`. Measured on mainnet block 24006677: `ExtBytecode`'s bytecode hash took
-/// the fallback 20,024 times out of 20,024, once per call frame.
-///
-/// (A site observation, not a law -- the fix below does not depend on the ratio.)
+/// `Option<B256>` puts its 32-byte align-1 payload at offset 1, so `&option.payload` is
+/// 8-aligned only when the `Option`'s own address is 7 mod 8 -- not predictably, so writes
+/// take [`write_some_b256`]'s `memcpy` fallback rather than its four `sd`: 20,024 times out
+/// of 20,024 for `ExtBytecode`'s bytecode hash on mainnet block 24006677.
 ///
 /// `#[repr(C)]` plus the explicit padding puts the payload at offset 8 of an align-8 struct
 /// by construction, so no probing and no runtime check are needed -- and the "absent" case
@@ -813,8 +797,8 @@ mod fast_key_tests {
     /// Digest of `value` under a fixed-seed FNV-1a.
     ///
     /// `RandomState` is not reachable under `no_std`, and a fixed seed makes a failure
-    /// reproducible. Only used to compare two digests, so the choice of hash is irrelevant
-    /// beyond its being field-order sensitive.
+    /// reproducible. Only two digests are ever compared, so all that matters is that it is
+    /// field-order sensitive.
     fn hash_of<T: core::hash::Hash>(value: &T) -> u64 {
         struct Fnv1a(u64);
         impl core::hash::Hasher for Fnv1a {
@@ -958,11 +942,10 @@ mod fast_key_tests {
             let k = key(i);
             assert_eq!(map.get(FastU256::new(&k)).copied(), Some(i), "i={i}");
         }
-        // The miss half. `key` is injective -- limb 0 is `u64::from(i)`, widened rather
-        // than truncated -- so these really are absent. The sibling address sweep was not
-        // so lucky: its `key` aliased mod 256 and 0 of its 64 cases reached the miss path.
-        // Asserted rather than assumed, and expected as `None` rather than compared with
-        // the plain lookup, which agrees with a broken fast path whenever both find nothing.
+        // The miss half, asserted rather than assumed: the sibling address sweep's `key`
+        // aliased mod 256 and 0 of its 64 cases reached the miss path. Expected as `None`,
+        // not compared against the plain lookup, which agrees with a broken fast path
+        // whenever both find nothing.
         for i in 256..320u32 {
             let k = key(i);
             assert!(
@@ -1119,11 +1102,9 @@ mod fast_key_tests {
         };
         assert_eq!(a, dirty);
 
-        // And `Hash` has to agree with that. `MaybeAddress` hand-writes `PartialEq`, so a
-        // derived `Hash` would fold the padding and an absent value's stale payload and let
-        // two equal values hash differently. `clippy::derived_hash_with_manual_eq` catches
-        // the derive; nothing pinned the contract once the impl was hand-written, so these
-        // are the two pairs `eq` calls equal that a field-wise hash would separate.
+        // And `Hash` has to agree: with `PartialEq` hand-written, a derived `Hash` folds
+        // the padding and an absent value's stale payload. These are the two pairs `eq`
+        // calls equal that a field-wise hash would separate.
         assert_eq!(
             hash_of(&a),
             hash_of(&dirty),

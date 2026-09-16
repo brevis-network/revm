@@ -87,14 +87,10 @@ pub trait LegacyBytecode {
 ///
 /// # Why the fields are private
 ///
-/// Every value in here is a memory-safety precondition of a *safe* function:
-/// [`Jumps::absolute_ip_with`] turns `code_base + offset` into the interpreter's instruction
-/// pointer after [`Jumps::is_valid_legacy_jump_with`] has bounded `offset` against
-/// `table_len` alone. With `pub` fields and no constructor, safe code containing no `unsafe`
-/// token at all could build a `JumpCtx` out of three arbitrary values and hand it to
-/// `control::jump_to`, which is how a struct of raw pointers launders an obligation. Building
-/// one now takes [`JumpCtx::new`], which is `unsafe` and states the obligation; reading one
-/// back is still safe, so an out-of-crate [`Jumps`] implementation can answer from it.
+/// Every value here is a memory-safety precondition of a *safe* function:
+/// [`Jumps::absolute_ip_with`] turns `code_base + offset` into the instruction pointer, with
+/// `offset` bounded against `table_len` alone, so `pub` fields would let safe code build one
+/// from three arbitrary values. Reading one back stays safe.
 #[derive(Clone, Copy, Debug)]
 pub struct JumpCtx {
     /// Base of the jump-destination bitmap, one bit per byte of the original bytecode.
@@ -119,15 +115,10 @@ impl JumpCtx {
 
     /// # Safety
     ///
-    /// For the whole lifetime of the returned value:
-    ///
-    /// * `table_ptr` must be readable for `table_len.div_ceil(8)` bytes;
-    /// * `code_base` must be readable for **more** than `table_len` bytes -- strictly more,
-    ///   because the dispatch loop reads the byte one past the opcode it halts on, and
-    ///   because the fused `JUMPDEST` arm lands on `target + 1`. This is exactly what
-    ///   `LegacyAnalyzedBytecode`'s constructor asserts (`jump_table.len() == original_len`
-    ///   and `original_len < bytecode.len()`);
-    /// * neither allocation may move or be freed.
+    /// For the whole lifetime of the returned value: `table_ptr` readable for
+    /// `table_len.div_ceil(8)` bytes, `code_base` readable for **strictly more** than
+    /// `table_len` bytes (what `LegacyAnalyzedBytecode`'s constructor asserts), and neither
+    /// allocation moved or freed.
     #[inline]
     pub const unsafe fn new(table_ptr: *const u8, table_len: usize, code_base: *const u8) -> Self {
         Self {
@@ -306,21 +297,17 @@ pub trait MemoryTr {
     /// that pushed the allocator into 13 callee-saved registers, whose save/restore ran on
     /// every `MSTORE`.
     ///
-    /// (The original rationale said the limbs stay one-at-a-time live because a possibly
-    /// aliasing load cannot be hoisted. That is stale for [`SharedMemory`]'s override, whose
-    /// 8-aligned arm reads all four limbs up front to test them against zero; the register
-    /// saving comes from not passing the word by value, not from the load ordering.)
+    /// The register saving comes from not passing the word by value, not from load
+    /// ordering: [`SharedMemory`]'s 8-aligned arm reads all four limbs up front anyway.
     ///
     /// # Safety
     ///
     /// * `src` must point at four readable `u64`s;
     /// * `offset + 32` must be within the current memory;
-    /// * **`src` must not overlap the 32 bytes at `offset`.** This default implementation
-    ///   reads the whole word before writing anything, and `SharedMemory`'s aligned arm does
-    ///   too, but its misaligned arm interleaves reads with writes -- so under overlap the
-    ///   answer depends on the destination's alignment and matches no implementation of the
-    ///   trait. The interpreter satisfies it structurally: the source is always a stack slot,
-    ///   and the stack and the memory buffer are separate allocations.
+    /// * **`src` must not overlap the 32 bytes at `offset`**: `SharedMemory`'s misaligned
+    ///   arm interleaves reads with writes, so the answer would depend on alignment. The
+    ///   interpreter satisfies this structurally -- stack and memory are separate
+    ///   allocations.
     ///
     /// [`SharedMemory`]: crate::interpreter::SharedMemory
     #[inline]
@@ -367,15 +354,10 @@ pub trait MemoryTr {
     ///
     /// # Correctness
     ///
-    /// This is a contract, and `wr_off + wr_len` has to be within `new_size`.
-    ///
-    /// It is not `unsafe` only because the *signature* cannot express the hazard, not because
-    /// there is none. Breaking the promise leaves stale EVM memory wherever the tail was
-    /// previously written -- consensus-wrong, but defined. Where the tail is capacity the
-    /// `Vec` has never written, reading it is an **uninitialised read**, which is undefined
-    /// behaviour and was demonstrated under Miri. An implementation that skips the zero fill
-    /// is therefore relying on the caller, and the caller is relying on it to skip no more
-    /// than `wr_off..wr_off + wr_len`.
+    /// A contract: `wr_off + wr_len` has to be within `new_size`. Not `unsafe` only because
+    /// the signature cannot express the hazard. Breaking it leaves stale EVM memory where the
+    /// tail was previously written -- consensus-wrong but defined -- and, where the tail is
+    /// capacity the `Vec` never wrote, an **uninitialised read**, demonstrated under Miri.
     #[inline]
     fn resize_written(&mut self, new_size: usize, wr_off: usize, wr_len: usize) -> bool {
         let _ = (wr_off, wr_len);

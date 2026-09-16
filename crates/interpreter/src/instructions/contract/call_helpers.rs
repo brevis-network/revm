@@ -31,14 +31,11 @@ pub fn resize_memory(
     } else {
         usize::MAX //unrealistic value so we are sure it is not used
     };
-    // `offset + len` is unchecked, and the guest ships with `overflow-checks = false`, so on
-    // that profile it would *wrap* rather than panic. It cannot be reached: on the `len != 0`
-    // arm, `resize_memory!` above has already charged the quadratic expansion gas for
-    // `offset + len` words, which no reachable gas limit covers for anything near
-    // `usize::MAX`; and on the `len == 0` arm the addend is zero, so the `usize::MAX`
-    // sentinel passes through exactly (which `calldataload_at` relies on). That ordering is
-    // the whole argument and it was stated nowhere -- moving this line above the
-    // `resize_memory!`, or adding a caller that skips it, is what breaks it.
+    // `offset + len` is unchecked and the guest has `overflow-checks = false`, so it would
+    // wrap. Unreachable only because `resize_memory!` ran first: on `len != 0` it charged
+    // quadratic gas for `offset + len` words, which no reachable limit covers near
+    // `usize::MAX`; on `len == 0` the addend is zero, so the `usize::MAX` sentinel passes
+    // through. Moving this above the `resize_memory!` breaks it.
     debug_assert!(offset.checked_add(len).is_some());
     Some(offset..offset + len)
 }

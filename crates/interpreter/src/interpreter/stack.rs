@@ -37,13 +37,10 @@ pub const BYTE_LIMIT: usize = STACK_LIMIT * WORD;
 ///
 /// # The clamp
 ///
-/// `(words as isize - 2) * WORD` wraps for a `words` anywhere near `usize::MAX`, and it wraps
-/// *negative*, so the guard built on it accepts a shallow stack for an absurd depth request.
-/// Every in-tree caller passes a literal or a const generic in `1..=17`, so the clamp below
-/// const-folds away at all of them -- but this is a safe `pub const fn`, and the value it
-/// returns is the sole depth precondition of several `unsafe` blocks. Anything past the stack
-/// limit can never be satisfied, so saturating to "reject" is both correct and the only
-/// answer that cannot wrap.
+/// `(words as isize - 2) * WORD` wraps *negative* for `words` near `usize::MAX`, so the guard
+/// built on it would accept a shallow stack for an absurd request. The clamp const-folds away
+/// at every in-tree caller, but this is a safe `pub const fn` whose result is the sole depth
+/// precondition of several `unsafe` blocks.
 #[inline(always)]
 pub const fn too_shallow_for(words: usize) -> isize {
     if words >= 2 {
@@ -62,13 +59,11 @@ pub const fn too_shallow_for(words: usize) -> isize {
 /// Whether the cursor has **no room** for one more word.
 ///
 /// `sp.wrapping_add(WORD)` undoes the bias (see [`StackTr::sp`]), so this is one unsigned
-/// compare on the post-push byte length. A signed `>=` would accept every `sp` from `2^63`
-/// up, where the bias makes it read as negative, and an `==` rejects one value and accepts
-/// every larger one.
+/// compare on the post-push byte length. A signed `>=` would accept every `sp` from `2^63` up,
+/// where the bias reads as negative; an `==` rejects one value and accepts every larger one.
 ///
-/// Alignment is not checked: `sp` in `usize::MAX - 30 ..= usize::MAX` wraps to a byte length
-/// of `1..=31`, in bounds but misaligned. That is the caller's invariant, and unlike the
-/// above it cannot put a write outside the allocation.
+/// Alignment is the caller's invariant, not checked here: `sp` in `usize::MAX - 30 ..=
+/// usize::MAX` wraps to a byte length of `1..=31`, misaligned but still in bounds.
 #[inline(always)]
 pub const fn no_room_to_push(sp: usize) -> bool {
     sp.wrapping_add(WORD) > BYTE_LIMIT - WORD
@@ -663,11 +658,10 @@ impl Stack {
         // `limit` saturates so that an absurd `n` (this is a safe, public method) can not
         // wrap it to a huge value: a saturated limit of 0 only accepts `bl == n * WORD`,
         // which such an `n` can never reach.
-        // `checked_mul`, not `*`: `n` comes from a safe public method, and `n * WORD` wraps
-        // to a *small* product for `n` near `2^59` -- `dup(1 << 59)` gives `need == 0`, which
-        // the compare below accepts on an empty stack and `top_mut().sub(n)` then turns into
-        // a `ptr::sub` of 2^64 bytes. The saturating `limit` below was written to stop
-        // exactly this and cannot, because by then the wrap has already happened.
+        // `checked_mul`, not `*`: `n` comes from a safe public method and `n * WORD` wraps
+        // to a *small* product near `2^59` -- `dup(1 << 59)` gives `need == 0`, accepted on
+        // an empty stack, with `top_mut().sub(n)` then offsetting by 2^64 bytes. The
+        // saturating `limit` below cannot catch it.
         let Some(need) = n.checked_mul(WORD) else {
             return false;
         };
@@ -708,10 +702,8 @@ impl Stack {
     pub fn exchange(&mut self, n: usize, m: usize) -> bool {
         assume!(m > 0, "overlapping exchange");
         let bl = self.byte_len();
-        // Checked on both operations, for the reason spelled out in `dup`: this is a safe
-        // public method, and both `n + m` and the scaling by `WORD` wrap for large inputs,
-        // which turns the bound below into an accept and `top.sub(n_m_index)` into
-        // out-of-allocation pointer arithmetic.
+        // Checked on both operations, for the reason given in `dup`: `n + m` and the
+        // scaling by `WORD` both wrap for large inputs, turning the bound into an accept.
         let Some(n_m_index) = n.checked_add(m) else {
             return false;
         };
@@ -813,12 +805,10 @@ impl Stack {
         }
 
         let n_words = slice.len().div_ceil(32);
-        // Neither of these can overflow, and the reason is not local: `[u8]::len()` is at
-        // most `isize::MAX`, so `n_words * WORD` -- `div_ceil(32)` then times 32 -- is at
-        // most `isize::MAX` rounded up, and `byte_len()` is at most `BYTE_LIMIT`. Stated
-        // because the two `*`/`+` here are the same shape as the three that *did* wrap in
-        // `dup`, `exchange` and `too_shallow_for`, and the only thing separating them is a
-        // property of the argument type.
+        // Neither can overflow, for a non-local reason: `[u8]::len()` is at most
+        // `isize::MAX`, so `n_words * WORD` is too, and `byte_len()` is at most
+        // `BYTE_LIMIT`. Stated because this is the shape that *did* wrap in `dup`,
+        // `exchange` and `too_shallow_for`.
         debug_assert!(slice.len() <= isize::MAX as usize);
         let new_byte_len = self.byte_len() + n_words * WORD;
         if new_byte_len > BYTE_LIMIT {
@@ -938,8 +928,8 @@ mod tests {
     }
 
     /// [`too_shallow_for`] must never return a value that *accepts* a request it cannot
-    /// serve. The hazard is the multiply: `(words as isize - 2) * WORD` wraps negative for
-    /// large `words`, and a negative threshold accepts an empty stack.
+    /// serve: `(words as isize - 2) * WORD` wraps negative for large `words`, and a negative
+    /// threshold accepts an empty stack.
     #[test]
     fn too_shallow_for_never_wraps_into_an_accept() {
         // The real domain: the answer is exactly "fewer than `words` words on the stack".
@@ -953,8 +943,7 @@ mod tests {
                 );
             }
         }
-        // Out of domain: every `sp` a real stack can hold must be rejected, including the
-        // full stack, and including the values that used to wrap.
+        // Out of domain: every `sp` a real stack can hold must be rejected.
         for words in [
             STACK_LIMIT + 1,
             usize::MAX / WORD,
@@ -973,10 +962,9 @@ mod tests {
         }
     }
 
-    /// `dup` and `exchange` are safe public methods whose guards scale their argument by
-    /// `WORD` before bounding it. `dup(1 << 59)` makes that product *zero*, which the guard
-    /// then accepts on an empty stack, and `top_mut().sub(n)` is pointer arithmetic with a
-    /// 2^64-byte offset.
+    /// `dup` and `exchange` scale their argument by `WORD` before bounding it, and
+    /// `dup(1 << 59)` makes that product *zero* -- accepted on an empty stack, with
+    /// `top_mut().sub(n)` then offsetting by 2^64 bytes.
     #[test]
     fn dup_and_exchange_reject_wrapping_depths() {
         let wrapping = [

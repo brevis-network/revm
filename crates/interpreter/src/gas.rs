@@ -156,14 +156,10 @@ impl Gas {
     ///
     /// # The poison interacts with this
     ///
-    /// `checked_sub` means a *poisoned* counter (`remaining == u64::MAX`, written by
-    /// [`Interpreter::set_action`](crate::Interpreter::set_action)) **accepts** a cost of
-    /// `u64::MAX` -- which is exactly what [`MemoryGas::record_new_len`] returns for a word
-    /// count at or above `2^32`. The two only fail to meet because `set_action` poisons on
-    /// frame *exit*, after the last instruction has run, so no instruction ever charges
-    /// against a poisoned counter. That coupling is load-bearing and lives in a different
-    /// file, so it is restated here: an edit that poisons earlier, or that makes an
-    /// instruction charge after a halt, turns this into a free `u64::MAX` of gas.
+    /// A poisoned counter (`remaining == u64::MAX`) **accepts** a cost of `u64::MAX`, which
+    /// is what [`MemoryGas::record_new_len`] returns past its bound. They only fail to meet
+    /// because `set_action` poisons on frame *exit*. Poisoning earlier, or charging after a
+    /// halt, turns this into a free `u64::MAX` of gas.
     #[inline]
     #[must_use = "prefer using `gas!` instead to return an out-of-gas error on failure"]
     pub fn record_cost(&mut self, cost: u64) -> bool {
@@ -267,14 +263,10 @@ pub struct MemoryGas {
     limit: usize,
 }
 
-/// The largest word count [`MemoryGas`] will store: the tighter of two bounds.
-///
-/// * `2^32` words (137 GB, ~2^55 gas) is the semantic bound, and binds on 64-bit.
-/// * `limit` holds `words * 32 - 31`, so `words << 5` must be representable, which caps
-///   `words` at `2^27 - 1` on 32-bit. That is the binding one there.
-///
-/// Not `u32::MAX`, which is `usize::MAX` on 32-bit and so vacuous exactly where the second
-/// bound is needed.
+/// The largest word count [`MemoryGas`] will store: the tighter of `2^32` words (the
+/// semantic bound, binding on 64-bit) and what `limit`'s `words * 32 - 31` can represent
+/// (`2^27 - 1` on 32-bit). Not `u32::MAX`, which is `usize::MAX` on 32-bit and so vacuous
+/// exactly where the second bound is needed.
 const MAX_WORDS: usize = if (usize::MAX >> 5) < u32::MAX as usize {
     usize::MAX >> 5
 } else {
@@ -289,16 +281,9 @@ const _: () = assert!(
 
 /// What a [`MemoryGas`] deserialises through, so that `limit`'s shape is checked.
 ///
-/// `limit` is not a free `usize`: it is `words_num * 32 - 31`, or `0` for "no memory". Every
-/// reader depends on that -- [`MemoryGas::words_num`] inverts it as `(limit + 31) / 32` and
-/// [`MemoryGas::word_limit`] hands it straight to a `>=` that decides whether a word access
-/// needs charging. A derived `Deserialize` accepted any `usize`, so a wire value of, say,
-/// `usize::MAX` reported a word count that no charge had ever been paid for, and one of
-/// `32` reported `words_num() == 1` while claiming a limit no expansion could have produced.
-///
-/// Not reachable from the rsp guest, which deserialises no interpreter type; this is
-/// revm-as-a-library surface. The check is one modulo on a path that runs once per resumed
-/// frame.
+/// `limit` is `words_num * 32 - 31`, or `0`, and [`MemoryGas::word_limit`] hands it to the
+/// `>=` deciding whether a word access needs charging -- so a wire value of `usize::MAX`
+/// reports a word count nothing paid for. Library surface; the rsp guest does not reach it.
 #[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
 struct MemoryGasDe {
@@ -355,50 +340,26 @@ impl MemoryGas {
     ///
     /// # It commits before the charge can be refused
     ///
-    /// `self.limit` is written below and the caller only then feeds the returned cost to
-    /// [`Gas::record_cost`], which may refuse it. So on an out-of-gas expansion the field
-    /// says the memory grew and the gas says it did not.
+    /// `self.limit` is written before the caller feeds the cost to [`Gas::record_cost`],
+    /// which may refuse it, so on an out-of-gas expansion the field says the memory grew and
+    /// the gas says it did not. Safe only because the refusal is **terminal** (traced, not
+    /// assumed): every caller returns at once and `Interpreter::clear` resets `*gas` on
+    /// reuse. Letting execution continue past one makes the stale limit consensus-visible.
     ///
-    /// That is safe because the refusal is **terminal**, which was confirmed by two
-    /// independent traces rather than assumed: every caller returns immediately on a refusal,
-    /// the halt is exceptional so the frame spends its whole limit, and
-    /// [`Interpreter::clear`](crate::Interpreter::clear) resets `*gas` when a pooled frame is
-    /// reused. Nothing reads the stale limit. An edit that lets execution continue past a
-    /// refused memory charge -- a non-exceptional halt here, or a caller that recovers --
-    /// makes the stale limit consensus-visible, because the next word access would then be
-    /// free.
-    ///
-    /// # Why the bound is a comparison and not a shift
-    ///
-    /// `new_num >> 32` is a shift by the full width of a 32-bit `usize`: a deny-by-default
-    /// `arithmetic_overflow` error, so the crate would not build for one at all. `MAX_WORDS`
-    /// is a single compare, and the `assert_unchecked` below reads it back.
+    /// The bound is a comparison against `MAX_WORDS`, not `new_num >> 32`: that shift is by
+    /// the full width of a 32-bit `usize`, a deny-by-default `arithmetic_overflow` error.
     #[inline]
     pub fn record_new_len(&mut self, new_num: usize) -> Option<u64> {
         let words_num = self.words_num();
         if new_num <= words_num {
             return None;
         }
-        // 2^32 words is 137 GB, and `memory_gas` of it is ~2^55 gas (`w * w` saturates, so
-        // the real figure is `u64::MAX / 512 + 3 * 2^32`). Every caller feeds the result
-        // straight to the *checked* `Gas::record_cost`, so `u64::MAX` is an out-of-gas rather
-        // than a wrap -- note this would not hold for `record_cost_unsafe`, where
-        // `remaining - u64::MAX` has a clear sign bit and reports success.
-        //
-        // What makes the shortcut equivalent to the saturating form is the size of that cost
-        // against a *real* gas limit: ~2^55 is about 1.2e9 times a mainnet block's, so no
-        // transaction can pay it and both forms end the frame out of gas. It is **not** true
-        // that no reachable `remaining` covers it -- `Gas::new` caps the limit at `i64::MAX`,
-        // which is ~250x larger, and `Interpreter::default_ext`/`invalid` are built with
-        // exactly that. Such a frame used to be charged ~2^55 and then attempt a 137 GB
-        // allocation; now it is out of gas, which is the better of the two.
-        //
-        // Returning early is also what bounds the field: `limit` is only ever written below,
-        // so every stored word count is under 2^32 and both `memory_gas` calls lose their
-        // saturation. Leave `limit` alone on this path so that bound holds even for the frame
-        // that dies here.
-        //
-        // What makes the `<< 5` below unable to overflow; see `MAX_WORDS`.
+        // `u64::MAX` rather than the saturating cost (~2^55 gas): every caller feeds this to
+        // the *checked* `record_cost`, so both end the frame out of gas. Not so for
+        // `record_cost_unsafe`, where `remaining - u64::MAX` has a clear sign bit and reports
+        // success, nor for a frame built with `Gas::new`'s `i64::MAX` cap, which can cover
+        // 2^55 -- out of gas is the better of the two there. Returning early is also what
+        // bounds the field, so both `memory_gas` calls lose their saturation.
         if new_num > MAX_WORDS {
             return Some(u64::MAX);
         }
@@ -420,9 +381,7 @@ impl MemoryGas {
 mod memory_gas_serde_tests {
     use super::MemoryGas;
 
-    /// `limit` is `words_num * 32 - 31`, not a free `usize`, and a derived `Deserialize`
-    /// accepted any value. Round-tripping must still work; a shape no expansion could have
-    /// produced must not.
+    /// Round-tripping must work; a `limit` no expansion could have produced must not.
     #[test]
     fn memory_gas_rejects_a_limit_no_expansion_could_produce() {
         for words in [0usize, 1, 2, 3, 1024, 1 << 20] {
@@ -436,9 +395,8 @@ mod memory_gas_serde_tests {
             assert_eq!(back, g);
             assert_eq!(back.words_num(), words);
         }
-        // Wrong residue: `limit` is `words_num * 32 - 31`, so `limit % 32 == 1` or zero.
-        // (33 is *legal* -- it is two words -- which is why the residue is the test and not
-        // the parity.)
+        // Wrong residue: `limit % 32` is 1 or zero. (33 is legal -- two words -- which is
+        // why the residue is the test and not the parity.)
         for bad in [2usize, 32, 64, usize::MAX, usize::MAX - 1] {
             let json = std::format!("{{\"limit\":{bad}}}");
             assert!(
@@ -446,8 +404,8 @@ mod memory_gas_serde_tests {
                 "accepted limit {bad}"
             );
         }
-        // Right residue, word count past `MAX_WORDS`. Off `MAX_WORDS` rather than a literal
-        // `2^32`, which a 32-bit target cannot represent.
+        // Right residue, count past `MAX_WORDS`. Off the constant, not a literal `2^32`,
+        // which a 32-bit target cannot represent.
         let over = usize::try_from(super::MAX_WORDS as u128 * 32 + 1).expect("representable");
         assert!(
             serde_json::from_str::<MemoryGas>(&std::format!("{{\"limit\":{over}}}")).is_err(),

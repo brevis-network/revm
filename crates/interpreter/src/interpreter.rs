@@ -35,19 +35,10 @@ use primitives::{hardfork::SpecId, Bytes};
 
 /// Main interpreter structure that contains all components defined in [`InterpreterTypes`].
 ///
-/// `repr(C)` with [`Interpreter::stack`] **last among the fields the dispatch loop
-/// touches**, on purpose. The EVM stack keeps its 1024 words inline (see `Stack`), which is
-/// 32 KiB; laid out anywhere but at the end it would push the other fields past the 12-bit
-/// displacement a RISC-V load or store can encode, and every access to the gas counter or
-/// the instruction pointer would grow an address computation. Placed there, the fields the
-/// dispatch loop touches stay within a few hundred bytes of the base and the stack words are
-/// reached as `base + byte_len` with the field offset folded into the displacement.
-///
-/// **Not literally last**: `gas_stash: u64` follows it, and exactly eight bytes do -- which
-/// is what `da338152`'s `const _` size assertion proves. It is cold (written once per halt,
-/// read once per frame exit), so it is past the stack on purpose too; the three statements
-/// in this file that called `stack` "the last field" were describing the intent, not the
-/// layout.
+/// `repr(C)` with [`Interpreter::stack`] **last among the fields the dispatch loop touches**,
+/// on purpose: the stack's 1024 inline words are 32 KiB, and anywhere but the end they push
+/// the other fields past the 12-bit displacement a RISC-V load or store can encode. Only the
+/// cold `gas_stash: u64` follows it, which the `const _` size assertion pins.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(C)]
@@ -679,16 +670,11 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
             // constants, which is exactly what `dup_at` gets.
             //
             // The `sp != byte_limit` equality is sound *here* and nowhere else: `sp` is the
-            // loop-local cursor, which starts as `Stack::sp()` and moves by whole words with
-            // each arm checking the bound it crosses, so it is never above `byte_limit`. The
-            // same test in the `*_at` entry points -- reachable from outside the crate with
-            // an arbitrary `sp` -- is a false upper bound, and so is a signed `>=`; those use
-            // `no_room_to_push`, which is not used here because it would materialise the
-            // constant this arm exists to keep pinned.
-            //
-            // Both exits below report `StackOverflow` even when it was the *depth* test that
-            // failed, which is pre-existing and is not consensus-visible: both halts are
-            // exceptional, so the frame spends its whole gas limit either way.
+            // loop-local cursor, never above `byte_limit`. In the `*_at` entry points it is a
+            // false upper bound and so is a signed `>=`; those use `no_room_to_push`, avoided
+            // here because it would materialise the constant this arm keeps pinned. Both
+            // exits report `StackOverflow` even for a *depth* failure, which is pre-existing
+            // and not consensus-visible.
             ((6, $n:literal), $_f:expr) => {{
                 ip = unsafe { ip.add(1) };
                 if sp != byte_limit && (sp as isize) > too_shallow_for($n) {
@@ -1151,9 +1137,8 @@ fn test_mstore_big_offset_memory_oog() {
     );
 }
 
-/// The `MLOAD` half of [`test_mstore_big_offset_memory_limit_oog`]. Both opcodes lost the
-/// `memory_limit` guard when their expansion moved off `resize_memory!`; only `MSTORE` had a
-/// test, which is why the regression was invisible for one of the two.
+/// The `MLOAD` half of [`test_mstore_big_offset_memory_limit_oog`]; only `MSTORE` had a test
+/// when both lost the `memory_limit` guard.
 #[test]
 #[cfg(feature = "memory_limit")]
 fn test_mload_big_offset_memory_limit_oog() {

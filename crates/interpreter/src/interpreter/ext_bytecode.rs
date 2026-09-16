@@ -289,8 +289,7 @@ impl Jumps for ExtBytecode {
         match self.base.legacy_jump_table() {
             // SAFETY: both pointers are into the `Bytecode` this `ExtBytecode` owns, which
             // outlives the returned context, and `LegacyAnalyzedBytecode::new` asserts
-            // `jump_table.len() == original_len < bytecode.len()` -- i.e. the bitmap covers
-            // `table_len` bits and the code buffer is strictly longer than `table_len`.
+            // `jump_table.len() == original_len < bytecode.len()`.
             Some(table) => unsafe {
                 JumpCtx::new(
                     table.table_ptr(),
@@ -313,12 +312,9 @@ impl Jumps for ExtBytecode {
     #[inline]
     fn absolute_ip_with(&self, ctx: JumpCtx, offset: usize) -> *const u8 {
         // SAFETY: the caller has checked `offset` against the bitmap, whose bit length
-        // `LegacyAnalyzedBytecode::new` pins to the *unpadded* bytecode length, and which the
-        // same constructor requires to be strictly less than the padded length. So
-        // `code_base + offset` is inside the padded bytes, and so is `code_base + offset + 1`
-        // -- which is what the fused `JUMPDEST` arm forms. Note this holds even for a jump
-        // table that disagrees with the bytes it describes: the bound is structural, not a
-        // consequence of the table being honest.
+        // `LegacyAnalyzedBytecode::new` pins below the padded length, so `code_base + offset`
+        // and `+ 1` (the fused `JUMPDEST` arm) are inside the padded bytes. Structural, so it
+        // holds for a table that disagrees with the bytes it describes.
         unsafe { ctx.code_base().add(offset) }
     }
 

@@ -499,11 +499,10 @@ macro_rules! as_usize_or_fail {
 /// its register until it knows it has gas to charge -- `MLOAD`/`MSTORE`, whose hot path
 /// charges nothing -- publishes here instead, on the cold edge only. See `sync_gas_at!`.
 ///
-/// The publish carries `poison_at!`'s precondition, and for the same reason: it writes the
-/// register back over the field, so a body that has charged through the field since its own
-/// `sync_gas_at!` would have that charge refunded. Both callers convert before they charge.
-/// Unlike `poison_at!` the value is not the caller's exit -- `$ret` carries that -- so the
-/// `u64::MAX` is discarded and only the publish-and-halt is shared.
+/// Carries `poison_at!`'s precondition for the same reason: the publish writes the register
+/// back over the field, refunding any charge made through the field since `sync_gas_at!`.
+/// Both callers convert before they charge. The `u64::MAX` is discarded here -- `$ret` is
+/// the caller's exit -- so only the publish-and-halt is shared.
 #[macro_export]
 #[collapse_debuginfo(yes)]
 macro_rules! as_usize_or_fail_ret_at {

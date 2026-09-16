@@ -578,12 +578,9 @@ mod shift_tests {
         }
     }
 
-    /// The guard the two helpers' partiality now rests on, pinned at the opcode boundary
-    /// rather than at the helper: `as_usize_saturated!` is what carries an out-of-domain
-    /// shift into `SHL`/`SHR`, and the `shift < 256` test is what stops it reaching the
-    /// helpers. The values below are the ones the helpers get *wrong* -- 256 is the identity
-    /// and 320 aliases 64 -- so a lost guard shows up here as `x` or `x << 64` where the EVM
-    /// requires zero.
+    /// The guard the helpers' partiality rests on, pinned at the opcode boundary. The values
+    /// below are the ones the helpers get *wrong* -- 256 is the identity, 320 aliases 64 --
+    /// so a lost guard shows up as `x` or `x << 64` where the EVM requires zero.
     #[test]
     fn out_of_domain_shifts_are_zero_at_the_opcode() {
         use crate::{host::DummyHost, InstructionContext, Interpreter};

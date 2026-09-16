@@ -85,26 +85,13 @@ impl LegacyAnalyzedBytecode {
     ///
     /// # What the assertions are for
     ///
-    /// Deserialization reaches these checks -- rsp's witness format supplies `bytecode`,
-    /// `original_len` and `jump_table` as three *independent* wire fields, and `hash_slow()`
-    /// covers only `bytecode[..original_len]`. So they are not debug hygiene: they are the
-    /// only thing standing between a caller-chosen jump table and the interpreter's pointer
-    /// arithmetic. See [`try_new`](Self::try_new), which the `serde(try_from)` routes through.
-    ///
-    /// Together the first two pin `jump_table.len() == original_len`, which is what
-    /// [`analyze_legacy`](super::analysis::analyze_legacy) produces. That is what bounds
-    /// [`JumpTable::is_valid`](super::JumpTable::is_valid): a `true` answer now implies
-    /// `pc < original_len`, so the `absolute_ip` the interpreter builds from a jump -- and
-    /// the `target + 1` of the fused `JUMPDEST` arm -- stay inside the buffer even if the
-    /// table disagrees with the bytes.
-    ///
-    /// The third pins the trailing guard byte; see
-    /// [`GUARD_BYTES`](super::analysis::GUARD_BYTES).
-    ///
-    /// What they do **not** pin is the analysis's padding rule itself (no truncated `PUSH`
-    /// immediate, last opcode a `STOP`) -- checking that costs the same scan as redoing the
-    /// analysis. A caller that did not get its arguments from `analyze_legacy` owes that
-    /// obligation; the way to discharge it is to call [`analyze`](Self::analyze) instead.
+    /// Not debug hygiene: rsp's witness format supplies the three fields independently, so
+    /// these are the only thing between a caller-chosen jump table and the interpreter's
+    /// pointer arithmetic. The first two pin `jump_table.len() == original_len`, bounding
+    /// [`JumpTable::is_valid`](super::JumpTable::is_valid) so that `absolute_ip` and the
+    /// fused `JUMPDEST` arm's `target + 1` stay inside the buffer; the third pins the guard
+    /// byte. They do **not** pin the padding rule -- checking it costs the same scan as
+    /// redoing the analysis, so a caller not using [`analyze`](Self::analyze) owes that.
     ///
     /// # Panics
     ///
@@ -119,16 +106,12 @@ impl LegacyAnalyzedBytecode {
         }
     }
 
-    /// [`new`](Self::new), returning the violated invariant instead of panicking.
-    ///
-    /// The one place the three checks live: `new` turns the error into a panic and
-    /// `Deserialize` into a `serde` error.
+    /// [`new`](Self::new), returning the violated invariant instead of panicking. The one
+    /// place the three checks live.
     ///
     /// # Errors
     ///
-    /// * if the jump table length is not exactly `original_len`;
-    /// * if `bytecode` has no byte past `original_len` (which also rejects an empty
-    ///   `bytecode`).
+    /// On any of the conditions [`new`](Self::new) panics for.
     pub fn try_new(
         bytecode: Bytes,
         original_len: usize,
@@ -195,10 +178,8 @@ mod tests {
         );
     }
 
-    /// `original_len` past the end of the buffer, with a jump table that agrees with it so
-    /// the third check is the one under test. Nothing else covers the over-run shape:
-    /// `test_panic_on_unpadded_bytecode` reaches that check only at `original_len ==
-    /// bytecode.len()`.
+    /// `original_len` past the end, the table agreeing so the third check is the one under
+    /// test; `test_panic_on_unpadded_bytecode` reaches it only at equality.
     #[test]
     #[should_panic(expected = "bytecode is not padded past original_len")]
     fn test_panic_on_large_original_len() {
@@ -218,10 +199,9 @@ mod tests {
         let _ = LegacyAnalyzedBytecode::new(bytecode.bytecode, bytecode.original_len, jump_table);
     }
 
-    /// The wire-format hazard, in its smallest form: a table claiming more valid jump
-    /// destinations than the code has bytes. `is_valid` bounds `pc` against the table's bit
-    /// length alone, so without this assert a `true` answer can name an offset past the end
-    /// of the bytecode and the interpreter builds an out-of-allocation `ip` from it.
+    /// A table claiming more jump destinations than the code has bytes: `is_valid` bounds
+    /// `pc` against the bit length alone, so a `true` answer would name an offset past the
+    /// end.
     #[test]
     #[should_panic(expected = "jump table length is greater than original length")]
     fn test_panic_on_overlong_jump_table() {
@@ -239,9 +219,8 @@ mod tests {
         let _ = LegacyAnalyzedBytecode::new(bytecode, 0, jump_table);
     }
 
-    /// The exact shape the wire format used to be able to build: the whole padded buffer
-    /// handed over as "original", leaving no byte past the last opcode for the dispatch
-    /// loop's one-past-the-end read.
+    /// The whole padded buffer handed over as "original", leaving no byte past the last
+    /// opcode for the dispatch loop's one-past-the-end read.
     #[test]
     #[should_panic(expected = "bytecode is not padded past original_len")]
     fn test_panic_on_unpadded_bytecode() {
@@ -250,9 +229,7 @@ mod tests {
         let _ = LegacyAnalyzedBytecode::new(raw, 1, jump_table);
     }
 
-    /// Every post-condition [`analyze_legacy`] claims, over a spread of shapes that reach
-    /// each padding arm: no padding needed, `STOP`-terminated, truncated `PUSH` immediate,
-    /// trailing `JUMPDEST`, and empty.
+    /// Every post-condition [`analyze_legacy`] claims, over shapes reaching each arm.
     #[test]
     fn analysis_post_conditions_hold() {
         let cases: &[&[u8]] = &[
@@ -280,9 +257,8 @@ mod tests {
                 analyzed.original_len() < analyzed.bytecode().len(),
                 "no guard byte for {case:?}"
             );
-            // Post-condition 3, the one `new` cannot assert. Walk the padded buffer the way
-            // the dispatch loop does and stop where execution would: at the first `STOP`.
-            // Every step asserts its own immediates are inside the buffer.
+            // Post-condition 3, the one `new` cannot assert: walk the padded buffer as the
+            // dispatch loop does, stopping at the first `STOP`.
             let padded = analyzed.bytecode();
             let mut i = 0usize;
             let stop_at = loop {
@@ -343,9 +319,8 @@ mod serde_tests {
         })
     }
 
-    /// A one-byte buffer with a 4096-bit table, every bit set: accepted by the derived
-    /// `Deserialize`, and `is_valid(4000)` then answered `true` -- the out-of-allocation `ip`
-    /// `Jumps::absolute_ip_with` builds without a further check.
+    /// A one-byte buffer with a 4096-bit table: the derived `Deserialize` accepted it, and
+    /// `is_valid(4000)` then answered `true`.
     #[test]
     fn an_overlong_jump_table_is_refused_on_the_wire() {
         let table = JumpTable::new(bitvec![u8, Lsb0; 1; 4096]);

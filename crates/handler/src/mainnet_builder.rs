@@ -91,9 +91,8 @@ mod test {
 
     /// A database with one contract and one pre-existing storage slot.
     ///
-    /// Needed because `BenchmarkDB` answers every `storage` with zero, so nothing built on it
-    /// can reach an `SSTORE` transition whose *original* value is non-zero -- which is three of
-    /// the four rungs that matter.
+    /// `BenchmarkDB` answers every `storage` with zero, so nothing built on it reaches three
+    /// of the four rungs.
     #[derive(Debug)]
     struct OneSlotDb {
         contract: primitives::Address,
@@ -144,24 +143,11 @@ mod test {
 
     /// `SSTORE`'s gas and refund, end to end, against the EIP numbers.
     ///
-    /// **Nothing in either repository asserted SSTORE gas.** `crates/ee-tests` has 30 fixtures
-    /// and no SSTORE fixture, and the only in-tree check of the rewritten cost path is
-    /// `sstore_table_matches_the_branch_chains`, which compares the table against the branch
-    /// chains it was *generated from* -- a self-consistency check, not an oracle. A transition
-    /// misclassified in both would pass it.
-    ///
-    /// These four are the rungs a transaction can reach on a fresh slot, priced by EIP-2200
-    /// as amended by EIP-2929 (the cold surcharge) and EIP-3529 (the reduced refund and the
-    /// one-fifth cap). Every figure below is derived from the EIPs, not read back out of this
-    /// implementation:
-    ///
-    /// * intrinsic 21,000 + two `PUSH1` at 3 = 21,006 before the `SSTORE`;
-    /// * a first touch of a slot is cold: +2,100 (`COLD_SLOAD_COST`);
-    /// * `0 -> non-zero` on a clean slot is `SSTORE_SET` = 20,000;
-    /// * `non-zero -> other non-zero` is `SSTORE_RESET` = 5,000 - 2,100 = 2,900, so 5,000 with
-    ///   the cold surcharge;
-    /// * `non-zero -> 0` is the same 5,000 and refunds 4,800, capped at `gas_used / 5`;
-    /// * `x -> x` is a no-op: the warm read, 100.
+    /// `sstore_table_matches_the_branch_chains` compares the table against the chains it was
+    /// generated from -- self-consistency, not an oracle. The figures below come from EIP-2200
+    /// as amended by EIP-2929 and EIP-3529: 21,006 before the `SSTORE`, +2,100 for the cold
+    /// slot, then `SSTORE_SET` 20,000 / `SSTORE_RESET` 2,900 / a 4,800 refund capped at
+    /// `gas_used / 5` / a warm read of 100.
     #[test]
     fn sstore_gas_matches_the_eip_numbers() {
         let contract = primitives::address!("00000000000000000000000000000000000000ff");
@@ -229,16 +215,11 @@ mod test {
         }
     }
 
-    /// A three-account database: a caller, a parent contract, a child contract, and one
-    /// address whose `basic` always fails.
+    /// A caller, a parent contract, a child contract, and one address whose `basic` fails.
     ///
-    /// [`EthFrame::return_result`] drains `ctx.error()` when a *child* frame returns, behind
-    /// an `is_err()` fast path added for three instructions a call. No test file in either
-    /// repository mentions `ContextError` at all, and the whole block corpus returns `Ok` on
-    /// all 19,975 frame returns -- so mutating that guard to `if false` swallowed every DB
-    /// error and left `cargo test --workspace --features serde` green. Reaching it needs the
-    /// error to happen *inside* a nested frame: the outermost frame's error is drained
-    /// elsewhere, which is why a top-level `BALANCE` does not bind on this guard.
+    /// [`EthFrame::return_result`] drains `ctx.error()` when a *child* frame returns; mutating
+    /// that guard to `if false` swallowed every DB error and left the suite green. The error
+    /// has to happen *inside* a nested frame -- the outermost frame's is drained elsewhere.
     #[derive(Debug)]
     struct TwoContractDb {
         parent: (primitives::Address, Bytecode),
@@ -359,16 +340,10 @@ mod test {
     /// `LOG1`..`LOG4` -- the arms with topics -- executed end to end, against
     /// `U256::to_be_bytes` as the oracle.
     ///
-    /// Before this, no test in either repository executed anything but `LOG0`: all four
-    /// in-tree `LOG` sites were `LOG0`, which is exactly where the topic loop is a no-op. That
-    /// loop is the part with a mechanism in it -- it reads the topics *in place* out of the
-    /// stack buffer rather than through `popn::<N>()`, writes each through `store_be_word`'s
-    /// zero ladder, and then discards `N` words by hand -- so topic order, topic count and the
-    /// ladder's arm selection were all unexercised.
-    ///
-    /// The four topics are chosen one per ladder rung: zero, one live limb, three live limbs
-    /// (the address shape), and all four. They are distinct and non-palindromic, so a
-    /// transposed pair or a reversed order is visible.
+    /// The topic loop reads topics *in place* out of the stack buffer rather than through
+    /// `popn::<N>()`, writes each through `store_be_word`'s zero ladder, then discards `N`
+    /// words by hand -- and `LOG0` makes all of that a no-op. One topic per ladder rung,
+    /// distinct and non-palindromic, so a transposition or a reversal is visible.
     #[test]
     fn log_topics_are_emitted_in_order() {
         const T: [U256; 4] = [
