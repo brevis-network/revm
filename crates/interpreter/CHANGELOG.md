@@ -7,10 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-> These are the changes made on this fork's `pico-v98-31-0-2` integration branch. Everything
-> marked **breaking** needs a major bump at the next release; the version in `Cargo.toml` is
-> still `29.0.1` because release tooling owns it, not this branch.
-
 ### Removed
 
 - **Breaking:** `instructions::contract::get_memory_input_and_out_ranges`. It lost its last

@@ -7,9 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-> These are the changes made on this fork's `pico-v98-31-0-2` integration branch. The version
-> in `Cargo.toml` is still `7.1.1`; release tooling owns it, not this branch.
-
 ### Fixed
 
 - **Undefined behaviour** in `BytecodeIterator::position`. `BytecodeIterator` walks the

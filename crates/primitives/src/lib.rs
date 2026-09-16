@@ -694,10 +694,7 @@ pub struct FastAddressAt<const TAG: usize>(Address);
 /// [`FastAddressAt`] with the tag `resolve_account` uses -- the sole user of tag 0 on the
 /// address side, reached from `JournalInner::sload_slot_warm` on a cache miss.
 ///
-/// (`de7caf9c` split `sload_slot` into `sload_slot_cold` and the free `sload_slot_warm`, and
-/// this line kept the old name. It was the one stale reference that *misdirected*: the heir
-/// to the name, `sload_slot_cold`, uses tag **4**, so a reader following this sentence landed
-/// on the wrong function for the one invariant the tags have.)
+/// Note that `sload_slot_cold`, the similarly named function, uses tag **4**.
 pub type FastAddress = FastAddressAt<0>;
 
 impl<const TAG: usize> FastAddressAt<TAG> {

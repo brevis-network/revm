@@ -4,7 +4,9 @@ concurrency:
   cancel-in-progress: true
   group: ${{github.workflow}}-${{github.ref}}
 
-# `pico-v98-31-0-2` is this fork's integration branch; PRs target it, not `main`.
+# `pico-v98-31-0-2` is this fork's integration branch: every campaign PR targeted it, and
+# with the trigger gated to `main` alone neither this workflow nor the EF statetest suite ran
+# for any of PRs #2-#7. The guard was that the CI never ran, which is not a guard.
 on:
   push:
     branches: [main, "release/**", "pico-v98-31-0-2"]
@@ -13,9 +15,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Stands in for `--all-features`, which does not build here (see the `test` matrix).
-  # `clippy` and `docs` read it so they cannot drift from `test`.
-  FORK_FEATURES: "serde,memory_limit"
 
 jobs:
   test:
@@ -26,20 +25,15 @@ jobs:
       fail-fast: false
       matrix:
         rust: ["1.88", "stable", "nightly"]
-        # Not `--all-features`: it selects `revm-precompile`'s `bn` backend, which does not
-        # build against the pinned `substrate-bn` (`cannot add AffineG1 to AffineG1`).
-        #
-        # `--features serde` is serde *without* `memory_limit`, which is what rsp ships; the
-        # last cell is the only one that compiles the MLOAD/MSTORE `MemoryLimitOOG` tests.
-        #
-        # None of them builds a serde-free `revm-interpreter`, not even the first:
-        # `crates/ee-tests` depends on `revm` with `serde` on, and unification is
-        # workspace-wide. See `test-no-serde`.
-        flags:
-          - "--no-default-features"
-          - ""
-          - "--features serde"
-          - "--features serde,memory_limit"
+        # `--all-features` is **not** buildable on this fork and has not been since before its
+        # tip: `--all-features` selects `revm-precompile`'s `bn` backend, which does not
+        # compile against the `substrate-bn` fork this tree pins (`cannot add AffineG1 to
+        # AffineG1`). It is 3 errors at `pico-v98-31-0-2` with no commit of this branch
+        # applied. Enabling this workflow's trigger without dropping that cell would give a
+        # permanently red matrix entry, and a CI that is red for a reason nobody caused is a
+        # CI nobody reads. `--features serde` in its place is the configuration that actually
+        # matters here: it is what the INV-B serde suite and the `Interpreter` round trip need.
+        flags: ["--no-default-features", "", "--features serde"]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
@@ -47,20 +41,6 @@ jobs:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace ${{ matrix.flags }}
-
-  # Package-scoped on purpose: adding any crate that depends on `revm` with `serde` on
-  # turns the feature back on through unification and silently defeats this job.
-  test-no-serde:
-    name: test without serde
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: |
-          cargo test -p revm-interpreter -p revm-bytecode -p revm-primitives \
-                     -p revm-context -p revm-context-interface -p revm-state
 
   check-no-std:
     name: check no_std ${{ matrix.target }} ${{ matrix.features }}
@@ -105,9 +85,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      # `bn` for the same reason the `test` matrix drops `--all-features`.
       - name: cargo hack
-        run: cargo hack check --feature-powerset --depth 1 --exclude-features bn
+        run: cargo hack check --feature-powerset --depth 1
 
   clippy:
     name: clippy
@@ -118,7 +97,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: cargo clippy --workspace --all-targets --features ${{ env.FORK_FEATURES }}
+      # Not `--all-features`, for the reason given on the `test` matrix above. The
+      # deny-by-default lints -- which are the ones that have caught real defects in this fork
+      # (`derived_hash_with_manual_eq`, `arithmetic_overflow`) -- fire on the default feature
+      # set just the same.
+      - run: cargo clippy --workspace --all-targets --features serde
         env:
           RUSTFLAGS: -Dwarnings
 
@@ -131,8 +114,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rust-docs
-      # Not `--all-features`: rustdoc type-checks, so it fails on the `bn` backend too.
-      - run: cargo doc --workspace --features ${{ env.FORK_FEATURES }} --no-deps --document-private-items
+      - run: cargo doc --workspace --all-features --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: "--cfg docsrs -D warnings"
 

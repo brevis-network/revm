@@ -1,6 +1,5 @@
 [default]
-# Exempt git SHAs quoted in comments; the dictionary reads the hex as words (`caf` -> `calf`).
-extend-ignore-identifiers-re = ["[sS]imular", "ba", "\\b[0-9a-f]{7,40}\\b"]
+extend-ignore-identifiers-re = ["[sS]imular", "ba"]
 
 [files]
 extend-exclude = ["CHANGELOG.md", "tests"]

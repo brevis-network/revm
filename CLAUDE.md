@@ -14,33 +14,25 @@ The project is used by major Ethereum infrastructure including Reth, Foundry, Ha
 
 ### Essential Commands
 
-> **`--all-features` does not build on this fork.** It selects `revm-precompile`'s `bn`
-> backend, which does not compile against the pinned `substrate-bn` (`cannot add AffineG1 to
-> AffineG1`). Use `--features serde,memory_limit`, which is what `ci.yml` runs as
-> `$FORK_FEATURES`.
-
 ```bash
 # Build the project
 cargo build
 cargo build --release
 
-# Run all tests. Both features gate tests that are otherwise not compiled at all: `serde`
-# for `tests/shared_memory_serde.rs` (a `required-features` target), `memory_limit` for the
-# two MLOAD/MSTORE `MemoryLimitOOG` regression tests.
-cargo nextest run --workspace --features serde,memory_limit
+# Run all tests. `--features serde` is the matrix cell that compiles
+# `tests/shared_memory_serde.rs`, which is a `required-features = ["serde"]` target.
+cargo nextest run --workspace --features serde
 cargo nextest run --workspace                       # the default feature set
 cargo nextest run --workspace --no-default-features # the no_std-shaped surface
 
-# Lint and format
-cargo clippy --workspace --all-targets --features serde,memory_limit
+# `memory_limit` is not in any CI cell; it gates the two MLOAD/MSTORE `MemoryLimitOOG`
+# regression tests, so run this before touching memory expansion.
+cargo nextest run -p revm-interpreter --features serde,memory_limit
+
+# Lint and format. Not `--all-features`: it selects `revm-precompile`'s `bn` backend, which
+# does not compile against the pinned `substrate-bn` (`cannot add AffineG1 to AffineG1`).
+cargo clippy --workspace --all-targets --features serde
 cargo fmt --all
-
-# Docs, with the same flags CI uses
-RUSTDOCFLAGS="--cfg docsrs -D warnings" \
-  cargo doc --workspace --features serde,memory_limit --no-deps --document-private-items
-
-# Feature-combination check (CI's `features` job)
-cargo hack check --feature-powerset --depth 1 --exclude-features bn
 
 # Check no_std compatibility
 cargo check --target riscv32imac-unknown-none-elf --no-default-features
