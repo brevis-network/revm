@@ -41,8 +41,6 @@ fn descending_into_a_child_is_fine_when_the_buffer_is_untouched() {
 /// allocation. There is no restore site for that, so the guard in `new_child_context` --
 /// the one check that is compiled into the guest as well -- has to catch it.
 ///
-/// What this depends on beyond the guard is the allocator actually moving the block, which
-/// `reserve` is free not to do, so that is asserted rather than assumed.
 #[test]
 #[should_panic(expected = "INV-B broken before a child frame")]
 fn external_growth_is_caught_before_descending_into_a_child() {
@@ -53,15 +51,14 @@ fn external_growth_is_caught_before_descending_into_a_child() {
     let mut m = SharedMemory::new_with_buffer(buf.clone());
     m.resize(32);
 
-    // Grow through the other handle, past the capacity, so the allocation moves and every
-    // cached `base` on it is left dangling.
-    let before = buf.borrow().as_ptr();
-    buf.borrow_mut().reserve(1 << 16);
-    assert_ne!(
-        buf.borrow().as_ptr(),
-        before,
-        "this probe needs the reallocation to move the block; it grew in place instead"
-    );
+    // Move the buffer through the other handle, leaving `m`'s cached `base` dangling.
+    //
+    // By swapping the allocation, not by `reserve`: `reserve` may realloc *in place*, and
+    // when it does the probe tests nothing. It grew in place on CI's stable runner while
+    // moving on 1.88 and nightly in the same run. `mem::replace` allocates the new buffer
+    // while the old one is still live, so the two addresses cannot coincide.
+    let old = core::mem::replace(&mut *buf.borrow_mut(), vec![0u8; 1 << 16]);
+    assert_ne!(buf.borrow().as_ptr(), old.as_ptr());
 
     let _ = m.new_child_context();
 }
