@@ -1709,24 +1709,22 @@ fn sload_slot_warm(
     slot
 }
 
+primitives::assert_all_fields_written!(
+    /// The check [`sstore_result`]'s `MaybeUninit` writer traded away. `SStoreResult` lives
+    /// in another crate, so a field added to it would land here with no local diff at all.
+    /// See [`assert_all_fields_written`](primitives::assert_all_fields_written).
+    assert_sstore_result_fields_are_all_written(SStoreResult) = SStoreResult {
+        original_value,
+        present_value,
+        new_value,
+    }
+);
+
 /// Builds an [`SStoreResult`] limb by limb.
 ///
 /// The struct is three `U256`s, and the plain literal is a 96-byte copy that LLVM lowers to a
 /// `memcpy` libcall (~74 retired instructions) rather than the twelve `ld`/`sd` pairs it
 /// actually is. `SSTORE` runs ~15 K times per mainnet block.
-/// The exhaustive-initialisation check [`sstore_result`]'s `MaybeUninit` writer traded away;
-/// see the same tripwire on `ExtBytecode`. `SStoreResult` lives in another crate, so an added
-/// field would land here with no local diff at all.
-#[allow(dead_code)]
-fn assert_sstore_result_fields_are_all_written(v: SStoreResult) {
-    let SStoreResult {
-        original_value,
-        present_value,
-        new_value,
-    } = v;
-    let _ = (original_value, present_value, new_value);
-}
-
 #[inline(always)]
 fn sstore_result(
     original_value: StorageValue,

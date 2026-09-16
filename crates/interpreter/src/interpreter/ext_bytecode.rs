@@ -43,32 +43,18 @@ impl Default for ExtBytecode {
     }
 }
 
-/// The exhaustive-initialisation check the two `MaybeUninit` writers below traded away.
-///
-/// `write_with_hash` and `write_with_optional_hash` initialise `ExtBytecode` one field at a
-/// time through `addr_of_mut!`, so the compiler no longer checks that every field is
-/// initialised -- adding one compiles clean, runs, and leaves the new field uninitialised
-/// (executed: adding a `bool` gives 0 errors, 0 warnings, and Miri reports *"constructing
-/// invalid value ... encountered uninitialized memory"*). An exhaustive destructuring, with
-/// no `..`, is a compile error the moment a field is added, which is where the reader is sent
-/// to the two writers.
-#[allow(dead_code)]
-fn assert_ext_bytecode_fields_are_all_written(v: ExtBytecode) {
-    let ExtBytecode {
+primitives::assert_all_fields_written!(
+    /// The check that `write_with_hash` and `write_with_optional_hash` traded away: both
+    /// initialise `ExtBytecode` one field at a time through `addr_of_mut!`. See
+    /// [`assert_all_fields_written`](primitives::assert_all_fields_written).
+    assert_ext_bytecode_fields_are_all_written(ExtBytecode) = ExtBytecode {
         instruction_pointer,
         continue_execution,
         bytecode_hash,
         action,
         base,
-    } = v;
-    let _ = (
-        instruction_pointer,
-        continue_execution,
-        bytecode_hash,
-        action,
-        base,
-    );
-}
+    }
+);
 
 impl ExtBytecode {
     /// Create new extended bytecode and set the instruction pointer to the start of the bytecode.

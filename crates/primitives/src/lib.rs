@@ -41,6 +41,51 @@ pub use alloy_primitives::{
     Bytes, FixedBytes, Log, LogData, TxKind, B256, I128, I256, U128, U256,
 };
 
+/// Declares the exhaustive-initialisation check that a `MaybeUninit` writer trades away.
+///
+/// A constructor that writes its fields one at a time through `addr_of_mut!` is no longer
+/// checked by the compiler for completeness: adding a field compiles clean, runs, and leaves
+/// the new field uninitialised. (Executed on `ExtBytecode`: adding a `bool` gives 0 errors, 0
+/// warnings, and Miri then reports *"constructing invalid value ... encountered uninitialized
+/// memory"*.) An exhaustive destructuring -- no `..` -- is a compile error the moment a field
+/// is added, which sends the next reader to the writer that has to learn about it.
+///
+/// This lives here, and is a macro, because there are several such writers across several
+/// crates and hand-copying the pattern gives each copy its own chance to drift: each carries
+/// `#[allow(dead_code)]`, which is precisely the attribute that hides a copy having gone
+/// stale. One definition, one doc, one place to add the next site.
+///
+/// # Usage
+///
+/// ```
+/// use revm_primitives::assert_all_fields_written;
+///
+/// struct Pair { a: u8, b: u8 }
+/// assert_all_fields_written!(assert_pair_fields_are_all_written(Pair) = Pair { a, b });
+///
+/// // Generic types put their parameters in square brackets, ahead of the value type:
+/// struct Wrap<'a, T> { inner: &'a mut T }
+/// assert_all_fields_written!(
+///     assert_wrap_fields_are_all_written['a, T](Wrap<'a, T>) = Wrap { inner }
+/// );
+/// ```
+#[macro_export]
+macro_rules! assert_all_fields_written {
+    (
+        $(#[$attr:meta])*
+        $name:ident $([$($generics:tt)*])? ($ty:ty) = $path:path { $($field:ident),+ $(,)? }
+    ) => {
+        $(#[$attr])*
+        // Never called: it exists to be type-checked. That is also why the `dead_code` allow
+        // is not hiding anything here -- there is only one copy of this shape in the tree.
+        #[allow(dead_code)]
+        fn $name $(<$($generics)*>)? (v: $ty) {
+            let $path { $($field),+ } = v;
+            $( let _ = $field; )+
+        }
+    };
+}
+
 /// Copies the 20 bytes of an [`Address`] from `src` to `dst`.
 ///
 /// `Address` is `[u8; 20]` with alignment 1, so LLVM has to assume the worst and lowers even a

@@ -22,20 +22,17 @@ pub struct JournaledAccount<'a, ENTRY: JournalEntryTr> {
     journal_entries: &'a mut Vec<ENTRY>,
 }
 
-/// The exhaustive-initialisation check [`JournaledAccount::new`]'s `MaybeUninit` writer
-/// traded away; see the same tripwire on `ExtBytecode`. A field added below is initialised by
-/// nothing, and the compiler no longer says so -- this destructuring is what says so.
-#[allow(dead_code)]
-fn assert_journaled_account_fields_are_all_written<ENTRY: JournalEntryTr>(
-    v: JournaledAccount<'_, ENTRY>,
-) {
-    let JournaledAccount {
+primitives::assert_all_fields_written!(
+    /// The check [`JournaledAccount::new`]'s `MaybeUninit` writer traded away. See
+    /// [`assert_all_fields_written`](primitives::assert_all_fields_written).
+    assert_journaled_account_fields_are_all_written[ENTRY: JournalEntryTr](
+        JournaledAccount<'_, ENTRY>
+    ) = JournaledAccount {
         address,
         account,
         journal_entries,
-    } = v;
-    let _ = (address, account, journal_entries);
-}
+    }
+);
 
 impl<'a, ENTRY: JournalEntryTr> JournaledAccount<'a, ENTRY> {
     /// Consumes the journaled account and returns the mutable account.
