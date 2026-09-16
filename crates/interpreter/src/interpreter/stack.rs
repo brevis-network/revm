@@ -17,7 +17,7 @@ pub const BYTE_LIMIT: usize = STACK_LIMIT * WORD;
 /// The largest cursor value that is **too shallow** to hold `words` operands.
 ///
 /// The threaded cursor is the byte offset of the topmost word (see
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp)), so `words` operands need `sp >=
+/// [`StackTr::sp`]), so `words` operands need `sp >=
 /// (words - 1) * WORD` and the depth test is `sp <= (words - 2) * WORD`.
 ///
 /// # Why the `words == 1` case is special
@@ -34,6 +34,7 @@ pub const BYTE_LIMIT: usize = STACK_LIMIT * WORD;
 /// WORD` as `li 32` plus a signed compare rather than `blez`. Handing it `sp <= 0` directly
 /// was 2.08 M retired instructions on block 24006677, because two operands is the commonest
 /// arity there is.
+///
 /// # The clamp
 ///
 /// `(words as isize - 2) * WORD` wraps for a `words` anywhere near `usize::MAX`, and it wraps
@@ -56,6 +57,37 @@ pub const fn too_shallow_for(words: usize) -> isize {
     } else {
         -1
     }
+}
+
+/// Whether the cursor has **no room** for one more word, i.e. a push must halt with
+/// `StackOverflow`.
+///
+/// # Why this is one *unsigned* compare and not a signed one
+///
+/// The obvious spelling, `(sp as isize) >= (BYTE_LIMIT - WORD) as isize`, closes only half
+/// the domain. The cursor is biased -- an empty stack is `-WORD`, i.e. `usize::MAX - 31` --
+/// so the comparison has to accept that one negative value, and a signed `>=` against a
+/// positive threshold accepts **every** negative value with it. `sp = usize::MAX - 64` reads
+/// as `-65`, passes the guard, and `push_at` then writes at `base + sp + WORD`: roughly 16
+/// EiB past a 32 KiB buffer. Half of all `usize` values are in that half.
+///
+/// `sp.wrapping_add(WORD)` is the stack's byte length after the push -- the bias is exactly
+/// one word, so adding it back gives the unbiased `byte_len`, and the empty cursor wraps to
+/// `0` rather than to something huge. One unsigned `>` against `BYTE_LIMIT - WORD` then
+/// accepts `byte_len` in `0..=BYTE_LIMIT - WORD` and rejects everything else, both halves.
+///
+/// It also costs nothing over the signed form: `push_at` computes `sp + WORD` for the store
+/// address and the caller computes it again for the new cursor, so LLVM already has the
+/// value in a register.
+///
+/// What this does *not* check is alignment. `sp` in `usize::MAX - 30 ..= usize::MAX` wraps to
+/// a byte length in `1..=31`, which is inside the buffer but not word-aligned. That is the
+/// caller's invariant (`set_sp` debug-asserts it, and `Interpreter::run_plain` states it),
+/// not a bound this test can carry for free -- and unlike the case above, it cannot put a
+/// write outside the allocation.
+#[inline(always)]
+pub const fn no_room_to_push(sp: usize) -> bool {
+    sp.wrapping_add(WORD) > BYTE_LIMIT - WORD
 }
 
 /// EVM stack with [STACK_LIMIT] capacity of words.
@@ -912,10 +944,13 @@ mod tests {
 
     fn run(f: impl FnOnce(&mut Stack)) {
         let mut stack = Stack::new();
-        // Fill the whole capacity with non-zero values. `write_bytes` counts *elements* of
-        // the pointee type and `base_mut()` is a `*mut U256`, so the count is words, not
-        // bytes: the previous `STACK_LIMIT` poisoned the first 32 words of 1024 and left
-        // every test that relies on reading garbage above them reading zeros instead.
+        // Fill the whole capacity with non-zero values.
+        //
+        // `STACK_LIMIT` and not `BYTE_LIMIT`: `write_bytes` counts *elements of the pointee
+        // type*, and `base_mut()` is a `*mut U256`, so the count is words. `STACK_LIMIT`
+        // words is the whole 32 KiB buffer, which is what this wants. Read as a byte count it
+        // looks 32x too small, and "fixing" it to `BYTE_LIMIT` writes 32768 words -- 1 MiB,
+        // 31/32 of it past the end of the stack.
         unsafe {
             core::ptr::write_bytes(stack.base_mut(), 0xff, STACK_LIMIT);
         }

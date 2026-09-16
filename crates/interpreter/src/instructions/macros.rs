@@ -279,7 +279,8 @@ macro_rules! poison_at {
 
 /// The threaded form of [`popn`].
 ///
-/// `$sp` is the loop-local stack cursor (see [`StackTr::sp`](crate::interpreter_types::StackTr::sp))
+/// `$sp` is the loop-local stack cursor (see
+/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp))
 /// and is updated in place; the enclosing function returns it, so the underflow exit returns
 /// the cursor **unchanged** -- the operands are still on the stack, which is what the
 /// non-threaded form leaves behind too.
@@ -340,11 +341,12 @@ macro_rules! popn_top_at {
 #[collapse_debuginfo(yes)]
 macro_rules! push_at {
     ($interpreter:expr, $sp:ident, $rem:ident, $x:expr) => {
-        // A *signed* `>=`, not `==`: see the note on `dup_at` for both halves of that --
-        // why an equality is a false upper bound, and why the comparison has to be signed
-        // when the cursor is biased. This macro is the room check of eighteen instructions.
-        if ($sp as isize) >= ($crate::interpreter::BYTE_LIMIT - $crate::interpreter::WORD) as isize
-        {
+        // This macro is the room check of eighteen instructions, so it is the one that has to
+        // be right for an arbitrary `usize`. See `no_room_to_push`: neither an equality nor a
+        // signed `>=` is an upper bound here -- the first rejects one value, the second
+        // rejects only the positive half, and the cursor is biased so half the domain reads
+        // as negative.
+        if $crate::interpreter::no_room_to_push($sp) {
             return (
                 $sp,
                 $crate::poison_at!($interpreter, $rem, $interpreter.halt_overflow()),

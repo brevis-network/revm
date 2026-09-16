@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+> These are the changes made on this fork's `pico-v98-31-0-2` integration branch. Everything
+> marked **breaking** needs a major bump at the next release; the version in `Cargo.toml` is
+> still `29.0.1` because release tooling owns it, not this branch.
+
+### Removed
+
+- **Breaking:** `instructions::contract::get_memory_input_and_out_ranges`. It lost its last
+  call site when `prepare_call_inputs` absorbed it, leaving a second, independently
+  maintained copy of the call prologue's range preparation. Callers should use
+  `prepare_call_inputs`.
+
+### Changed
+
+- **Breaking:** `interpreter_types::JumpCtx`'s fields are now private. Every value in it is a
+  memory-safety precondition of the *safe* `Jumps::absolute_ip_with`, so with `pub` fields and
+  no constructor, safe code containing no `unsafe` token could build one out of three
+  arbitrary values. Build one with the new `unsafe fn JumpCtx::new`, which states the
+  obligation, and read it back through `table_ptr()`, `table_len()` and `code_base()`.
+- **Breaking:** `interpreter::grow_memory_word` and `interpreter::grow_memory_word_written`
+  return `Result<(), InstructionResult>` rather than `bool`, and apply the `memory_limit` cap
+  themselves instead of requiring each caller to restate it. Match on the error and halt with
+  it; `Ok(())` is the previous `true`.
+- `MemoryGas::record_new_len` bounds the word count by what `limit` can represent on the
+  target as well as by `2^32`. The two differ only on a 32-bit target, where the previous
+  `u32::MAX` test was vacuous.
+
+### Added
+
+- `interpreter::no_room_to_push`, the single correct room check for a biased stack cursor.
+  The previous signed comparison was an upper bound on only half of the `usize` domain.
+
+### Fixed
+
+- `MLOAD`/`MSTORE` honour `memory_limit` again (regression tests under that feature; the
+  `test` CI matrix now has a cell that enables it).
+- `tests/shared_memory_serde.rs` is declared `required-features = ["serde"]` instead of being
+  `#![cfg]`-gated, so naming the target without the feature errors rather than silently
+  running zero tests. This replaces a self dev-dependency that turned `serde` on for every
+  test build of the crate, including the `--no-default-features` CI cell.
+
 ## [29.0.1](https://github.com/bluealloy/revm/compare/revm-interpreter-v29.0.0...revm-interpreter-v29.0.1) - 2025-11-07
 
 ### Other

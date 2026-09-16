@@ -1,4 +1,5 @@
 use super::MemoryTr;
+use crate::InstructionResult;
 use core::{
     cell::{Ref, RefCell, RefMut},
     cmp::min,
@@ -1618,6 +1619,29 @@ pub fn resize_memory_written<Memory: MemoryTr>(
     }
 }
 
+/// The `memory_limit` cap, applied where the expansion happens.
+///
+/// It lives in [`grow_memory_word`] and [`grow_memory_word_written`] rather than at their
+/// call sites because it is an invariant of *growing the buffer*, not of `MLOAD` and `MSTORE`
+/// in particular. Restating it per caller is exactly how it went missing: moving the
+/// expansion off `resize_memory_written!` -- where the macro applies the cap for ~20 other
+/// memory opcodes -- onto these helpers dropped it, leaving the two opcodes most able to push
+/// past the cap as the only two not subject to it. A third caller of a `pub` helper would
+/// have dropped it again.
+///
+/// Compiled out entirely without the feature, which is every build rsp ships.
+#[cfg(feature = "memory_limit")]
+#[inline(always)]
+fn check_memory_limit<Memory: MemoryTr>(
+    memory: &Memory,
+    offset: usize,
+) -> Result<(), InstructionResult> {
+    if memory.limit_reached(offset, 32) {
+        return Err(InstructionResult::MemoryLimitOOG);
+    }
+    Ok(())
+}
+
 /// The expansion half of a 32-byte `MSTORE` whose caller has *already* found that the word
 /// does not fit, by testing `offset >= gas.memory().word_limit()`.
 ///
@@ -1626,39 +1650,61 @@ pub fn resize_memory_written<Memory: MemoryTr>(
 /// nor re-reads it, and the "does it fit" test is a single `bgeu` against a field instead of
 /// a saturating `num_words` of `offset + 32`.
 ///
+/// # Errors
+///
+/// [`InstructionResult::MemoryLimitOOG`] if the `memory_limit` cap refuses the new length, or
+/// [`InstructionResult::MemoryOOG`] if the frame cannot pay the expansion. The caller halts
+/// with whichever comes back; the distinction is consensus-visible, which is why this is a
+/// `Result` and not a `bool`. The cap is applied here rather than at the call sites -- see
+/// the crate-internal `check_memory_limit` for why that matters.
+///
 /// # Safety
 ///
 /// The caller's test is the precondition: `num_words(offset + 32) > words_num` must already
 /// hold, because `resize_memory_cold_written` reaches `record_new_len` through
 /// `unwrap_unchecked`.
 #[inline(always)]
-#[must_use]
 pub unsafe fn grow_memory_word_written<Memory: MemoryTr>(
     gas: &mut crate::Gas,
     memory: &mut Memory,
     offset: usize,
-) -> bool {
+) -> Result<(), InstructionResult> {
+    #[cfg(feature = "memory_limit")]
+    check_memory_limit(memory, offset)?;
     let new_num_words = num_words(offset.saturating_add(32));
     debug_assert!(new_num_words > gas.memory().words_num());
-    resize_memory_cold_written(gas, memory, new_num_words, offset, 32)
+    if resize_memory_cold_written(gas, memory, new_num_words, offset, 32) {
+        Ok(())
+    } else {
+        Err(InstructionResult::MemoryOOG)
+    }
 }
 
 /// [`grow_memory_word_written`] for a caller that only reads the word (`MLOAD`), so the new
 /// tail has to be zeroed in full.
 ///
+/// # Errors
+///
+/// Same as [`grow_memory_word_written`].
+///
 /// # Safety
 ///
 /// Same precondition as [`grow_memory_word_written`].
 #[inline(always)]
-#[must_use]
 pub unsafe fn grow_memory_word<Memory: MemoryTr>(
     gas: &mut crate::Gas,
     memory: &mut Memory,
     offset: usize,
-) -> bool {
+) -> Result<(), InstructionResult> {
+    #[cfg(feature = "memory_limit")]
+    check_memory_limit(memory, offset)?;
     let new_num_words = num_words(offset.saturating_add(32));
     debug_assert!(new_num_words > gas.memory().words_num());
-    resize_memory_cold(gas, memory, new_num_words)
+    if resize_memory_cold(gas, memory, new_num_words) {
+        Ok(())
+    } else {
+        Err(InstructionResult::MemoryOOG)
+    }
 }
 
 /// [`resize_memory_cold`] for [`resize_memory_written`]; inlined for the same reason.
@@ -2163,7 +2209,7 @@ mod tests {
     /// limbs 1 and 2 in the `l3 == 0` rung, which is the arm every value below `2^192`
     /// takes, i.e. every address. So the values below are built so that no two limbs are
     /// equal and no limb is symmetric under byte reversal: a transposition, a dropped
-    /// reversal or a mis-indexed limb all change the bytes.
+    /// reversal or a wrongly indexed limb all change the bytes.
     #[test]
     fn be_word_ladder_matches_u256() {
         // One representative per rung, plus the boundaries. Limb `i` gets a distinct

@@ -23,7 +23,7 @@ pub use shared_memory::{
     grow_memory_word, grow_memory_word_written, num_words, resize_memory, resize_memory_written,
     SharedMemory,
 };
-pub use stack::{too_shallow_for, Stack, BYTE_LIMIT, STACK_LIMIT, WORD};
+pub use stack::{no_room_to_push, too_shallow_for, Stack, BYTE_LIMIT, STACK_LIMIT, WORD};
 
 // imports
 use crate::{
@@ -682,7 +682,10 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
             // loop-local cursor, which starts as `Stack::sp()` and moves by whole words with
             // each arm checking the bound it crosses, so it is never above `byte_limit`. The
             // same test in the `*_at` entry points -- reachable from outside the crate with
-            // an arbitrary `sp` -- is a false upper bound, and is a signed `>=` there.
+            // an arbitrary `sp` -- is a false upper bound, and so is the signed `>=` that
+            // replaced it: those use `no_room_to_push`, one unsigned compare that closes both
+            // halves of the domain. It is not used here because it would materialise the
+            // constant this arm exists to keep pinned.
             //
             // Both exits below report `StackOverflow` even when it was the *depth* test that
             // failed, which is pre-existing and is not consensus-visible: both halts are

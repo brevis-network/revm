@@ -27,30 +27,22 @@ macro_rules! mstore_body {
         let rem = if offset >= $context.interpreter.gas.memory().word_limit() {
             // Charges gas, so the field has to be the truth first; see `sync_gas_at!`.
             sync_gas_at!($context.interpreter, $rem);
-            // The same guard `resize_memory_written!` applies, and for the same reason: the
-            // `memory_limit` feature is a hard cap on the shared buffer, and `MSTORE` is one
-            // of the two opcodes most able to push past it. Moving the expansion off
-            // `resize_memory_written!` and onto `grow_memory_word_written` dropped it, which
-            // left the cap applied by ~20 memory opcodes and not by these two. It sits inside
-            // the cold arm, so it costs nothing on the path that does not grow -- and nothing
-            // at all in a build without the feature, which is every build rsp ships.
-            #[cfg(feature = "memory_limit")]
-            if $context.interpreter.memory.limit_reached(offset, 32) {
-                $context.interpreter.halt_memory_limit_oog();
-                return $ret;
-            }
             // The `set_u256_ptr` below writes all 32 bytes of `offset..offset + 32`
             // unconditionally and before anything can read them, so the grow does not have
             // to zero that part of the new tail. Same gas, same word count.
+            //
+            // `grow_memory_word_written` applies the `memory_limit` cap itself and reports
+            // which of the two halts it wants, so there is no cap to restate here and no way
+            // for a caller to forget one; see `check_memory_limit`.
             // SAFETY: the test above is exactly `grow_memory_word_written`'s precondition.
-            if !unsafe {
+            if let Err(halt) = unsafe {
                 crate::interpreter::grow_memory_word_written(
                     &mut $context.interpreter.gas,
                     &mut $context.interpreter.memory,
                     offset,
                 )
             } {
-                $context.interpreter.halt_memory_oog();
+                $context.interpreter.halt(halt);
                 return $ret;
             }
             $context.interpreter.gas.remaining()
@@ -84,7 +76,7 @@ pub fn mload<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, 
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn mload_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -113,21 +105,16 @@ pub fn mload_at<WIRE: InterpreterTypes, H: ?Sized>(
     let rem = if offset >= context.interpreter.gas.memory().word_limit() {
         // Charges gas, so the field has to be the truth first; see `sync_gas_at!`.
         sync_gas_at!(context.interpreter, rem);
-        // See the matching guard in `mstore_body!`.
-        #[cfg(feature = "memory_limit")]
-        if context.interpreter.memory.limit_reached(offset, 32) {
-            context.interpreter.halt_memory_limit_oog();
-            return (sp, u64::MAX);
-        }
+        // The `memory_limit` cap lives inside `grow_memory_word`; see `check_memory_limit`.
         // SAFETY: the test above is exactly `grow_memory_word`'s precondition.
-        if !unsafe {
+        if let Err(halt) = unsafe {
             crate::interpreter::grow_memory_word(
                 &mut context.interpreter.gas,
                 &mut context.interpreter.memory,
                 offset,
             )
         } {
-            context.interpreter.halt_memory_oog();
+            context.interpreter.halt(halt);
             return (sp, u64::MAX);
         }
         context.interpreter.gas.remaining()
@@ -158,7 +145,7 @@ pub fn mstore<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_,
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn mstore_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -231,7 +218,7 @@ pub fn mstore8<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn mstore8_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -262,7 +249,7 @@ pub fn msize<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, 
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn msize_at<WIRE: InterpreterTypes, H: ?Sized>(

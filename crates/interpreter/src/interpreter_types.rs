@@ -84,6 +84,7 @@ pub trait LegacyBytecode {
 /// bytecode's data pointer. None of them can change while one frame runs -- only the
 /// instruction *pointer* moves -- so `Interpreter::run_plain` reads them once into a local
 /// and hands that local to the two arms that need it.
+///
 /// # Why the fields are private
 ///
 /// Every value in here is a memory-safety precondition of a *safe* function:
