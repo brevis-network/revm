@@ -636,6 +636,62 @@ const ALL_SPECS: [SpecId; 21] = [
     SpecId::AMSTERDAM,
 ];
 
+/// `ALL_SPECS` has to be **every** [`SpecId`], in discriminant order: both tables below are
+/// indexed by `spec_id as usize` with no bound of their own, from a `SpecId` that came out of
+/// the block's configuration.
+///
+/// The `while` loop below catches a reordering or a duplicate. This `match` catches the
+/// likelier mistake, and is the reason any of this exists: this is a fork that gets rebased
+/// on upstream revm, and a hard fork added there has to be acknowledged somewhere. With no
+/// `_` arm here, a new variant is a compile error in this function, which is where the fix
+/// belongs.
+///
+/// The arm alone is not enough, which is why both tables below are sized `ALL_SPECS.len()`
+/// rather than a literal. Adding only the `match` arm makes the build green again while
+/// `ALL_SPECS` and both tables stay one row short, and the first `SSTORE` of the new fork
+/// then panics on an out-of-bounds index inside the guest -- the failure this exists to
+/// prevent, one rebase later. Tied to the array, the tables grow with it and the loops fill
+/// the new row, so the only thing left to do by hand is the one the compiler asks for.
+///
+/// Compile-time only on purpose: `sstore_at` still indexes with `spec_id as usize`, so this
+/// adds nothing to the guest.
+const fn spec_row(spec: SpecId) -> usize {
+    match spec {
+        SpecId::FRONTIER => 0,
+        SpecId::FRONTIER_THAWING => 1,
+        SpecId::HOMESTEAD => 2,
+        SpecId::DAO_FORK => 3,
+        SpecId::TANGERINE => 4,
+        SpecId::SPURIOUS_DRAGON => 5,
+        SpecId::BYZANTIUM => 6,
+        SpecId::CONSTANTINOPLE => 7,
+        SpecId::PETERSBURG => 8,
+        SpecId::ISTANBUL => 9,
+        SpecId::MUIR_GLACIER => 10,
+        SpecId::BERLIN => 11,
+        SpecId::LONDON => 12,
+        SpecId::ARROW_GLACIER => 13,
+        SpecId::GRAY_GLACIER => 14,
+        SpecId::MERGE => 15,
+        SpecId::SHANGHAI => 16,
+        SpecId::CANCUN => 17,
+        SpecId::PRAGUE => 18,
+        SpecId::OSAKA => 19,
+        SpecId::AMSTERDAM => 20,
+    }
+}
+
+const _: () = {
+    let mut i = 0;
+    while i < ALL_SPECS.len() {
+        assert!(
+            spec_row(ALL_SPECS[i]) == i && ALL_SPECS[i] as usize == i,
+            "ALL_SPECS must be every SpecId, in discriminant order"
+        );
+        i += 1;
+    }
+};
+
 /// A representative `SStoreResult` for each [`SStoreStatus`], in discriminant order.
 /// `1`, `2` and `3` stand in for the distinct non-zero `X`, `Y` and `Z`.
 const STATUS_WITNESS: [(u64, u64, u64); SSTORE_STATUS_COUNT] = [
@@ -652,13 +708,13 @@ const STATUS_WITNESS: [(u64, u64, u64); SSTORE_STATUS_COUNT] = [
 
 /// `SSTORE` dynamic cost and refund, indexed by `spec_id as usize` then by
 /// `sstore_status(vals) as usize`.
-pub static SSTORE_GAS: [[SStoreGas; SSTORE_STATUS_COUNT]; 21] = {
+pub static SSTORE_GAS: [[SStoreGas; SSTORE_STATUS_COUNT]; ALL_SPECS.len()] = {
     let mut table = [[SStoreGas {
         dyn_cost: 0,
         refund: 0,
-    }; SSTORE_STATUS_COUNT]; 21];
+    }; SSTORE_STATUS_COUNT]; ALL_SPECS.len()];
     let mut s = 0;
-    while s < 21 {
+    while s < ALL_SPECS.len() {
         let spec = ALL_SPECS[s];
         let mut i = 0;
         while i < SSTORE_STATUS_COUNT {
@@ -680,13 +736,13 @@ pub static SSTORE_GAS: [[SStoreGas; SSTORE_STATUS_COUNT]; 21] = {
 };
 
 /// The revision-only `SSTORE` constants, indexed by `spec_id as usize`.
-pub static SSTORE_SPEC: [SStoreSpec; 21] = {
+pub static SSTORE_SPEC: [SStoreSpec; ALL_SPECS.len()] = {
     let mut table = [SStoreSpec {
         static_cost: 0,
         cold_extra: 0,
-    }; 21];
+    }; ALL_SPECS.len()];
     let mut s = 0;
-    while s < 21 {
+    while s < ALL_SPECS.len() {
         let spec = ALL_SPECS[s];
         table[s] = SStoreSpec {
             static_cost: static_sstore_cost(spec) as u32,
