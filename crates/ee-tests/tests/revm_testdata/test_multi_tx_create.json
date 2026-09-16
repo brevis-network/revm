@@ -94,7 +94,7 @@
         "balance": "0x0",
         "code": {
           "LegacyAnalyzed": {
-            "bytecode": "0x61ffffff00",
+            "bytecode": "0x61ffffff0000",
             "jump_table": {
               "bits": 5,
               "data": [

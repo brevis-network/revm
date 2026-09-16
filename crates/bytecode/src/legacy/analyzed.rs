@@ -27,6 +27,7 @@ use primitives::Bytes;
 /// expense of doing analysis and generate the jump table.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "LegacyAnalyzedBytecodeDe"))]
 pub struct LegacyAnalyzedBytecode {
     /// The potentially padded bytecode.
     bytecode: Bytes,
@@ -34,6 +35,38 @@ pub struct LegacyAnalyzedBytecode {
     original_len: usize,
     /// The jump table.
     jump_table: JumpTable,
+}
+
+/// What a [`LegacyAnalyzedBytecode`] deserialises through, so that [`new`](
+/// LegacyAnalyzedBytecode::new)'s checks apply to wire data too.
+///
+/// The three fields are *independent* on the wire, and a derived `Deserialize` writes them
+/// straight into the struct -- so the constructor whose doc calls itself "the only thing
+/// standing between a caller-chosen jump table and the interpreter's pointer arithmetic" was
+/// skipped by the one caller it was written for. `{"bytecode":"0x00","original_len":1,
+/// "jump_table":<4096 set bits>}` deserialised without complaint and answered
+/// `is_valid(4000)` with `true`, against a one-byte allocation.
+///
+/// Routing through [`try_new`](LegacyAnalyzedBytecode::try_new) costs one comparison per
+/// deserialised contract and makes the assertions structural, which is what
+/// `revm-interpreter`'s `JumpCtx::new` safety contract cites them as. `Bytecode` derives
+/// `Deserialize` too, but as an enum it delegates to this impl for the `LegacyAnalyzed`
+/// variant, so it is covered by the same fix.
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+struct LegacyAnalyzedBytecodeDe {
+    bytecode: Bytes,
+    original_len: usize,
+    jump_table: JumpTable,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<LegacyAnalyzedBytecodeDe> for LegacyAnalyzedBytecode {
+    type Error = &'static str;
+
+    fn try_from(de: LegacyAnalyzedBytecodeDe) -> Result<Self, Self::Error> {
+        Self::try_new(de.bytecode, de.original_len, de.jump_table)
+    }
 }
 
 impl Default for LegacyAnalyzedBytecode {
@@ -64,11 +97,13 @@ impl LegacyAnalyzedBytecode {
     ///
     /// # What the assertions are for
     ///
-    /// This constructor is reachable from deserialization -- rsp's witness format reaches it
-    /// with `bytecode`, `original_len` and `jump_table` as three *independent* wire fields,
-    /// and `hash_slow()` covers only `bytecode[..original_len]`. So the asserts here are not
-    /// debug hygiene: they are the only thing standing between a caller-chosen jump table and
-    /// the interpreter's pointer arithmetic.
+    /// Deserialization reaches these checks -- rsp's witness format supplies `bytecode`,
+    /// `original_len` and `jump_table` as three *independent* wire fields, and `hash_slow()`
+    /// covers only `bytecode[..original_len]`. So they are not debug hygiene: they are the
+    /// only thing standing between a caller-chosen jump table and the interpreter's pointer
+    /// arithmetic. A derived `Deserialize` wrote the fields directly and skipped them
+    /// entirely, which is why the struct now carries `serde(try_from = ...)`, routing the
+    /// wire format through [`try_new`](Self::try_new).
     ///
     /// Together the first two pin `jump_table.len() == original_len`, which is what
     /// [`analyze_legacy`](super::analysis::analyze_legacy) produces. That is what bounds
@@ -92,23 +127,44 @@ impl LegacyAnalyzedBytecode {
     /// * If `bytecode` has no byte past `original_len` (which also rejects an empty
     ///   `bytecode`).
     pub fn new(bytecode: Bytes, original_len: usize, jump_table: JumpTable) -> Self {
-        assert!(
-            original_len <= jump_table.len(),
-            "jump table length is less than original length"
-        );
-        assert!(
-            jump_table.len() <= original_len,
-            "jump table length is greater than original length"
-        );
-        assert!(
-            original_len < bytecode.len(),
-            "bytecode is not padded past original_len"
-        );
-        Self {
+        match Self::try_new(bytecode, original_len, jump_table) {
+            Ok(this) => this,
+            Err(msg) => panic!("{msg}"),
+        }
+    }
+
+    /// [`new`](Self::new), returning the violated invariant instead of panicking.
+    ///
+    /// This is the one place the three checks live. `new` is this function with the error
+    /// turned into a panic, and `Deserialize` is this function with the error turned into a
+    /// `serde` error -- so a wire-format value cannot reach the interpreter through a path
+    /// that skipped them, which is what the safety contract of `revm-interpreter`'s
+    /// `JumpCtx::new` relies on.
+    ///
+    /// # Errors
+    ///
+    /// * if the jump table length is not exactly `original_len`;
+    /// * if `bytecode` has no byte past `original_len` (which also rejects an empty
+    ///   `bytecode`).
+    pub fn try_new(
+        bytecode: Bytes,
+        original_len: usize,
+        jump_table: JumpTable,
+    ) -> Result<Self, &'static str> {
+        if original_len > jump_table.len() {
+            return Err("jump table length is less than original length");
+        }
+        if jump_table.len() > original_len {
+            return Err("jump table length is greater than original length");
+        }
+        if original_len >= bytecode.len() {
+            return Err("bytecode is not padded past original_len");
+        }
+        Ok(Self {
             bytecode,
             original_len,
             jump_table,
-        }
+        })
     }
 
     /// Returns a reference to the bytecode.
@@ -156,12 +212,22 @@ mod tests {
         );
     }
 
+    /// `original_len` past the end of the buffer entirely, with a jump table that *agrees*
+    /// with it so the first two checks pass and the third is the one under test. Nothing else
+    /// in this file reaches that check with `original_len > bytecode.len()`:
+    /// `test_panic_on_unpadded_bytecode` reaches it with `original_len == bytecode.len()`, so
+    /// relaxing the check to `<=` would leave only that one test standing -- and the shape
+    /// where `original_len` genuinely exceeds the allocation was covered by nothing at all.
+    /// (This test previously passed a 2-bit table with `original_len = 100` and so tripped
+    /// the *first* check, duplicating `test_panic_on_short_jump_table`.)
     #[test]
-    #[should_panic(expected = "jump table length is less than original length")]
+    #[should_panic(expected = "bytecode is not padded past original_len")]
     fn test_panic_on_large_original_len() {
-        let bytecode = Bytes::from_static(&[opcode::PUSH1, 0x01]);
-        let bytecode = LegacyRawBytecode(bytecode).into_analyzed();
-        let _ = LegacyAnalyzedBytecode::new(bytecode.bytecode, 100, bytecode.jump_table);
+        let analyzed =
+            LegacyRawBytecode(Bytes::from_static(&[opcode::PUSH1, 0x01])).into_analyzed();
+        assert!(analyzed.bytecode.len() < 100);
+        let jump_table = JumpTable::new(bitvec![u8, Lsb0; 0; 100]);
+        let _ = LegacyAnalyzedBytecode::new(analyzed.bytecode, 100, jump_table);
     }
 
     #[test]
@@ -279,6 +345,81 @@ mod tests {
                 assert!(pc < analyzed.original_len());
                 assert!(pc + 1 < analyzed.bytecode().len());
             }
+        }
+    }
+}
+
+/// The wire format, which is the path the constructor's checks were written for and the one
+/// they used to miss entirely.
+#[cfg(all(test, feature = "serde"))]
+mod serde_tests {
+    use super::*;
+    use crate::{opcode, Bytecode, LegacyRawBytecode};
+    use bitvec::{bitvec, order::Lsb0};
+
+    fn wire(bytecode: &str, original_len: usize, table: &JumpTable) -> serde_json::Value {
+        serde_json::json!({
+            "bytecode": bytecode,
+            "original_len": original_len,
+            "jump_table": serde_json::to_value(table).unwrap(),
+        })
+    }
+
+    /// The reproducer: a one-byte buffer with a 4096-bit table, every bit set. A derived
+    /// `Deserialize` accepted it and then answered `is_valid(4000)` with `true`, which is the
+    /// out-of-allocation `ip` that `Jumps::absolute_ip_with` builds without a further check.
+    #[test]
+    fn an_overlong_jump_table_is_refused_on_the_wire() {
+        let table = JumpTable::new(bitvec![u8, Lsb0; 1; 4096]);
+        let json = wire("0x00", 1, &table);
+        let err = serde_json::from_value::<LegacyAnalyzedBytecode>(json.clone())
+            .expect_err("deserialised a 4096-bit table over a 1-byte buffer");
+        assert!(
+            err.to_string().contains("jump table length is greater"),
+            "unexpected error: {err}"
+        );
+        // And through the enum, which is how a witness actually names it.
+        assert!(
+            serde_json::from_value::<Bytecode>(serde_json::json!({ "LegacyAnalyzed": json }))
+                .is_err()
+        );
+    }
+
+    /// The other two checks, over the wire.
+    #[test]
+    fn the_other_constructor_checks_apply_on_the_wire() {
+        // Table shorter than `original_len`.
+        let short = JumpTable::new(bitvec![u8, Lsb0; 0; 1]);
+        assert!(
+            serde_json::from_value::<LegacyAnalyzedBytecode>(wire("0x0000", 2, &short)).is_err()
+        );
+        // No guard byte: `original_len` covers the whole buffer.
+        let exact = JumpTable::new(bitvec![u8, Lsb0; 0; 2]);
+        assert!(
+            serde_json::from_value::<LegacyAnalyzedBytecode>(wire("0x0000", 2, &exact)).is_err()
+        );
+        // `original_len` past the end of the buffer, table agreeing.
+        let long = JumpTable::new(bitvec![u8, Lsb0; 0; 100]);
+        assert!(
+            serde_json::from_value::<LegacyAnalyzedBytecode>(wire("0x0000", 100, &long)).is_err()
+        );
+    }
+
+    /// The checks must not cost the honest path: everything `analyze` produces round-trips.
+    #[test]
+    fn analysed_bytecode_still_round_trips() {
+        let cases: &[&[u8]] = &[
+            &[],
+            &[opcode::STOP],
+            &[opcode::JUMPDEST, opcode::PUSH1, 0x01, opcode::STOP],
+            &[opcode::PUSH32],
+            &[opcode::JUMPDEST; 64],
+        ];
+        for case in cases {
+            let analyzed = LegacyRawBytecode(Bytes::copy_from_slice(case)).into_analyzed();
+            let json = serde_json::to_string(&analyzed).unwrap();
+            let back: LegacyAnalyzedBytecode = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, analyzed, "{case:?}");
         }
     }
 }

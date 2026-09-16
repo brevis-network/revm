@@ -15,7 +15,17 @@ use std::vec::Vec;
 ///
 /// Paying for it here rather than in the loop is deliberate: the alternative is a bounds or
 /// poison test on every single dispatch, which is the test the loop was restructured to
-/// remove. One byte per analysed contract costs nothing at run time.
+/// remove.
+///
+/// # What it costs, stated honestly
+///
+/// Nothing at dispatch time, which is the point. At *analysis* time it is not free: a
+/// mandatory guard byte means the returned buffer is always strictly longer than the input,
+/// so the "no padding needed, hand the input straight back" arm that `analyze_legacy` used to
+/// have is now unreachable by construction. That arm was already rare on mainnet -- it needs
+/// the code to end exactly on a `STOP`, and Solidity runtime code ends in a CBOR metadata
+/// blob -- but it was not free to delete, so [`analyze_legacy`] grows the caller's buffer in
+/// place where it can rather than always copying. See the padding arm there.
 pub const GUARD_BYTES: usize = 1;
 
 /// Analyzes the bytecode for use in [`LegacyAnalyzedBytecode`](crate::LegacyAnalyzedBytecode).
@@ -72,13 +82,35 @@ pub fn analyze_legacy(bytecode: Bytes) -> (JumpTable, Bytes) {
         }
     }
 
-    let padding = i - len + (opcode != opcode::STOP) as usize + GUARD_BYTES;
-    let mut padded = Vec::with_capacity(len + padding);
-    padded.extend_from_slice(&bytecode);
-    padded.resize(len + padding, 0);
-    let bytecode = Bytes::from(padded);
+    // Always at least `GUARD_BYTES`, so there is no "input is already fine" arm to take; see
+    // [`GUARD_BYTES`]. What is left to save is the *copy*, not the allocation.
+    let total = len + padding_len(i, len, opcode);
+    let bytecode = match bytecode.0.try_into_mut() {
+        // Sole owner of a growable allocation: `resize` reallocates, which for a one-byte
+        // extension is an in-place `realloc` on any real allocator, and zero-fills exactly
+        // the padding. No memcpy of the code itself. This is the arm the pre-guard-byte
+        // `padding == 0` fast path used to cover.
+        Ok(mut buf) => {
+            buf.resize(total, 0);
+            Bytes::from(buf.freeze())
+        }
+        // Shared with another handle, or static, or not ours to grow. Copy, as before.
+        Err(shared) => {
+            let mut padded = Vec::with_capacity(total);
+            padded.extend_from_slice(&shared);
+            padded.resize(total, 0);
+            Bytes::from(padded)
+        }
+    };
 
     (JumpTable::new(jumps), bytecode)
+}
+
+/// How many bytes [`analyze_legacy`] appends: enough to complete a truncated trailing `PUSH`
+/// immediate, a `STOP` if the code does not already end in one, and [`GUARD_BYTES`].
+#[inline]
+const fn padding_len(scan_end: usize, len: usize, last_opcode: u8) -> usize {
+    scan_end - len + (last_opcode != opcode::STOP) as usize + GUARD_BYTES
 }
 
 #[cfg(test)]
@@ -189,6 +221,79 @@ mod tests {
         assert!(!jump_table.is_valid(0)); // PUSH1
         assert!(!jump_table.is_valid(2)); // PUSH2
         assert!(!jump_table.is_valid(5)); // PUSH4
+    }
+
+    /// The padding arm now branches on whether the caller's buffer is ours to grow. Both
+    /// arms are on the consensus path, so they must agree byte for byte -- including the
+    /// zero fill, which the reuse arm writes over whatever the allocation held.
+    #[test]
+    fn both_padding_arms_produce_the_same_buffer() {
+        let cases: &[&[u8]] = &[
+            &[opcode::STOP],
+            &[opcode::PUSH1, 0x01, opcode::STOP],
+            &[opcode::PUSH1, 0x01, opcode::ADD],
+            &[opcode::PUSH32],
+            &[opcode::JUMPDEST, opcode::PUSH2, 0x00, 0x03],
+        ];
+        for case in cases {
+            // Unique and growable: takes the reuse arm. Give it spare capacity and stale
+            // bytes past the end, so a missing zero fill would show.
+            let mut owned = Vec::with_capacity(case.len() + 64);
+            owned.extend_from_slice(case);
+            owned.resize(case.len() + 64, 0xff);
+            owned.truncate(case.len());
+            let (t_reuse, b_reuse) = analyze_legacy(Bytes::from(owned));
+
+            // A second live handle on the same buffer: `try_into_mut` refuses, copy arm.
+            let shared = Bytes::copy_from_slice(case);
+            let _keep_alive = shared.clone();
+            let (t_copy, b_copy) = analyze_legacy(shared);
+
+            // A *slice* of a larger unique allocation: `try_into_mut` may accept it, and the
+            // returned view must still be the slice and nothing around it.
+            let mut backing = std::vec![0xaa_u8; 8];
+            backing.extend_from_slice(case);
+            backing.extend_from_slice(&[0xbb; 8]);
+            let sliced = Bytes::from(backing).slice(8..8 + case.len());
+            let (_, b_slice) = analyze_legacy(sliced);
+
+            assert_eq!(b_reuse, b_copy, "{case:?}");
+            assert_eq!(b_slice, b_copy, "sliced input diverged for {case:?}");
+            assert_eq!(t_reuse.len(), t_copy.len(), "{case:?}");
+            assert_eq!(&b_reuse[..case.len()], *case, "{case:?}");
+            assert!(
+                b_reuse[case.len()..].iter().all(|&b| b == 0),
+                "padding not zeroed for {case:?}: {b_reuse:?}"
+            );
+        }
+    }
+
+    /// The same agreement over a spread of pseudo-random code, since `analyze_legacy` is on
+    /// the consensus path and the ownership branch above is new. Deterministic LCG so a
+    /// failure is reproducible; no `rand` dependency in this crate.
+    #[test]
+    fn both_padding_arms_agree_on_random_code() {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..512 {
+            let len = (next() % 48) as usize;
+            let code: Vec<u8> = (0..len).map(|_| (next() & 0xff) as u8).collect();
+
+            let (_, unique) = analyze_legacy(Bytes::from(code.clone()));
+            let shared_in = Bytes::copy_from_slice(&code);
+            let _keep_alive = shared_in.clone();
+            let (_, shared) = analyze_legacy(shared_in);
+
+            assert_eq!(unique, shared, "{code:?}");
+            assert_eq!(&unique[..len], &code[..], "{code:?}");
+            assert!(unique.len() > len, "no guard byte for {code:?}");
+            assert_eq!(unique[unique.len() - 1], 0, "{code:?}");
+        }
     }
 
     #[test]

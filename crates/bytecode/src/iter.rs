@@ -61,14 +61,22 @@ impl<'a> BytecodeIterator<'a> {
             .map(|info| info.immediate_size() as usize)
             .unwrap_or_default();
 
-        // Advance the iterator by the immediate size
+        // Advance the iterator by the immediate size, saturating at the end of what is left.
+        //
+        // Not `.get(immediate_size..).unwrap_or_default()`: the default `&[]` is
+        // `NonNull::dangling()`, a pointer into no allocation at all, and `position()`
+        // subtracts it from `start`. `offset_from_unsigned` requires both pointers to be
+        // derived from the same object, so that is undefined behaviour -- it aborts under the
+        // debug precondition checks and returns garbage in release.
+        //
+        // The short-remainder case was unreachable while this iterator walked the *padded*
+        // buffer, because the analysis guarantees no truncated immediate there. It became
+        // reachable the moment `new` switched to the original bytes, which is exactly where
+        // a truncated `PUSH` immediate is allowed to sit: `Bytecode::new_raw([PUSH2, 0x01])`
+        // is enough. Clamping keeps the cursor one-past-the-end of the same slice instead.
         if immediate_size > 0 {
-            self.bytes = self
-                .bytes
-                .as_slice()
-                .get(immediate_size..)
-                .unwrap_or_default()
-                .iter();
+            let rest = self.bytes.as_slice();
+            self.bytes = rest[immediate_size.min(rest.len())..].iter();
         }
     }
 
@@ -296,5 +304,48 @@ mod tests {
 
         let opcodes: Vec<u8> = bytecode.iter_opcodes().collect();
         assert_eq!(opcodes, vec![opcode::STOP]);
+    }
+
+    /// Iterating the *original* bytes means a truncated `PUSH` immediate is reachable -- the
+    /// analysis only guarantees there is none in the padded buffer. `skip_immediate` used to
+    /// fall back to an empty slice there, whose pointer belongs to no allocation, and the
+    /// next `position()` subtracted it from `start`: undefined behaviour, and an abort under
+    /// the debug precondition checks. Every code ending in a `0x60..=0x7f` byte reaches it.
+    #[test]
+    fn truncated_trailing_push_immediate_keeps_position_in_the_allocation() {
+        // One byte short of PUSH2's immediate, through to 31 short of PUSH32's.
+        for push in opcode::PUSH1..=opcode::PUSH32 {
+            let want = (push - opcode::PUSH1) as usize + 1;
+            for have in 0..want {
+                let mut code = vec![opcode::JUMPDEST, push];
+                code.extend(std::iter::repeat_n(0xff, have));
+                let raw = LegacyRawBytecode(Bytes::from(code.clone()));
+                let bytecode = Bytecode::LegacyAnalyzed(raw.into_analyzed());
+
+                let mut it = BytecodeIterator::new(&bytecode);
+                assert_eq!(it.next(), Some(opcode::JUMPDEST));
+                assert_eq!(it.position(), 1);
+                assert_eq!(it.next(), Some(push));
+                // Clamped to the end of the original bytes, not past them.
+                assert_eq!(it.position(), code.len(), "{push:#04x}, {have} of {want}");
+                assert_eq!(it.next(), None);
+                assert_eq!(it.position(), code.len());
+                assert!(it.as_slice().is_empty());
+            }
+        }
+    }
+
+    /// The same shape with nothing before it, which is the smallest reproducer there is.
+    #[test]
+    fn lone_truncated_push_yields_the_opcode_and_stops() {
+        let raw = LegacyRawBytecode(Bytes::from(vec![opcode::PUSH2, 0x01]));
+        let bytecode = Bytecode::LegacyAnalyzed(raw.into_analyzed());
+        let opcodes: Vec<u8> = bytecode.iter_opcodes().collect();
+        assert_eq!(opcodes, vec![opcode::PUSH2]);
+        // And the padded buffer's trailing `STOP`s are not reported as contract opcodes.
+        let mut it = BytecodeIterator::new(&bytecode);
+        assert_eq!(it.next(), Some(opcode::PUSH2));
+        assert_eq!(it.position(), 2);
+        assert_eq!(it.next(), None);
     }
 }
