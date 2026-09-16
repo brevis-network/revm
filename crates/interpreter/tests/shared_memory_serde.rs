@@ -1,9 +1,8 @@
 //! Probe: does a deserialised `SharedMemory` satisfy INV-B?
 //!
-//! `serde` is not a default feature of this crate, so gate the file: without this, testing
-//! `revm-interpreter` on its own fails to build. Workspace-wide runs unify the feature on and
-//! never see it.
-#![cfg(feature = "serde")]
+//! `serde` is not a default feature of this crate. The requirement is declared as
+//! `required-features` on the `[[test]]` target in `Cargo.toml`, not as a `#![cfg]` here, so
+//! that naming this target without the feature is an error rather than a silent pass.
 
 use primitives::U256;
 use revm_interpreter::interpreter::SharedMemory;

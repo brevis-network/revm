@@ -156,9 +156,9 @@ fn be_bytes_to_u64x4(bytes: &[u8]) -> [u64; 4] {
     let len = bytes.len().min(32);
     padded[32 - len..].copy_from_slice(&bytes[..len]);
     let mut limbs = [0u64; 4];
-    for i in 0..4 {
+    for (i, limb) in limbs.iter_mut().enumerate() {
         let off = 24 - i * 8;
-        limbs[i] = u64::from_be_bytes([
+        *limb = u64::from_be_bytes([
             padded[off],
             padded[off + 1],
             padded[off + 2],
@@ -176,9 +176,9 @@ fn be_bytes_to_u64x4(bytes: &[u8]) -> [u64; 4] {
 #[cfg(any(target_os = "zkvm", test))]
 fn u64x4_to_be_bytes(limbs: &[u64; 4], out_len: usize) -> Vec<u8> {
     let mut full = [0u8; 32];
-    for i in 0..4 {
+    for (i, limb) in limbs.iter().enumerate() {
         let off = 24 - i * 8;
-        full[off..off + 8].copy_from_slice(&limbs[i].to_be_bytes());
+        full[off..off + 8].copy_from_slice(&limb.to_be_bytes());
     }
     if out_len >= 32 {
         let mut out = std::vec![0u8; out_len];
@@ -966,7 +966,7 @@ mod tests {
     }
 
     fn limbs_to_u256(limbs: &[u64; 4]) -> U256 {
-        U256::from_limbs(limbs.clone())
+        U256::from_limbs(*limbs)
     }
 
     fn u256_to_limbs(v: U256) -> [u64; 4] {

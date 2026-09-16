@@ -148,7 +148,7 @@ mod test {
     /// and no SSTORE fixture, and the only in-tree check of the rewritten cost path is
     /// `sstore_table_matches_the_branch_chains`, which compares the table against the branch
     /// chains it was *generated from* -- a self-consistency check, not an oracle. A transition
-    /// mis-classified in both would pass it.
+    /// misclassified in both would pass it.
     ///
     /// These four are the rungs a transaction can reach on a fresh slot, priced by EIP-2200
     /// as amended by EIP-2929 (the cold surcharge) and EIP-3529 (the reduced refund and the

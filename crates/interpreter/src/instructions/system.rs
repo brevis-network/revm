@@ -29,7 +29,7 @@ pub fn keccak256<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn keccak256_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -75,7 +75,7 @@ pub fn address<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn address_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -101,7 +101,7 @@ pub fn caller<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_,
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn caller_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -127,7 +127,7 @@ pub fn codesize<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn codesize_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -180,7 +180,7 @@ pub fn calldataload<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionConte
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn calldataload_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -367,7 +367,7 @@ pub fn calldatasize<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionConte
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn calldatasize_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -396,7 +396,7 @@ pub fn callvalue<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn callvalue_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -452,7 +452,7 @@ pub fn returndatasize<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionCon
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn returndatasize_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -506,11 +506,11 @@ pub fn gas<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
     run_threaded!(context, gas_at)
 }
 
-/// [`gas`], threading the stack cursor.
+/// [`gas`](fn@gas), threading the stack cursor.
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn gas_at<WIRE: InterpreterTypes, H: ?Sized>(

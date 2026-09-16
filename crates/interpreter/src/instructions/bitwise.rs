@@ -15,7 +15,7 @@ pub fn lt<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, 
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn lt_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -38,7 +38,7 @@ pub fn gt<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, 
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn gt_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -62,7 +62,7 @@ pub fn clz<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn clz_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -90,7 +90,7 @@ pub fn slt<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn slt_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -116,7 +116,7 @@ pub fn sgt<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn sgt_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -142,7 +142,7 @@ pub fn eq<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, 
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn eq_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -176,7 +176,7 @@ pub fn iszero<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_,
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn iszero_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -207,7 +207,7 @@ pub fn bitand<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_,
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn bitand_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -232,7 +232,7 @@ pub fn bitor<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, 
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn bitor_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -258,7 +258,7 @@ pub fn bitxor<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_,
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn bitxor_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -284,7 +284,7 @@ pub fn not<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn not_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -310,7 +310,7 @@ pub fn byte<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn byte_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -455,7 +455,7 @@ pub fn shl<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn shl_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -492,7 +492,7 @@ pub fn shr<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn shr_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -529,7 +529,7 @@ pub fn sar<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn sar_at<WIRE: InterpreterTypes, H: ?Sized>(

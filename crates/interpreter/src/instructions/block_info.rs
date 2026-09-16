@@ -15,7 +15,7 @@ pub fn chainid<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionCon
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn chainid_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
@@ -42,7 +42,7 @@ pub fn coinbase<WIRE: InterpreterTypes, H: Host + ?Sized>(
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn coinbase_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
@@ -73,7 +73,7 @@ pub fn timestamp<WIRE: InterpreterTypes, H: Host + ?Sized>(
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn timestamp_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
@@ -99,7 +99,7 @@ pub fn block_number<WIRE: InterpreterTypes, H: Host + ?Sized>(
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn block_number_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
@@ -125,7 +125,7 @@ pub fn difficulty<WIRE: InterpreterTypes, H: Host + ?Sized>(
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn difficulty_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
@@ -166,7 +166,7 @@ pub fn gaslimit<WIRE: InterpreterTypes, H: Host + ?Sized>(
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn gaslimit_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
@@ -188,7 +188,7 @@ pub fn basefee<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionCon
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn basefee_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
@@ -213,7 +213,7 @@ pub fn blob_basefee<WIRE: InterpreterTypes, H: Host + ?Sized>(
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn blob_basefee_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
