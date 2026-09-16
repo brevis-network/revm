@@ -16,19 +16,17 @@ The project is used by major Ethereum infrastructure including Reth, Foundry, Ha
 
 > **`--all-features` does not build on this fork.** It selects `revm-precompile`'s `bn`
 > backend, which does not compile against the pinned `substrate-bn` (`cannot add AffineG1 to
-> AffineG1`). Use `--features serde,memory_limit` instead -- that is what `ci.yml` runs, as
-> `$FORK_FEATURES`, and running `--all-features` locally gives both a build failure and a
-> different lint surface from CI.
+> AffineG1`). Use `--features serde,memory_limit`, which is what `ci.yml` runs as
+> `$FORK_FEATURES`.
 
 ```bash
 # Build the project
 cargo build
 cargo build --release
 
-# Run all tests. The feature set is load-bearing, not decoration:
-#   `serde`       -- `tests/shared_memory_serde.rs` is `required-features = ["serde"]`, so
-#                    without it cargo refuses the target rather than running zero tests
-#   `memory_limit`-- gates the two MLOAD/MSTORE `MemoryLimitOOG` regression tests
+# Run all tests. Both features gate tests that are otherwise not compiled at all: `serde`
+# for `tests/shared_memory_serde.rs` (a `required-features` target), `memory_limit` for the
+# two MLOAD/MSTORE `MemoryLimitOOG` regression tests.
 cargo nextest run --workspace --features serde,memory_limit
 cargo nextest run --workspace                       # the default feature set
 cargo nextest run --workspace --no-default-features # the no_std-shaped surface

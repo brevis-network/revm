@@ -4,9 +4,7 @@ concurrency:
   cancel-in-progress: true
   group: ${{github.workflow}}-${{github.ref}}
 
-# `pico-v98-31-0-2` is this fork's integration branch: every campaign PR targeted it, and
-# with the trigger gated to `main` alone neither this workflow nor the EF statetest suite ran
-# for any of PRs #2-#7. The guard was that the CI never ran, which is not a guard.
+# `pico-v98-31-0-2` is this fork's integration branch; PRs target it, not `main`.
 on:
   push:
     branches: [main, "release/**", "pico-v98-31-0-2"]
@@ -15,9 +13,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # What this fork builds with in place of `--all-features` (see the `test` matrix below).
-  # Read by `clippy` and `docs` so the three cannot drift apart again. `memory_limit` is in
-  # the set because it gates the MLOAD/MSTORE regression tests.
+  # Stands in for `--all-features`, which does not build here (see the `test` matrix).
+  # `clippy` and `docs` read it so they cannot drift from `test`.
   FORK_FEATURES: "serde,memory_limit"
 
 jobs:
@@ -30,19 +27,14 @@ jobs:
       matrix:
         rust: ["1.88", "stable", "nightly"]
         # Not `--all-features`: it selects `revm-precompile`'s `bn` backend, which does not
-        # compile against the `substrate-bn` this tree pins (`cannot add AffineG1 to
-        # AffineG1`), so the cell would be permanently red.
+        # build against the pinned `substrate-bn` (`cannot add AffineG1 to AffineG1`).
         #
-        # What each cell is the only cover for:
-        #   --no-default-features   the no_std-shaped surface
-        #   ""                      the defaults a plain dependant gets
-        #   --features serde        the INV-B serde suite, and serde *without* `memory_limit`,
-        #                           which is what rsp ships
-        #   $FORK_FEATURES          the MLOAD/MSTORE `MemoryLimitOOG` regression tests
+        # `--features serde` is serde *without* `memory_limit`, which is what rsp ships; the
+        # last cell is the only one that compiles the MLOAD/MSTORE `MemoryLimitOOG` tests.
         #
-        # No cell here builds a serde-free `revm-interpreter`, not even the first:
-        # `crates/ee-tests` depends on `revm` with `serde` on unconditionally, and
-        # unification is workspace-wide. That is what `test-no-serde` below covers.
+        # None of them builds a serde-free `revm-interpreter`, not even the first:
+        # `crates/ee-tests` depends on `revm` with `serde` on, and unification is
+        # workspace-wide. See `test-no-serde`.
         flags:
           - "--no-default-features"
           - ""
@@ -56,9 +48,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace ${{ matrix.flags }}
 
-  # The configuration `--workspace` cannot reach, so a `#[cfg(not(feature = "serde"))]` path
-  # is exercised somewhere. Package-scoped on purpose: adding any crate that depends on
-  # `revm` with `serde` on defeats the job.
+  # Package-scoped on purpose: adding any crate that depends on `revm` with `serde` on
+  # turns the feature back on through unification and silently defeats this job.
   test-no-serde:
     name: test without serde
     runs-on: ubuntu-latest
@@ -114,8 +105,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      # `bn` for the same reason the `test` matrix drops `--all-features`; every other
-      # combination stays under test.
+      # `bn` for the same reason the `test` matrix drops `--all-features`.
       - name: cargo hack
         run: cargo hack check --feature-powerset --depth 1 --exclude-features bn
 
@@ -128,10 +118,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      # Not `--all-features`, for the reason given on the `test` matrix above. The
-      # deny-by-default lints -- which are the ones that have caught real defects in this fork
-      # (`derived_hash_with_manual_eq`, `arithmetic_overflow`) -- fire on the default feature
-      # set just the same.
       - run: cargo clippy --workspace --all-targets --features ${{ env.FORK_FEATURES }}
         env:
           RUSTFLAGS: -Dwarnings
