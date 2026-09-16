@@ -321,6 +321,19 @@ macro_rules! popn_at {
 }
 
 /// The threaded form of [`popn_top`]. See [`popn_at`].
+///
+/// # Bound
+///
+/// Lower only, and deliberately: a pop needs depth, not room. `too_shallow_for` no longer
+/// *widens* that -- it saturates to `isize::MAX` above `STACK_LIMIT`, so the wrap that once
+/// made `usize::MAX` an accepted argument is closed -- but an `sp` above `BYTE_LIMIT` is
+/// still not independently rejected here, as it is for the push path by `no_room_to_push`.
+///
+/// That residue is the safe cross-crate `*_at` surface, not opcode dispatch: B12 closed the
+/// opcode side by execution -- 29 entry points x every legal `sp` x 11 specs x static and
+/// non-static x 5 gas limits, **3,269,750 calls, 0 violations**. Left open knowingly rather
+/// than overlooked; closing it means an upper bound on every pop, which is the cost the
+/// threaded cursor exists to avoid.
 #[macro_export]
 #[collapse_debuginfo(yes)]
 macro_rules! popn_top_at {

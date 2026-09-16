@@ -31,6 +31,28 @@ pub const GUARD_BYTES: usize = 1;
 /// 2. the returned buffer is longer than the input, by [`GUARD_BYTES`] at minimum;
 /// 3. its last opcode is a `STOP` and no `PUSH` immediate is truncated, which is what lets
 ///    `PUSH*` skip its bounds check.
+///
+/// # What `new` does *not* restate, and why it cannot
+///
+/// **Post-condition 3 is not restated, and 2 alone does not stand in for it.** The guard byte
+/// is sufficient only when the terminating `STOP` lies *inside* `original_len`: `execute!`
+/// advances `ip` before calling the handler, so after the `STOP` at index *k* the dispatch
+/// loop dereferences *k+1*. Honest output puts the `STOP` at `original_len - 1` and the guard
+/// at `original_len`, so that read is the buffer's last byte.
+///
+/// A caller supplying `bytecode`, `original_len` and `jump_table` separately -- a wire format
+/// -- can instead put the terminating `STOP` in the *padding* and consume the guard. Miri, on
+/// `[JUMPDEST, STOP]` with `original_len = 1`: *"attempting to access 1 byte, but got
+/// alloc+0x2 which is at or beyond the end of the allocation of size 2 bytes"*, at
+/// `interpreter.rs`'s `let opcode = unsafe { *ip };`.
+///
+/// **No constant-time check closes this.** Demanding two bytes of padding rejects honest
+/// output, which has exactly one; raising [`GUARD_BYTES`] does not help either, because the
+/// padding's *contents* belong to the caller too, so the first `STOP` simply moves later. The
+/// property needs the walk -- which is to say, it needs this function. **A wire format must
+/// re-derive through [`analyze_legacy`] rather than restate its results.** That is what
+/// `rsp`'s witness decoder now does: it reads only `code[..original_len]`, the preimage that
+/// `code_hash` binds, and hands it to `Bytecode::new_raw_checked`.
 pub fn analyze_legacy(bytecode: Bytes) -> (JumpTable, Bytes) {
     if bytecode.is_empty() {
         // `STOP` plus the guard byte: the interpreter reads one past the `STOP` it halts on.
@@ -270,6 +292,35 @@ mod tests {
             assert!(unique.len() > len, "no guard byte for {code:?}");
             assert_eq!(unique[unique.len() - 1], 0, "{code:?}");
         }
+    }
+
+    /// The guard byte is sound only together with post-condition 3, and this is why: the
+    /// padding grows to hold the terminating `STOP` *as well as* the guard, so the read one
+    /// past that `STOP` is always inside the buffer.
+    ///
+    /// Restating the post-conditions instead of re-deriving them loses this. A wire format
+    /// that supplies `bytecode`/`original_len`/`jump_table` separately can pass a buffer with
+    /// exactly `GUARD_BYTES` of padding whose `STOP` is the padding -- Miri then reports an
+    /// access "at or beyond the end of the allocation" in the dispatch loop. See the note on
+    /// [`analyze_legacy`].
+    #[test]
+    fn padding_holds_the_terminating_stop_as_well_as_the_guard() {
+        // Ends in STOP: the STOP is inside the input, so GUARD_BYTES alone is enough.
+        let ends_in_stop: Bytes = vec![opcode::JUMPDEST, opcode::STOP].into();
+        let (_, out) = analyze_legacy(ends_in_stop.clone());
+        assert_eq!(out.len(), ends_in_stop.len() + GUARD_BYTES);
+
+        // Does not end in STOP: one byte for the STOP, one for the guard.
+        let no_stop: Bytes = vec![opcode::JUMPDEST].into();
+        let (_, out) = analyze_legacy(no_stop.clone());
+        assert_eq!(out.len(), no_stop.len() + 1 + GUARD_BYTES);
+        assert_eq!(out[no_stop.len()], opcode::STOP);
+
+        // A truncated PUSH immediate is padded out too, then terminated, then guarded.
+        let truncated: Bytes = vec![opcode::PUSH32].into();
+        let (_, out) = analyze_legacy(truncated);
+        assert_eq!(out.len(), 1 + 32 + 1 + GUARD_BYTES);
+        assert_eq!(*out.last().unwrap(), 0);
     }
 
     #[test]
