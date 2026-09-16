@@ -198,6 +198,21 @@ impl ExtBytecode {
 /// every field must be written again before anything observes it.
 #[inline]
 unsafe fn drop_stale(dst: *mut ExtBytecode) {
+    // Destructured rather than reached through `addr_of_mut!` field by field: adding a
+    // field to `ExtBytecode` must not silently leak it here. This binding is the guard --
+    // a new field makes it fail to compile, and the compiler then points at this line.
+    // Nothing below reads the bindings; the pattern exists to be exhaustive.
+    //
+    // SAFETY: `dst` is a live, aligned `ExtBytecode`, so the reference is valid for the
+    // duration of the match; nothing is moved out of it.
+    let ExtBytecode {
+        instruction_pointer: _,
+        continue_execution: _,
+        bytecode_hash: _,
+        action: _,
+        base: _,
+    } = unsafe { &*dst };
+
     unsafe {
         core::ptr::drop_in_place(core::ptr::addr_of_mut!((*dst).base));
         if (*dst).action.is_some() {

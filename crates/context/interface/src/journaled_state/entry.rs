@@ -108,6 +108,17 @@ pub enum SelfdestructionRevertStatus {
 /// Journal entries that are used to track changes to the state and are used to revert it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+// `repr(u64)`, not the default. Every variant carries an `Address`, which is `[u8; 20]`
+// with alignment 1; with the default representation rustc packs those bytes into the
+// discriminant's padding, and LLVM's field-by-field copy then merges a variant field with
+// that padding into one misaligned span -- a `memcpy` libcall instead of four `sd`, three
+// per journalled storage write. Giving the discriminant a word of its own leaves no
+// padding to merge with. Worth 1.80 M retired guest instructions on mainnet block
+// 24006677; the cost is 8 bytes an entry.
+//
+// The assertion below is the guard: this is a one-line attribute with no behavioural
+// effect, so dropping it breaks no test, moves neither codegen probe, and stays under
+// `check_guest_cycles.sh`'s 2 % tolerance (the loss is 0.53 %).
 #[repr(u64)]
 pub enum JournalEntry {
     /// Used to mark account that is warm inside EVM in regard to EIP-2929 AccessList.
@@ -409,3 +420,6 @@ impl JournalEntryTr for JournalEntry {
         }
     }
 }
+
+/// The word-wide discriminant above is load-bearing; see the comment on the enum.
+const _: () = assert!(core::mem::size_of::<JournalEntry>() == 96);
