@@ -27,15 +27,21 @@ pub struct AccountInfo {
 }
 
 /// [`AccountInfo::code_hash`] reads the field as four aligned `u64`s and writes 32 bytes into
-/// a `MaybeUninit<B256>`. That is sound exactly while the struct itself is 8-aligned, the
-/// field's offset is a multiple of 8, and `B256` is 32 bytes wide -- all three of which
-/// `repr(Rust)` happens to give it today but none of which it promises. Assert all three:
-/// checking only the offset would let a change that drops the struct's alignment (say
+/// a `MaybeUninit<B256>`. That is sound exactly while the struct is aligned for `u64`, the
+/// field's offset is a multiple of that alignment, and `B256` is 32 bytes wide -- all three
+/// of which `repr(Rust)` happens to give it today but none of which it promises. Assert all
+/// three: checking only the offset would let a change that drops the struct's alignment (say
 /// `balance` ceasing to be a `U256`) through, leaving `code_hash()` doing misaligned `ld` on a
 /// target that has no misaligned scalar access.
+///
+/// The bound is `align_of::<u64>()` and not a literal `8` because the two differ: i686 aligns
+/// `u64` to 4, so `AccountInfo` is 4-aligned there and a literal 8 fails the build on a
+/// target where the reads are perfectly well aligned. `align_of::<u64>()` is what the `ld`
+/// actually needs, on every target.
 const _: () = assert!(
-    core::mem::align_of::<AccountInfo>().is_multiple_of(8)
-        && core::mem::offset_of!(AccountInfo, code_hash).is_multiple_of(8)
+    core::mem::align_of::<AccountInfo>().is_multiple_of(core::mem::align_of::<u64>())
+        && core::mem::offset_of!(AccountInfo, code_hash)
+            .is_multiple_of(core::mem::align_of::<u64>())
         && core::mem::size_of::<B256>() == 32
 );
 
