@@ -359,13 +359,10 @@ fn funnel_right(lo: u64, hi: u64, shift: usize) -> u64 {
 ///
 /// # Precondition
 ///
-/// `shift < 256`, and it is **load-bearing**. What this replaced -- ruint's
-/// `overflowing_shl` -- is *total*: any shift of 256 or more gives `ZERO`. This is partial
-/// and silently wrong out of domain, because every arm masks the shift down to its low bits:
-/// `u256_shl(x, 256) == x`, and 320 aliases 64. The `shift < 256` test at both call sites was
-/// redundant against the library call and became the only thing holding this up, codified by
-/// nothing until now. Expect this shape wherever a library call was replaced by hand-written
-/// arithmetic.
+/// `shift < 256`, and it is **load-bearing**: this is partial and silently wrong out of
+/// domain, because every arm masks the shift down to its low bits -- `u256_shl(x, 256) == x`,
+/// and 320 aliases 64. The `shift < 256` test at both call sites is the only thing holding it
+/// up. (`U256`'s own `Shl` is total: 256 or more gives `ZERO`.)
 ///
 /// `U256`'s `Shl` goes through ruint's `overflowing_shl`, which builds the result with
 /// `array::from_fn` over a *dynamic* limb offset. LLVM cannot keep that in registers: on the

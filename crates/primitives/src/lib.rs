@@ -43,13 +43,10 @@ pub use alloy_primitives::{
 
 /// Declares the exhaustive-initialisation check that a `MaybeUninit` writer trades away.
 ///
-/// A constructor that writes its fields through `addr_of_mut!` is no longer checked for
-/// completeness: adding a field compiles clean and leaves it uninitialised (verified on
-/// `ExtBytecode` -- 0 errors, and Miri reports *"encountered uninitialized memory"*). An
-/// exhaustive destructuring is a compile error the moment a field is added.
-///
-/// A macro because there are several such writers across crates, and each hand-copy carries
-/// its own `#[allow(dead_code)]` -- the attribute that would hide it having gone stale.
+/// A constructor writing its fields through `addr_of_mut!` is no longer checked for
+/// completeness: adding a field compiles clean and leaves it uninitialised, and Miri then
+/// reports *"encountered uninitialized memory"*. An exhaustive destructuring is a compile
+/// error the moment a field is added.
 ///
 /// # Usage
 ///
@@ -72,8 +69,7 @@ macro_rules! assert_all_fields_written {
         $name:ident $([$($generics:tt)*])? ($ty:ty) = $path:path { $($field:ident),+ $(,)? }
     ) => {
         $(#[$attr])*
-        // Never called; it exists to be type-checked.
-        #[allow(dead_code)]
+        #[allow(dead_code)] // never called; it exists to be type-checked
         fn $name $(<$($generics)*>)? (v: $ty) {
             let $path { $($field),+ } = v;
             $( let _ = $field; )+
@@ -480,9 +476,7 @@ impl MaybeAddress {
 /// than its four `sd`. Measured on mainnet block 24006677: `ExtBytecode`'s bytecode hash took
 /// the fallback 20,024 times out of 20,024, once per call frame.
 ///
-/// (That measurement is a site observation, not a law: this doc used to state the payload is
-/// *never* 8-aligned whatever the enclosing struct's alignment, which is not true of the
-/// one-in-eight placement above. The fix below does not depend on which it is.)
+/// (A site observation, not a law -- the fix below does not depend on the ratio.)
 ///
 /// `#[repr(C)]` plus the explicit padding puts the payload at offset 8 of an align-8 struct
 /// by construction, so no probing and no runtime check are needed -- and the "absent" case
@@ -675,9 +669,6 @@ pub fn address_eq(a: &Address, b: &Address) -> bool {
 ///
 /// `Hash` forwards to `Address`'s, so a `FastAddress` query hashes to exactly the bucket an
 /// `Address` key was stored in; `fast_address_finds_what_address_stored` pins that.
-///
-/// (This line used to name `hash_agrees_with_address`, a test that has never existed in
-/// either repository. The property is covered; the name was not.)
 ///
 /// `TAG` carries no information and is never read. It is there so that each call site can ask
 /// for its own monomorphisation of the lookup: hashbrown's `RawTable::find` is generic over

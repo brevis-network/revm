@@ -15,8 +15,8 @@ use std::vec::Vec;
 ///
 /// Paying for it here rather than in the loop is deliberate: the alternative is a bounds or
 /// poison test on every single dispatch, which is the test the loop was restructured to
-/// remove. It is not free at analysis time, though -- the returned buffer is now always
-/// longer than the input, so `analyze_legacy`'s zero-copy arm is unreachable; see there.
+/// remove. It is not free at analysis time, though: the returned buffer is always longer
+/// than the input, so `analyze_legacy` has no zero-copy arm.
 pub const GUARD_BYTES: usize = 1;
 
 /// Analyzes the bytecode for use in [`LegacyAnalyzedBytecode`](crate::LegacyAnalyzedBytecode).
@@ -212,8 +212,8 @@ mod tests {
         assert!(!jump_table.is_valid(5)); // PUSH4
     }
 
-    /// Both ownership arms are on the consensus path, so they must agree byte for byte --
-    /// including the zero fill, which the reuse arm writes over whatever the allocation held.
+    /// Both ownership arms are on the consensus path, so they must agree byte for byte,
+    /// including the zero fill over whatever the reused allocation held.
     #[test]
     fn both_padding_arms_produce_the_same_buffer() {
         let cases: &[&[u8]] = &[

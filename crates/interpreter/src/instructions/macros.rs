@@ -341,8 +341,8 @@ macro_rules! popn_top_at {
 #[collapse_debuginfo(yes)]
 macro_rules! push_at {
     ($interpreter:expr, $sp:ident, $rem:ident, $x:expr) => {
-        // The room check of eighteen instructions, and reachable from outside the crate with
-        // an arbitrary `usize`, so the bound has to hold for one. See `no_room_to_push`.
+        // Reachable from outside the crate with an arbitrary `usize`, so the bound has to
+        // hold for one. See `no_room_to_push`.
         if $crate::interpreter::no_room_to_push($sp) {
             return (
                 $sp,

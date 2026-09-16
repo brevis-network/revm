@@ -34,10 +34,8 @@ pub struct AccountInfo {
 /// `balance` ceasing to be a `U256`) through, leaving `code_hash()` doing misaligned `ld` on a
 /// target that has no misaligned scalar access.
 ///
-/// The bound is `align_of::<u64>()` and not a literal `8` because the two differ: i686 aligns
-/// `u64` to 4, so `AccountInfo` is 4-aligned there and a literal 8 fails the build on a
-/// target where the reads are perfectly well aligned. `align_of::<u64>()` is what the `ld`
-/// actually needs, on every target.
+/// `align_of::<u64>()` and not a literal `8`: i686 aligns `u64` to 4, where a literal 8
+/// fails the build on reads that are perfectly well aligned.
 const _: () = assert!(
     core::mem::align_of::<AccountInfo>().is_multiple_of(core::mem::align_of::<u64>())
         && core::mem::offset_of!(AccountInfo, code_hash)

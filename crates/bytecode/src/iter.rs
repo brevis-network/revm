@@ -61,9 +61,9 @@ impl<'a> BytecodeIterator<'a> {
             .map(|info| info.immediate_size() as usize)
             .unwrap_or_default();
 
-        // Clamp rather than `unwrap_or_default()`: the *original* bytes may end in a
-        // truncated immediate, and an empty default slice is a dangling pointer, which
-        // `position()` would subtract from `start` -- UB.
+        // Clamp, not `unwrap_or_default()`: the original bytes may end in a truncated
+        // immediate, and an empty default slice is a dangling pointer that `position()`
+        // would subtract from `start` -- UB.
         if immediate_size > 0 {
             let rest = self.bytes.as_slice();
             self.bytes = rest[immediate_size.min(rest.len())..].iter();
@@ -296,8 +296,8 @@ mod tests {
         assert_eq!(opcodes, vec![opcode::STOP]);
     }
 
-    /// A truncated `PUSH` immediate is only excluded from the *padded* buffer, so iterating
-    /// the original bytes must tolerate one. Reached by any code ending in `0x60..=0x7f`.
+    /// Only the *padded* buffer excludes a truncated `PUSH` immediate, so iterating the
+    /// original bytes must tolerate one. Any code ending in `0x60..=0x7f` reaches this.
     #[test]
     fn truncated_trailing_push_immediate_keeps_position_in_the_allocation() {
         // One byte short of PUSH2's immediate, through to 31 short of PUSH32's.
@@ -322,7 +322,7 @@ mod tests {
         }
     }
 
-    /// The smallest reproducer, and the padded buffer's trailing `STOP`s stay unreported.
+    /// The smallest such code; the padded buffer's trailing `STOP`s stay unreported.
     #[test]
     fn lone_truncated_push_yields_the_opcode_and_stops() {
         let raw = LegacyRawBytecode(Bytes::from(vec![opcode::PUSH2, 0x01]));

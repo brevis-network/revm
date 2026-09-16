@@ -295,9 +295,8 @@ impl Precompiles {
     ///
     /// Two entries are considered equal if the precompile addresses are equal.
     ///
-    /// `#[must_use]` because it takes `&self`: it removes nothing from the receiver, and
-    /// `precompiles.difference(&to_remove);` as a statement -- which is how it read in
-    /// `op_revm::precompiles::jovian` -- is a no-op that looks like a mutation.
+    /// `#[must_use]` because it takes `&self`: it removes nothing from the receiver, so
+    /// `precompiles.difference(&other);` as a statement is a no-op that looks like a mutation.
     #[must_use]
     pub fn difference(&self, other: &Self) -> Self {
         let Self { inner, .. } = self;

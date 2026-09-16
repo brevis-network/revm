@@ -15,12 +15,6 @@ use primitives::{
 };
 use state::Bytecode;
 
-// `get_memory_input_and_out_ranges` used to live here. It lost its last call site when
-// `prepare_call_inputs` absorbed it, and what remained was a second, *independently
-// maintained* copy of the call prologue's range preparation -- the shape where a fix lands in
-// one and not the other. Deleted rather than left `pub` and unreachable; the logic is in
-// `prepare_call_inputs` below.
-
 /// Resize memory and return range of memory.
 /// If `len` is 0 dont touch memory and return `usize::MAX` as offset and 0 as length.
 #[inline]

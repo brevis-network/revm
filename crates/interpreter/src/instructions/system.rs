@@ -249,7 +249,7 @@ pub fn calldataload_at<WIRE: InterpreterTypes, H: ?Sized>(
     // the range `prepare_call_inputs` builds -- it comes out of `resize_memory`, which grew
     // the buffer to cover it -- and *not* of the enum, which carries no bound of its own.
     // The `usize::MAX..usize::MAX` "no calldata" sentinel is excluded here by its zero
-    // length. The checked `.get(range)` this replaced did not need the premise; this does.
+    // length.
     unsafe { be_word_to(base.add(offset), count, dst) }
     (sp, rem)
 }

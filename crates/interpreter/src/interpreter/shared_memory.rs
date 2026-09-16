@@ -480,17 +480,14 @@ pub struct SharedMemory {
     /// `base == buffer.borrow().as_ptr().add(my_checkpoint)` whenever `buffer` is `Some`, and
     /// `base` is null when it is `None`.
     ///
-    /// Note which `as_ptr` that is: `Vec::as_ptr`, the address of the *elements*. This
-    /// formula used to read `buffer.as_ptr()`, which on an `Option<Rc<RefCell<Vec<u8>>>>`
-    /// resolves to `RefCell::as_ptr` and yields a `*mut Vec<u8>` -- the address of the
-    /// header, not the data. A restore site implemented from it literally computes the wrong
-    /// pointer; the restore sites below all get it right.
+    /// Note which `as_ptr` that is: `Vec::as_ptr`, the address of the *elements*. Spelled
+    /// `buffer.as_ptr()` it resolves to `RefCell::as_ptr` and yields a `*mut Vec<u8>` -- the
+    /// header, not the data -- so a restore site written from that spelling computes the
+    /// wrong pointer.
     ///
     /// Unlike a length, there is no safe fallback value: every read of `base` turns straight
     /// into a load or a store, so it has to be exactly right, and the **six** things that can
-    /// break it each have to restore it. (This sentence said "three" above a five-item list
-    /// for as long as the list existed, and the sixth -- `Clone` -- was created by the commit
-    /// that wrote the list.)
+    /// break it each have to restore it.
     ///
     /// 1. **`my_checkpoint` changes.** Only ever at construction, so every constructor and
     ///    [`new_child_context`](Self::new_child_context) sets `base` from the buffer.
@@ -748,12 +745,10 @@ impl MemoryTr for SharedMemory {
 
     /// The shared buffer's data pointer, with no borrow taken.
     ///
-    /// This is a **safe** `&self` method handing out the whole buffer's data pointer, and it
-    /// replaced a checked `Ref`. What that costs is host-*debug* detection and nothing else:
-    /// the pre-image panics on a live conflicting borrow and this does not (executed), while
-    /// Miri flags neither under stacked or tree borrows, and `dbg_borrow`'s `Err` arm is
-    /// `debug_unreachable!` -- i.e. `unreachable_unchecked` -- in release anyway. So the
-    /// release guest never had the check; only the test suite did.
+    /// A **safe** `&self` method handing out the whole buffer's data pointer, with no borrow
+    /// taken. All a checked `Ref` adds is a host-*debug* panic on a live conflicting borrow:
+    /// `dbg_borrow`'s `Err` arm is `debug_unreachable!` in release, so the guest never had
+    /// the check either way, and Miri flags neither under stacked or tree borrows.
     ///
     /// The one caller is `calldataload_at`, which dereferences the pointer only where
     /// `offset < input_len`.
@@ -1619,10 +1614,9 @@ pub fn resize_memory_written<Memory: MemoryTr>(
     }
 }
 
-/// The `memory_limit` cap, applied where the expansion happens rather than at each call site:
-/// it is an invariant of growing the buffer, not of `MLOAD` and `MSTORE`. Restating it per
-/// caller is how it went missing when the expansion moved off `resize_memory_written!`, which
-/// applies it for ~20 other opcodes.
+/// The `memory_limit` cap. It belongs here and not at the call sites: it is an invariant of
+/// growing the buffer, not of `MLOAD` and `MSTORE`, and restating it per caller is how a
+/// caller comes to omit it.
 #[cfg(feature = "memory_limit")]
 #[inline(always)]
 fn check_memory_limit<Memory: MemoryTr>(
@@ -1948,15 +1942,9 @@ mod tests {
                 assert_eq!(cur.get_u256(i * 32), *want, "step {step}, word {i}");
             }
         }
-        // The walk has to have hit the two interesting events, or it proves nothing.
-        //
-        // `nested` is deterministic. `reallocs` is not: it counts the times the buffer
-        // actually *moved*, and whether a `Vec` growth moves the block is the allocator's
-        // choice -- a CI runner returned 5 here where this machine returns more, which failed
-        // a `> 5` threshold tuned to one allocator. What the walk proves does not rest on the
-        // count: `assert_inv_b` and the model comparison run on every one of the 2000 steps,
-        // so one move is enough to catch a stale base, and dropping either the
-        // `free_child_context` or the `grow_zeroed` refresh still fails it.
+        // The walk has to have hit both events, or it proves nothing. Only one *move* is
+        // needed -- `assert_inv_b` runs on every step -- and the exact count is the
+        // allocator's choice, not a property of the code, so do not tighten this.
         assert!(
             reallocs > 0,
             "the buffer never moved; the walk proves nothing"

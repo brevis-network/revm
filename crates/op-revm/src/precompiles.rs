@@ -104,13 +104,6 @@ pub fn jovian() -> &'static Precompiles {
         // `extend` is the whole replacement: each Jovian entry sits at the same address as
         // the Isthmus one it supersedes (`bn254::pair::ADDRESS`, `G1_MSM_ADDRESS`,
         // `G2_MSM_ADDRESS`, `PAIRING_ADDRESS`) and "other precompiles overwrite existing".
-        // There used to be a `to_remove` set and a `precompiles.difference(&to_remove);`
-        // above this, whose result was discarded -- `difference` takes `&self` and returns a
-        // new `Self`. It removed nothing, but it also *needed* to remove nothing;
-        // `test_get_jovian_precompile_with_bad_input_len` already pins that all four
-        // addresses answer with the Jovian limits. Deleted rather than repaired, so the code
-        // says what it does; `Precompiles::difference` is now `#[must_use]`, which is what
-        // makes the next one of these a compile error.
         precompiles.extend([
             bn254_pair::JOVIAN,
             bls12_381::JOVIAN_G1_MSM,

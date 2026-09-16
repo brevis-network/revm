@@ -103,9 +103,8 @@ pub fn dup_at<const N: usize, WIRE: InterpreterTypes, H: ?Sized>(
     // tagged `(6, N)` and tests the same two bounds against a pinned register -- so this form
     // is the readable one rather than the one unsigned compare it used to fold into.
     // Room, then depth; see `no_room_to_push` for why neither `==` nor a signed `>=` bounds
-    // an arbitrary `sp`. The depth half already refuses every negative `sp` for `N >= 1`, so
-    // this site was never reachable through that hole -- but it now spells the bound the same
-    // way as `push_at!`, which is what stops the next reader copying the weaker one.
+    // an arbitrary `sp`. The depth half alone already refuses every negative `sp` for
+    // `N >= 1`, but both checks spell the bound the same way as `push_at!` on purpose.
     if no_room_to_push(sp) || (sp as isize) <= too_shallow_for(N) {
         return (
             sp,
@@ -181,10 +180,8 @@ mod bound_tests {
     /// cross-crate public API, and the room checks are what stands between an out-of-range
     /// cursor and a write past the 32 KiB stack buffer.
     ///
-    /// Three shapes must be rejected: the full stack (which an `==` did catch), anything
-    /// above it (which it did not), and everything from `2^63` up -- which a signed `>=`
-    /// reads as negative and accepts. The biased empty cursor must still be *accepted*,
-    /// which rules out a plain unsigned compare on `sp` itself.
+    /// Three shapes must be rejected -- the full stack, anything above it, and everything
+    /// from `2^63` up -- while the biased empty cursor is still accepted.
     #[test]
     fn room_checks_reject_every_out_of_range_cursor() {
         // Full, past full, and the negative-as-`isize` half that the signed compare let in.

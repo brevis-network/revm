@@ -37,10 +37,9 @@ pub struct LegacyAnalyzedBytecode {
     jump_table: JumpTable,
 }
 
-/// What a [`LegacyAnalyzedBytecode`] deserialises through, so the constructor's checks apply
-/// to wire data -- a derived `Deserialize` writes the three independent fields straight into
-/// the struct and skips them, which is what `revm-interpreter`'s `JumpCtx::new` safety
-/// contract relies on them for. `Bytecode`'s enum derive delegates here, so it is covered too.
+/// What a [`LegacyAnalyzedBytecode`] deserialises through, so the constructor's checks reach
+/// wire data: a derived `Deserialize` writes the three independent fields straight in and
+/// skips them. `Bytecode`'s enum derive delegates here, so it is covered too.
 #[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
 struct LegacyAnalyzedBytecodeDe {
@@ -122,8 +121,8 @@ impl LegacyAnalyzedBytecode {
 
     /// [`new`](Self::new), returning the violated invariant instead of panicking.
     ///
-    /// The one place the three checks live: `new` turns the error into a panic,
-    /// `Deserialize` turns it into a `serde` error, and neither can skip them.
+    /// The one place the three checks live: `new` turns the error into a panic and
+    /// `Deserialize` into a `serde` error.
     ///
     /// # Errors
     ///
@@ -196,10 +195,10 @@ mod tests {
         );
     }
 
-    /// `original_len` past the end of the buffer, with a jump table that *agrees* with it so
-    /// the first two checks pass and the third is the one under test.
-    /// `test_panic_on_unpadded_bytecode` only reaches that check with
-    /// `original_len == bytecode.len()`, so without this the over-run shape is uncovered.
+    /// `original_len` past the end of the buffer, with a jump table that agrees with it so
+    /// the third check is the one under test. Nothing else covers the over-run shape:
+    /// `test_panic_on_unpadded_bytecode` reaches that check only at `original_len ==
+    /// bytecode.len()`.
     #[test]
     #[should_panic(expected = "bytecode is not padded past original_len")]
     fn test_panic_on_large_original_len() {

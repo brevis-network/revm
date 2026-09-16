@@ -29,8 +29,7 @@ macro_rules! mstore_body {
             sync_gas_at!($context.interpreter, $rem);
             // The `set_u256_ptr` below writes all 32 bytes of `offset..offset + 32`
             // unconditionally and before anything can read them, so the grow does not have
-            // to zero that part of the new tail. Same gas, same word count. The helper
-            // applies the `memory_limit` cap itself and reports which halt it wants.
+            // to zero that part of the new tail. Same gas, same word count.
             // SAFETY: the test above is exactly `grow_memory_word_written`'s precondition.
             if let Err(halt) = unsafe {
                 crate::interpreter::grow_memory_word_written(

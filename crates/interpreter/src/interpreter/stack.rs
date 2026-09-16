@@ -59,19 +59,16 @@ pub const fn too_shallow_for(words: usize) -> isize {
     }
 }
 
-/// Whether the cursor has **no room** for one more word, i.e. a push must halt with
-/// `StackOverflow`.
+/// Whether the cursor has **no room** for one more word.
 ///
 /// `sp.wrapping_add(WORD)` undoes the bias (see [`StackTr::sp`]), so this is one unsigned
-/// compare on the post-push byte length, and the empty cursor wraps to `0` rather than to
-/// something huge. Both a signed `>=` and an `==` are false upper bounds here: the first
-/// accepts every `sp` from `2^63` up, because the bias makes it read as negative, and
-/// `push_at` would then write at `base + sp + WORD`, far outside the buffer. Costs nothing
-/// over either, since `sp + WORD` is already computed for the store address.
+/// compare on the post-push byte length. A signed `>=` would accept every `sp` from `2^63`
+/// up, where the bias makes it read as negative, and an `==` rejects one value and accepts
+/// every larger one.
 ///
-/// Alignment is *not* checked: `sp` in `usize::MAX - 30 ..= usize::MAX` wraps to a byte
-/// length of `1..=31`, in bounds but misaligned. That is the caller's invariant (`set_sp`
-/// debug-asserts it); unlike the above it cannot put a write outside the allocation.
+/// Alignment is not checked: `sp` in `usize::MAX - 30 ..= usize::MAX` wraps to a byte length
+/// of `1..=31`, in bounds but misaligned. That is the caller's invariant, and unlike the
+/// above it cannot put a write outside the allocation.
 #[inline(always)]
 pub const fn no_room_to_push(sp: usize) -> bool {
     sp.wrapping_add(WORD) > BYTE_LIMIT - WORD
