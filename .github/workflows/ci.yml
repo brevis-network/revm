@@ -4,14 +4,11 @@ concurrency:
   cancel-in-progress: true
   group: ${{github.workflow}}-${{github.ref}}
 
-# `pico-v98-31-0-2` is this fork's integration branch: every campaign PR targeted it, and
-# with the trigger gated to `main` alone neither this workflow nor the EF statetest suite ran
-# for any of PRs #2-#7. The guard was that the CI never ran, which is not a guard.
 on:
   push:
-    branches: [main, "release/**", "pico-v98-31-0-2"]
+    branches: [main, "release/**"]
   pull_request:
-    branches: [main, "release/**", "pico-v98-31-0-2"]
+    branches: [main, "release/**"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -25,15 +22,7 @@ jobs:
       fail-fast: false
       matrix:
         rust: ["1.88", "stable", "nightly"]
-        # `--all-features` is **not** buildable on this fork and has not been since before its
-        # tip: `--all-features` selects `revm-precompile`'s `bn` backend, which does not
-        # compile against the `substrate-bn` fork this tree pins (`cannot add AffineG1 to
-        # AffineG1`). It is 3 errors at `pico-v98-31-0-2` with no commit of this branch
-        # applied. Enabling this workflow's trigger without dropping that cell would give a
-        # permanently red matrix entry, and a CI that is red for a reason nobody caused is a
-        # CI nobody reads. `--features serde` in its place is the configuration that actually
-        # matters here: it is what the INV-B serde suite and the `Interpreter` round trip need.
-        flags: ["--no-default-features", "", "--features serde"]
+        flags: ["--no-default-features", "", "--all-features"]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
@@ -97,11 +86,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      # Not `--all-features`, for the reason given on the `test` matrix above. The
-      # deny-by-default lints -- which are the ones that have caught real defects in this fork
-      # (`derived_hash_with_manual_eq`, `arithmetic_overflow`) -- fire on the default feature
-      # set just the same.
-      - run: cargo clippy --workspace --all-targets --features serde
+      - run: cargo clippy --workspace --all-targets --all-features
         env:
           RUSTFLAGS: -Dwarnings
 
