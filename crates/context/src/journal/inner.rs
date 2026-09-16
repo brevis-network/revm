@@ -50,8 +50,7 @@ use std::vec::Vec;
 /// A `remove` is **not** in the surviving set, whatever the shape of the table afterwards:
 /// `RawTable::remove` reads the value *out* of its bucket, so a cached pointer to the removed
 /// entry dangles even though every other bucket is where it was. Nothing in either repository
-/// removes from `state` -- which is why this is a precondition and not a clear site -- and
-/// `JournalEntry::AccountWarmed`'s doc has been corrected to stop inviting one.
+/// removes from `state`, which is why this is a precondition and not a clear site.
 ///
 /// Eight places clear, for four different reasons.
 ///
@@ -661,7 +660,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     ///   insert into that map since it was resolved; **and**
     /// * **`from` must not equal `to`.**
     ///
-    /// The second clause is the one with teeth, and it was missing. The hazard is not a moved
+    /// The second clause is the one with teeth. The hazard is not a moved
     /// bucket -- the `from` lookup below is a lookup, so nothing rehashes -- it is *aliasing*:
     /// that lookup mints a `&mut Account` through the same table, and if `from` and `to` are
     /// one key, the retag invalidates `to_account`, which the second half of this function
@@ -674,9 +673,8 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     /// one frame up -- and because [`AlignedAddress::same`] reads exactly the 20 payload
     /// bytes and never the `repr(C, align(8))` tail padding, so it cannot miss an equality.
     /// Both of those are a caller's property, which is what makes this a clause and not a
-    /// comment. `8e8355d5` had the guard and the deref in one body, where the compiler
-    /// enforced it; moving the deref across a function boundary turned a compiler-enforced
-    /// fact into a doc sentence, and the sentence left this out.
+    /// comment: the guard and the deref used to share a body, where the compiler enforced
+    /// it, and moving the deref across a function boundary made it a doc sentence instead.
     ///
     /// [`AlignedAddress::same`]: primitives::AlignedAddress::same
     #[inline(never)]
@@ -1246,15 +1244,14 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // well, and it is that, not the work itself, that gave this function a 464-byte frame
         // and twelve callee-saved registers to spill; the insert stays in `sload_slot_miss`.
         //
-        // SAFETY, in both arms -- the note this replaced covered only the miss:
+        // SAFETY, in both arms:
         //   * miss: `account` was just derived from a live `&mut Account` out of `state`, and
         //     no other access to `state` happens before it is used.
         //   * hit: `account` is an `AccountCache` bucket pointer, whose contract is that a
         //     non-zero entry points at the `Account` stored under that address in `state`;
         //     the cache is emptied at every point where the table can restructure, and the
         //     `state` borrow this function holds is what keeps it from restructuring here.
-        // The cached arm is the one that runs 74,948 times in 76,821, and it is the one the
-        // comment did not describe.
+        // The cached arm runs 74,948 times in 76,821.
         // Keyed by `FastU256At` so the bucket comparison is limb-wise rather than a 32-byte
         // `memcmp` libcall; see there. Tag 1, and this is its only call site.
         if let Some(slot) = unsafe {
@@ -1712,7 +1709,6 @@ fn sload_slot_warm(
 primitives::assert_all_fields_written!(
     /// The check [`sstore_result`]'s `MaybeUninit` writer traded away. `SStoreResult` lives
     /// in another crate, so a field added to it would land here with no local diff at all.
-    /// See [`assert_all_fields_written`](primitives::assert_all_fields_written).
     assert_sstore_result_fields_are_all_written(SStoreResult) = SStoreResult {
         original_value,
         present_value,

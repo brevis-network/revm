@@ -267,36 +267,24 @@ pub struct MemoryGas {
     limit: usize,
 }
 
-/// The largest word count [`MemoryGas`] will store.
+/// The largest word count [`MemoryGas`] will store: the tighter of two bounds.
 ///
-/// Two separate bounds, and the tighter one wins on each target:
+/// * `2^32` words (137 GB, ~2^55 gas) is the semantic bound, and binds on a 64-bit target.
+/// * `limit` holds `words * 32 - 31`, so `words << 5` must be representable. On a 32-bit
+///   target that caps `words` at `2^27 - 1`, and it is this bound that binds.
 ///
-/// * **`2^32` words.** 137 GB of memory, ~2^55 gas. This is the semantic bound
-///   [`MemoryGas::record_new_len`] refuses past, and the one its `assert_unchecked` reads
-///   back. It binds on a 64-bit target.
-/// * **`limit` must fit.** The field holds `words * 32 - 31`, so `words << 5` has to be
-///   representable. On a 32-bit target that caps `words` at `usize::MAX >> 5`, i.e. `2^27 -
-///   1` -- far below `2^32`, so it is this bound that binds there.
-///
-/// Writing the test as `new_num > u32::MAX as usize` gets the first bound and misses the
-/// second, and on a 32-bit target `u32::MAX as usize == usize::MAX` makes it vacuous: it is
-/// never true, `(new_num << 5)` overflows for any `new_num >= 2^27`, and the guest profile
-/// has `overflow-checks = false`, so it wraps silently. A wrapped `limit` makes
-/// [`MemoryGas::word_limit`] tiny, which makes `offset >= word_limit()` false for offsets the
-/// memory has not been grown to cover -- and that comparison is the only bound `set_u256_ptr`
-/// and `get_u256_to` have.
-///
-/// riscv32imac is a target this fork's `no_std` CI job checks and that `CLAUDE.md` names, so
-/// the 32-bit case is not hypothetical.
+/// Spelling the test `> u32::MAX as usize` misses the second and is *vacuous* on 32-bit,
+/// where `u32::MAX as usize == usize::MAX`: `words << 5` then wraps -- silently, on the guest
+/// profile -- and a wrapped `limit` makes `offset >= word_limit()` false for memory that was
+/// never grown, which is the only bound `set_u256_ptr` and `get_u256_to` have.
 const MAX_WORDS: usize = if (usize::MAX >> 5) < u32::MAX as usize {
     usize::MAX >> 5
 } else {
     u32::MAX as usize
 };
 
-// The invariant `record_new_len`'s `(new_num << 5) - 31` depends on, enforced at compile time
-// on whatever target is being built rather than by a host test the 32-bit CI job never runs.
-// With the bound spelled `u32::MAX` this line is what fails on riscv32imac.
+// Enforced per target, since the 32-bit CI job type-checks but runs no tests. With the bound
+// spelled `u32::MAX` this is the line that fails on riscv32imac.
 const _: () = assert!(
     MAX_WORDS.checked_mul(32).is_some(),
     "MemoryGas::limit would overflow at MAX_WORDS on this target"
@@ -328,10 +316,9 @@ impl TryFrom<MemoryGasDe> for MemoryGas {
         if de.limit != 0 && de.limit % 32 != 1 {
             return Err("MemoryGas::limit must be 0 or words_num * 32 - 31");
         }
-        // The second half of the shape, and the one with teeth: `record_new_len` refuses to
-        // store a word count above `MAX_WORDS` precisely so that the `assert_unchecked` on
-        // the value read back holds. A deserialised `limit` bypasses that write, so the same
-        // bound has to be restated here or the hint becomes a lie about wire data.
+        // The half with teeth: `record_new_len` refuses a word count above `MAX_WORDS` so its
+        // `assert_unchecked` holds. A deserialised `limit` bypasses that write, so without
+        // the same bound here the hint becomes a lie about wire data.
         let words = de
             .limit
             .checked_add(31)
@@ -393,12 +380,9 @@ impl MemoryGas {
     /// sake of one comparison, and `ci.yml`'s `riscv32imac` no-std job is gated to branches
     /// this fork never pushes, so nothing reported it.
     ///
-    /// The replacement is a single compare against the crate-internal `MAX_WORDS`, which is
-    /// `u32::MAX` on a 64-bit target -- the same instruction the shift was standing in for --
-    /// and the tighter "`words << 5` must fit" bound on a 32-bit one. Spelling it
-    /// `> u32::MAX as usize` instead trades the compile error for a bound that is *vacuous*
-    /// on the very target it was meant to enable, because there `u32::MAX as usize` is
-    /// `usize::MAX`. The `assert_unchecked` below reads the same bound back.
+    /// The replacement is a single compare against `MAX_WORDS` -- the same instruction on a
+    /// 64-bit target, and a bound that is not vacuous on a 32-bit one. The `assert_unchecked`
+    /// below reads it back.
     #[inline]
     pub fn record_new_len(&mut self, new_num: usize) -> Option<u64> {
         let words_num = self.words_num();
@@ -424,10 +408,8 @@ impl MemoryGas {
         // saturation. Leave `limit` alone on this path so that bound holds even for the frame
         // that dies here.
         //
-        // The comparison is against `MAX_WORDS` and not `new_num >> 32`; see the note on this
-        // function for why that difference is load-bearing on a 32-bit target, and
-        // `MAX_WORDS` for why the bound is not simply `u32::MAX`. It is what makes the
-        // `<< 5` below unable to overflow.
+        // Against `MAX_WORDS`, not `>> 32` and not `u32::MAX`; see this function's note and
+        // `MAX_WORDS`. It is what makes the `<< 5` below unable to overflow.
         if new_num > MAX_WORDS {
             return Some(u64::MAX);
         }
@@ -475,10 +457,8 @@ mod memory_gas_serde_tests {
                 "accepted limit {bad}"
             );
         }
-        // Right residue, but a word count past `MAX_WORDS` -- the bound
-        // `record_new_len`'s `assert_unchecked` reads back. Written off `MAX_WORDS` rather
-        // than off a literal `2^32` so it stays the real bound on a 32-bit target, where
-        // `1usize << 32` is not even representable.
+        // Right residue, word count past `MAX_WORDS`. Written off `MAX_WORDS` rather than a
+        // literal `2^32`, which is not representable on a 32-bit target.
         let over = usize::try_from(super::MAX_WORDS as u128 * 32 + 1).expect("representable");
         assert!(
             serde_json::from_str::<MemoryGas>(&std::format!("{{\"limit\":{over}}}")).is_err(),
@@ -495,29 +475,22 @@ mod memory_gas_serde_tests {
 mod memory_gas_bound_tests {
     use super::{MemoryGas, MAX_WORDS};
 
-    /// [`MAX_WORDS`] is the smaller of two bounds, and which one binds depends on the target
-    /// width. Both halves are asserted here because the 32-bit half has no CI job that *runs*
-    /// tests -- `check-no-std` only type-checks -- so this is the statement a reader gets.
+    /// Which of the two bounds binds depends on the target width, so both halves are stated.
     #[test]
     fn max_words_is_the_tighter_of_the_two_bounds() {
-        // The representability bound: the field holds `words * 32 - 31`.
         assert!(
             MAX_WORDS.checked_mul(32).is_some(),
             "MAX_WORDS * 32 must not overflow"
         );
-        // The semantic bound.
         assert!(MAX_WORDS <= u32::MAX as usize);
-        // And it really is the tighter one: either `u32::MAX` binds, or one more word is
-        // unrepresentable.
+        // Either `u32::MAX` binds, or one more word is unrepresentable.
         assert!(
             MAX_WORDS == u32::MAX as usize || (MAX_WORDS + 1).checked_mul(32).is_none(),
             "MAX_WORDS is below both bounds"
         );
     }
 
-    /// The refusal path. `> u32::MAX as usize` was vacuous on a 32-bit target, so `new_num`
-    /// fell through to `(new_num << 5) - 31` and wrapped -- silently, on the guest profile,
-    /// which sets `overflow-checks = false`.
+    /// The refusal path, which `> u32::MAX as usize` left open on a 32-bit target.
     #[test]
     fn record_new_len_refuses_past_the_bound_and_leaves_the_field_alone() {
         let mut g = MemoryGas::new();
@@ -526,7 +499,7 @@ mod memory_gas_bound_tests {
         assert_eq!(g.record_new_len(usize::MAX), Some(u64::MAX));
         assert_eq!(g.words_num(), 0);
 
-        // The largest count that is accepted still round-trips through the field.
+        // The largest accepted count still round-trips through the field.
         let mut g = MemoryGas::new();
         assert!(g.record_new_len(MAX_WORDS).is_some());
         assert_eq!(g.words_num(), MAX_WORDS);

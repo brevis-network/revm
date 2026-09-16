@@ -43,17 +43,13 @@ pub use alloy_primitives::{
 
 /// Declares the exhaustive-initialisation check that a `MaybeUninit` writer trades away.
 ///
-/// A constructor that writes its fields one at a time through `addr_of_mut!` is no longer
-/// checked by the compiler for completeness: adding a field compiles clean, runs, and leaves
-/// the new field uninitialised. (Executed on `ExtBytecode`: adding a `bool` gives 0 errors, 0
-/// warnings, and Miri then reports *"constructing invalid value ... encountered uninitialized
-/// memory"*.) An exhaustive destructuring -- no `..` -- is a compile error the moment a field
-/// is added, which sends the next reader to the writer that has to learn about it.
+/// A constructor that writes its fields through `addr_of_mut!` is no longer checked for
+/// completeness: adding a field compiles clean and leaves it uninitialised (verified on
+/// `ExtBytecode` -- 0 errors, and Miri reports *"encountered uninitialized memory"*). An
+/// exhaustive destructuring is a compile error the moment a field is added.
 ///
-/// This lives here, and is a macro, because there are several such writers across several
-/// crates and hand-copying the pattern gives each copy its own chance to drift: each carries
-/// `#[allow(dead_code)]`, which is precisely the attribute that hides a copy having gone
-/// stale. One definition, one doc, one place to add the next site.
+/// A macro because there are several such writers across crates, and each hand-copy carries
+/// its own `#[allow(dead_code)]` -- the attribute that would hide it having gone stale.
 ///
 /// # Usage
 ///
@@ -76,8 +72,7 @@ macro_rules! assert_all_fields_written {
         $name:ident $([$($generics:tt)*])? ($ty:ty) = $path:path { $($field:ident),+ $(,)? }
     ) => {
         $(#[$attr])*
-        // Never called: it exists to be type-checked. That is also why the `dead_code` allow
-        // is not hiding anything here -- there is only one copy of this shape in the tree.
+        // Never called; it exists to be type-checked.
         #[allow(dead_code)]
         fn $name $(<$($generics)*>)? (v: $ty) {
             let $path { $($field),+ } = v;

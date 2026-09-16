@@ -15,17 +15,8 @@ use std::vec::Vec;
 ///
 /// Paying for it here rather than in the loop is deliberate: the alternative is a bounds or
 /// poison test on every single dispatch, which is the test the loop was restructured to
-/// remove.
-///
-/// # What it costs, stated honestly
-///
-/// Nothing at dispatch time, which is the point. At *analysis* time it is not free: a
-/// mandatory guard byte means the returned buffer is always strictly longer than the input,
-/// so the "no padding needed, hand the input straight back" arm that `analyze_legacy` used to
-/// have is now unreachable by construction. That arm was already rare on mainnet -- it needs
-/// the code to end exactly on a `STOP`, and Solidity runtime code ends in a CBOR metadata
-/// blob -- but it was not free to delete, so [`analyze_legacy`] grows the caller's buffer in
-/// place where it can rather than always copying. See the padding arm there.
+/// remove. It is not free at analysis time, though -- the returned buffer is now always
+/// longer than the input, so `analyze_legacy`'s zero-copy arm is unreachable; see there.
 pub const GUARD_BYTES: usize = 1;
 
 /// Analyzes the bytecode for use in [`LegacyAnalyzedBytecode`](crate::LegacyAnalyzedBytecode).
@@ -82,19 +73,17 @@ pub fn analyze_legacy(bytecode: Bytes) -> (JumpTable, Bytes) {
         }
     }
 
-    // Always at least `GUARD_BYTES`, so there is no "input is already fine" arm to take; see
-    // [`GUARD_BYTES`]. What is left to save is the *copy*, not the allocation.
+    // Padding is always at least `GUARD_BYTES`, so there is no "input is already fine" arm.
+    // What can still be saved is the copy, not the allocation.
     let total = len + padding_len(i, len, opcode);
     let bytecode = match bytecode.0.try_into_mut() {
-        // Sole owner of a growable allocation: `resize` reallocates, which for a one-byte
-        // extension is an in-place `realloc` on any real allocator, and zero-fills exactly
-        // the padding. No memcpy of the code itself. This is the arm the pre-guard-byte
-        // `padding == 0` fast path used to cover.
+        // Sole owner of a growable allocation: a one-byte extension is an in-place `realloc`,
+        // so the code itself is never memcpied.
         Ok(mut buf) => {
             buf.resize(total, 0);
             Bytes::from(buf.freeze())
         }
-        // Shared with another handle, or static, or not ours to grow. Copy, as before.
+        // Shared, static, or otherwise not ours to grow.
         Err(shared) => {
             let mut padded = Vec::with_capacity(total);
             padded.extend_from_slice(&shared);
@@ -223,9 +212,8 @@ mod tests {
         assert!(!jump_table.is_valid(5)); // PUSH4
     }
 
-    /// The padding arm now branches on whether the caller's buffer is ours to grow. Both
-    /// arms are on the consensus path, so they must agree byte for byte -- including the
-    /// zero fill, which the reuse arm writes over whatever the allocation held.
+    /// Both ownership arms are on the consensus path, so they must agree byte for byte --
+    /// including the zero fill, which the reuse arm writes over whatever the allocation held.
     #[test]
     fn both_padding_arms_produce_the_same_buffer() {
         let cases: &[&[u8]] = &[
@@ -236,21 +224,20 @@ mod tests {
             &[opcode::JUMPDEST, opcode::PUSH2, 0x00, 0x03],
         ];
         for case in cases {
-            // Unique and growable: takes the reuse arm. Give it spare capacity and stale
-            // bytes past the end, so a missing zero fill would show.
+            // Reuse arm, with stale bytes past the end so a missing zero fill would show.
             let mut owned = Vec::with_capacity(case.len() + 64);
             owned.extend_from_slice(case);
             owned.resize(case.len() + 64, 0xff);
             owned.truncate(case.len());
             let (t_reuse, b_reuse) = analyze_legacy(Bytes::from(owned));
 
-            // A second live handle on the same buffer: `try_into_mut` refuses, copy arm.
+            // A second live handle: `try_into_mut` refuses, so this takes the copy arm.
             let shared = Bytes::copy_from_slice(case);
             let _keep_alive = shared.clone();
             let (t_copy, b_copy) = analyze_legacy(shared);
 
-            // A *slice* of a larger unique allocation: `try_into_mut` may accept it, and the
-            // returned view must still be the slice and nothing around it.
+            // A slice of a larger unique allocation: the result must still be the slice and
+            // nothing around it.
             let mut backing = std::vec![0xaa_u8; 8];
             backing.extend_from_slice(case);
             backing.extend_from_slice(&[0xbb; 8]);
@@ -268,9 +255,8 @@ mod tests {
         }
     }
 
-    /// The same agreement over a spread of pseudo-random code, since `analyze_legacy` is on
-    /// the consensus path and the ownership branch above is new. Deterministic LCG so a
-    /// failure is reproducible; no `rand` dependency in this crate.
+    /// The same agreement over pseudo-random code. Deterministic, so a failure reproduces;
+    /// this crate has no `rand` dependency.
     #[test]
     fn both_padding_arms_agree_on_random_code() {
         let mut seed = 0x2545_F491_4F6C_DD1Du64;

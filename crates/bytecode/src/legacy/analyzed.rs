@@ -37,21 +37,10 @@ pub struct LegacyAnalyzedBytecode {
     jump_table: JumpTable,
 }
 
-/// What a [`LegacyAnalyzedBytecode`] deserialises through, so that [`new`](
-/// LegacyAnalyzedBytecode::new)'s checks apply to wire data too.
-///
-/// The three fields are *independent* on the wire, and a derived `Deserialize` writes them
-/// straight into the struct -- so the constructor whose doc calls itself "the only thing
-/// standing between a caller-chosen jump table and the interpreter's pointer arithmetic" was
-/// skipped by the one caller it was written for. `{"bytecode":"0x00","original_len":1,
-/// "jump_table":<4096 set bits>}` deserialised without complaint and answered
-/// `is_valid(4000)` with `true`, against a one-byte allocation.
-///
-/// Routing through [`try_new`](LegacyAnalyzedBytecode::try_new) costs one comparison per
-/// deserialised contract and makes the assertions structural, which is what
-/// `revm-interpreter`'s `JumpCtx::new` safety contract cites them as. `Bytecode` derives
-/// `Deserialize` too, but as an enum it delegates to this impl for the `LegacyAnalyzed`
-/// variant, so it is covered by the same fix.
+/// What a [`LegacyAnalyzedBytecode`] deserialises through, so the constructor's checks apply
+/// to wire data -- a derived `Deserialize` writes the three independent fields straight into
+/// the struct and skips them, which is what `revm-interpreter`'s `JumpCtx::new` safety
+/// contract relies on them for. `Bytecode`'s enum derive delegates here, so it is covered too.
 #[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
 struct LegacyAnalyzedBytecodeDe {
@@ -101,9 +90,7 @@ impl LegacyAnalyzedBytecode {
     /// `original_len` and `jump_table` as three *independent* wire fields, and `hash_slow()`
     /// covers only `bytecode[..original_len]`. So they are not debug hygiene: they are the
     /// only thing standing between a caller-chosen jump table and the interpreter's pointer
-    /// arithmetic. A derived `Deserialize` wrote the fields directly and skipped them
-    /// entirely, which is why the struct now carries `serde(try_from = ...)`, routing the
-    /// wire format through [`try_new`](Self::try_new).
+    /// arithmetic. See [`try_new`](Self::try_new), which the `serde(try_from)` routes through.
     ///
     /// Together the first two pin `jump_table.len() == original_len`, which is what
     /// [`analyze_legacy`](super::analysis::analyze_legacy) produces. That is what bounds
@@ -135,11 +122,8 @@ impl LegacyAnalyzedBytecode {
 
     /// [`new`](Self::new), returning the violated invariant instead of panicking.
     ///
-    /// This is the one place the three checks live. `new` is this function with the error
-    /// turned into a panic, and `Deserialize` is this function with the error turned into a
-    /// `serde` error -- so a wire-format value cannot reach the interpreter through a path
-    /// that skipped them, which is what the safety contract of `revm-interpreter`'s
-    /// `JumpCtx::new` relies on.
+    /// The one place the three checks live: `new` turns the error into a panic,
+    /// `Deserialize` turns it into a `serde` error, and neither can skip them.
     ///
     /// # Errors
     ///
@@ -212,14 +196,10 @@ mod tests {
         );
     }
 
-    /// `original_len` past the end of the buffer entirely, with a jump table that *agrees*
-    /// with it so the first two checks pass and the third is the one under test. Nothing else
-    /// in this file reaches that check with `original_len > bytecode.len()`:
-    /// `test_panic_on_unpadded_bytecode` reaches it with `original_len == bytecode.len()`, so
-    /// relaxing the check to `<=` would leave only that one test standing -- and the shape
-    /// where `original_len` genuinely exceeds the allocation was covered by nothing at all.
-    /// (This test previously passed a 2-bit table with `original_len = 100` and so tripped
-    /// the *first* check, duplicating `test_panic_on_short_jump_table`.)
+    /// `original_len` past the end of the buffer, with a jump table that *agrees* with it so
+    /// the first two checks pass and the third is the one under test.
+    /// `test_panic_on_unpadded_bytecode` only reaches that check with
+    /// `original_len == bytecode.len()`, so without this the over-run shape is uncovered.
     #[test]
     #[should_panic(expected = "bytecode is not padded past original_len")]
     fn test_panic_on_large_original_len() {
@@ -349,8 +329,7 @@ mod tests {
     }
 }
 
-/// The wire format, which is the path the constructor's checks were written for and the one
-/// they used to miss entirely.
+/// The wire format: the path the constructor's checks exist for, and the one they missed.
 #[cfg(all(test, feature = "serde"))]
 mod serde_tests {
     use super::*;
@@ -365,9 +344,9 @@ mod serde_tests {
         })
     }
 
-    /// The reproducer: a one-byte buffer with a 4096-bit table, every bit set. A derived
-    /// `Deserialize` accepted it and then answered `is_valid(4000)` with `true`, which is the
-    /// out-of-allocation `ip` that `Jumps::absolute_ip_with` builds without a further check.
+    /// A one-byte buffer with a 4096-bit table, every bit set: accepted by the derived
+    /// `Deserialize`, and `is_valid(4000)` then answered `true` -- the out-of-allocation `ip`
+    /// `Jumps::absolute_ip_with` builds without a further check.
     #[test]
     fn an_overlong_jump_table_is_refused_on_the_wire() {
         let table = JumpTable::new(bitvec![u8, Lsb0; 1; 4096]);
@@ -378,7 +357,7 @@ mod serde_tests {
             err.to_string().contains("jump table length is greater"),
             "unexpected error: {err}"
         );
-        // And through the enum, which is how a witness actually names it.
+        // Through the enum too, which is how a witness names it.
         assert!(
             serde_json::from_value::<Bytecode>(serde_json::json!({ "LegacyAnalyzed": json }))
                 .is_err()
@@ -405,7 +384,7 @@ mod serde_tests {
         );
     }
 
-    /// The checks must not cost the honest path: everything `analyze` produces round-trips.
+    /// The honest path must be unaffected: everything `analyze` produces round-trips.
     #[test]
     fn analysed_bytecode_still_round_trips() {
         let cases: &[&[u8]] = &[

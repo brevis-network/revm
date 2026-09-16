@@ -15,14 +15,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # What this fork builds with in place of `--all-features`; see the note on the `test` matrix
-  # below for why `--all-features` is not usable here. Every job that would otherwise have
-  # reached for `--all-features` reads this one value, so `test`, `clippy` and `docs` cannot
-  # drift apart again -- which is how `docs` was left running a command that cannot pass.
-  #
-  # `memory_limit` is in the set because it gates real code, including the two MLOAD/MSTORE
-  # regression tests: with `--features serde` alone those are compiled out of every job, and
-  # `cargo hack check` below does not compile test targets, so nothing would have run them.
+  # What this fork builds with in place of `--all-features` (see the `test` matrix below).
+  # Read by `clippy` and `docs` so the three cannot drift apart again. `memory_limit` is in
+  # the set because it gates the MLOAD/MSTORE regression tests.
   FORK_FEATURES: "serde,memory_limit"
 
 jobs:
@@ -34,30 +29,20 @@ jobs:
       fail-fast: false
       matrix:
         rust: ["1.88", "stable", "nightly"]
-        # `--all-features` is **not** buildable on this fork and has not been since before its
-        # tip: `--all-features` selects `revm-precompile`'s `bn` backend, which does not
-        # compile against the `substrate-bn` fork this tree pins (`cannot add AffineG1 to
-        # AffineG1`). It is 3 errors at `pico-v98-31-0-2` with no commit of this branch
-        # applied. Enabling this workflow's trigger without dropping that cell would give a
-        # permanently red matrix entry, and a CI that is red for a reason nobody caused is a
-        # CI nobody reads.
+        # Not `--all-features`: it selects `revm-precompile`'s `bn` backend, which does not
+        # compile against the `substrate-bn` this tree pins (`cannot add AffineG1 to
+        # AffineG1`), so the cell would be permanently red.
         #
-        # The four cells in its place, and what each one is the only cover for:
+        # What each cell is the only cover for:
         #   --no-default-features   the no_std-shaped surface
-        #   ""                      the defaults, i.e. what a plain dependant gets
-        #   --features serde        the INV-B serde suite and the `Interpreter` round trip --
-        #                           and, being serde *without* `memory_limit`, the
-        #                           configuration rsp actually ships
-        #   $FORK_FEATURES          `memory_limit`, which gates `check_memory_limit` and the
-        #                           two MLOAD/MSTORE `MemoryLimitOOG` regression tests
+        #   ""                      the defaults a plain dependant gets
+        #   --features serde        the INV-B serde suite, and serde *without* `memory_limit`,
+        #                           which is what rsp ships
+        #   $FORK_FEATURES          the MLOAD/MSTORE `MemoryLimitOOG` regression tests
         #
-        # None of these cells builds a *serde-free* `revm-interpreter`, including the
-        # `--no-default-features` one: `crates/ee-tests` declares `revm = { features =
-        # ["serde"] }` unconditionally, so a `--workspace` build unifies `serde` on for the
-        # whole tree no matter what is passed here. That configuration is covered by the
-        # `test-no-serde` job below, not by this matrix -- saying so here because assuming
-        # otherwise is exactly the mistake that let the self dev-dependency in
-        # `crates/interpreter/Cargo.toml` go unnoticed.
+        # No cell here builds a serde-free `revm-interpreter`, not even the first:
+        # `crates/ee-tests` depends on `revm` with `serde` on unconditionally, and
+        # unification is workspace-wide. That is what `test-no-serde` below covers.
         flags:
           - "--no-default-features"
           - ""
@@ -71,10 +56,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace ${{ matrix.flags }}
 
-  # The configuration `--workspace` cannot reach: the crates that matter, built without
-  # `serde`, so a `#[cfg(not(feature = "serde"))]` path or a compile error that only appears
-  # there is reachable from CI at all. Package-scoped on purpose -- adding any crate that
-  # depends on `revm` with `serde` on defeats the point of the job.
+  # The configuration `--workspace` cannot reach, so a `#[cfg(not(feature = "serde"))]` path
+  # is exercised somewhere. Package-scoped on purpose: adding any crate that depends on
+  # `revm` with `serde` on defeats the job.
   test-no-serde:
     name: test without serde
     runs-on: ubuntu-latest
@@ -130,10 +114,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      # `--exclude-features bn` for the same reason the `test` matrix drops `--all-features`:
-      # the powerset selects `revm-precompile`'s `bn` backend on its own, which does not build
-      # against the pinned `substrate-bn`. Excluding the one feature keeps every other
-      # combination under test, which is the point of this job.
+      # `bn` for the same reason the `test` matrix drops `--all-features`; every other
+      # combination stays under test.
       - name: cargo hack
         run: cargo hack check --feature-powerset --depth 1 --exclude-features bn
 
@@ -163,10 +145,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rust-docs
-      # Not `--all-features`: rustdoc type-checks, so it fails on the `bn` backend exactly as
-      # `cargo check` does. This job was left on `--all-features` when `test` and `clippy`
-      # moved off it, which would have made it permanently red the moment the branch trigger
-      # above started firing.
+      # Not `--all-features`: rustdoc type-checks, so it fails on the `bn` backend too.
       - run: cargo doc --workspace --features ${{ env.FORK_FEATURES }} --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: "--cfg docsrs -D warnings"

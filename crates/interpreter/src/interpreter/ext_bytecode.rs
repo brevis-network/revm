@@ -44,9 +44,8 @@ impl Default for ExtBytecode {
 }
 
 primitives::assert_all_fields_written!(
-    /// The check that `write_with_hash` and `write_with_optional_hash` traded away: both
-    /// initialise `ExtBytecode` one field at a time through `addr_of_mut!`. See
-    /// [`assert_all_fields_written`](primitives::assert_all_fields_written).
+    /// The check `write_with_hash` and `write_with_optional_hash` traded away: both
+    /// initialise `ExtBytecode` one field at a time through `addr_of_mut!`.
     assert_ext_bytecode_fields_are_all_written(ExtBytecode) = ExtBytecode {
         instruction_pointer,
         continue_execution,

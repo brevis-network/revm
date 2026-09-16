@@ -1,8 +1,7 @@
 //! Probe: does a deserialised `SharedMemory` satisfy INV-B?
 //!
-//! `serde` is not a default feature of this crate. The requirement is declared as
-//! `required-features` on the `[[test]]` target in `Cargo.toml`, not as a `#![cfg]` here, so
-//! that naming this target without the feature is an error rather than a silent pass.
+//! `serde` is declared as `required-features` on the `[[test]]` target in `Cargo.toml`, not
+//! as a `#![cfg]` here, so naming this target without it is an error, not a silent pass.
 
 use primitives::U256;
 use revm_interpreter::interpreter::SharedMemory;

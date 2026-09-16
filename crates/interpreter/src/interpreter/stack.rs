@@ -62,29 +62,16 @@ pub const fn too_shallow_for(words: usize) -> isize {
 /// Whether the cursor has **no room** for one more word, i.e. a push must halt with
 /// `StackOverflow`.
 ///
-/// # Why this is one *unsigned* compare and not a signed one
+/// `sp.wrapping_add(WORD)` undoes the bias (see [`StackTr::sp`]), so this is one unsigned
+/// compare on the post-push byte length, and the empty cursor wraps to `0` rather than to
+/// something huge. Both a signed `>=` and an `==` are false upper bounds here: the first
+/// accepts every `sp` from `2^63` up, because the bias makes it read as negative, and
+/// `push_at` would then write at `base + sp + WORD`, far outside the buffer. Costs nothing
+/// over either, since `sp + WORD` is already computed for the store address.
 ///
-/// The obvious spelling, `(sp as isize) >= (BYTE_LIMIT - WORD) as isize`, closes only half
-/// the domain. The cursor is biased -- an empty stack is `-WORD`, i.e. `usize::MAX - 31` --
-/// so the comparison has to accept that one negative value, and a signed `>=` against a
-/// positive threshold accepts **every** negative value with it. `sp = usize::MAX - 64` reads
-/// as `-65`, passes the guard, and `push_at` then writes at `base + sp + WORD`: roughly 16
-/// EiB past a 32 KiB buffer. Half of all `usize` values are in that half.
-///
-/// `sp.wrapping_add(WORD)` is the stack's byte length after the push -- the bias is exactly
-/// one word, so adding it back gives the unbiased `byte_len`, and the empty cursor wraps to
-/// `0` rather than to something huge. One unsigned `>` against `BYTE_LIMIT - WORD` then
-/// accepts `byte_len` in `0..=BYTE_LIMIT - WORD` and rejects everything else, both halves.
-///
-/// It also costs nothing over the signed form: `push_at` computes `sp + WORD` for the store
-/// address and the caller computes it again for the new cursor, so LLVM already has the
-/// value in a register.
-///
-/// What this does *not* check is alignment. `sp` in `usize::MAX - 30 ..= usize::MAX` wraps to
-/// a byte length in `1..=31`, which is inside the buffer but not word-aligned. That is the
-/// caller's invariant (`set_sp` debug-asserts it, and `Interpreter::run_plain` states it),
-/// not a bound this test can carry for free -- and unlike the case above, it cannot put a
-/// write outside the allocation.
+/// Alignment is *not* checked: `sp` in `usize::MAX - 30 ..= usize::MAX` wraps to a byte
+/// length of `1..=31`, in bounds but misaligned. That is the caller's invariant (`set_sp`
+/// debug-asserts it); unlike the above it cannot put a write outside the allocation.
 #[inline(always)]
 pub const fn no_room_to_push(sp: usize) -> bool {
     sp.wrapping_add(WORD) > BYTE_LIMIT - WORD
@@ -943,13 +930,9 @@ mod tests {
 
     fn run(f: impl FnOnce(&mut Stack)) {
         let mut stack = Stack::new();
-        // Fill the whole capacity with non-zero values.
-        //
-        // `STACK_LIMIT` and not `BYTE_LIMIT`: `write_bytes` counts *elements of the pointee
-        // type*, and `base_mut()` is a `*mut U256`, so the count is words. `STACK_LIMIT`
-        // words is the whole 32 KiB buffer, which is what this wants. Read as a byte count it
-        // looks 32x too small, and "fixing" it to `BYTE_LIMIT` writes 32768 words -- 1 MiB,
-        // 31/32 of it past the end of the stack.
+        // Fill the whole capacity with non-zero values. `STACK_LIMIT`, not `BYTE_LIMIT`:
+        // `write_bytes` counts *elements* of the `*mut U256`, so this is already 32 KiB.
+        // `BYTE_LIMIT` would write 1 MiB, almost all of it past the end of the stack.
         unsafe {
             core::ptr::write_bytes(stack.base_mut(), 0xff, STACK_LIMIT);
         }

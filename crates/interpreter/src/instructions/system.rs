@@ -226,12 +226,10 @@ pub fn calldataload_at<WIRE: InterpreterTypes, H: ?Sized>(
     // reversals, ~77 more. When the whole 32 bytes are inside the calldata - the case for
     // essentially every `CALLDATALOAD` a compiler emits - the limbs can be assembled
     // straight from the bytes with 8 `lbu` + 7 `slli` + 7 `or` each and neither is needed.
-    // The bound is tested on the `u64` limb, not on `ol[0] as usize`. The two are the same
-    // test only because `usize` is 64 bits here, and the difference fails *open*: on a 32-bit
-    // target `ol[0] as usize` truncates, so `ol[0] = 0x1_0000_0000` would read
-    // `calldata[0..32]` where the saturating form it replaced pushes zero. Nothing in this
-    // crate asserts the width, and the 32-bit no-std job in `ethereum-tests.yml` is gated to
-    // branches this fork never pushes, so the assumption was held by nothing.
+    // Tested on the `u64` limb, not on `ol[0] as usize`: the two agree only where `usize` is
+    // 64 bits, and the difference fails *open* -- on a 32-bit target `ol[0] as usize`
+    // truncates, so `ol[0] = 0x1_0000_0000` would read `calldata[0..32]` where the saturating
+    // form it replaced pushes zero. Nothing in this crate asserts the width.
     if (ol[1] | ol[2] | ol[3]) != 0 || ol[0] >= input_len as u64 {
         // SAFETY: `dst` is the four limbs of a live stack word.
         unsafe {
@@ -554,8 +552,7 @@ pub fn memory_resize(
     // MCOPY was measured with it too, on the `dst >= src` half: a further +652. Not worth
     // the branch.
     //
-    // **`dst >= src` is not the sound predicate**, and the note that used to claim it was is
-    // exactly the kind of warrant a future edit leans on. It is false whenever the two ranges
+    // **`dst >= src` is not the sound predicate.** It is false whenever the two ranges
     // *overlap*: with `dst >= src` and `src + len > max(old_len, dst)`, part of the copy's
     // own source lies in memory the grow has just created, which the EVM requires to read as
     // zero -- executed, `(dst, src, len)` of `(0, 0, 32)`, `(0, 0, 64)`, `(32, 0, 64)` and

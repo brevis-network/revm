@@ -1,7 +1,5 @@
 [default]
-# `[0-9a-f]{7,40}` exempts git SHAs quoted in comments: several notes in this tree cite the
-# commit a claim came from, and the dictionary reads the hex as misspelled words (`de7caf9c`
-# -> `caf` -> `calf`).
+# Exempt git SHAs quoted in comments; the dictionary reads the hex as words (`caf` -> `calf`).
 extend-ignore-identifiers-re = ["[sS]imular", "ba", "\\b[0-9a-f]{7,40}\\b"]
 
 [files]

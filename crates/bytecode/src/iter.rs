@@ -61,19 +61,9 @@ impl<'a> BytecodeIterator<'a> {
             .map(|info| info.immediate_size() as usize)
             .unwrap_or_default();
 
-        // Advance the iterator by the immediate size, saturating at the end of what is left.
-        //
-        // Not `.get(immediate_size..).unwrap_or_default()`: the default `&[]` is
-        // `NonNull::dangling()`, a pointer into no allocation at all, and `position()`
-        // subtracts it from `start`. `offset_from_unsigned` requires both pointers to be
-        // derived from the same object, so that is undefined behaviour -- it aborts under the
-        // debug precondition checks and returns garbage in release.
-        //
-        // The short-remainder case was unreachable while this iterator walked the *padded*
-        // buffer, because the analysis guarantees no truncated immediate there. It became
-        // reachable the moment `new` switched to the original bytes, which is exactly where
-        // a truncated `PUSH` immediate is allowed to sit: `Bytecode::new_raw([PUSH2, 0x01])`
-        // is enough. Clamping keeps the cursor one-past-the-end of the same slice instead.
+        // Clamp rather than `unwrap_or_default()`: the *original* bytes may end in a
+        // truncated immediate, and an empty default slice is a dangling pointer, which
+        // `position()` would subtract from `start` -- UB.
         if immediate_size > 0 {
             let rest = self.bytes.as_slice();
             self.bytes = rest[immediate_size.min(rest.len())..].iter();
@@ -306,15 +296,13 @@ mod tests {
         assert_eq!(opcodes, vec![opcode::STOP]);
     }
 
-    /// Iterating the *original* bytes means a truncated `PUSH` immediate is reachable -- the
-    /// analysis only guarantees there is none in the padded buffer. `skip_immediate` used to
-    /// fall back to an empty slice there, whose pointer belongs to no allocation, and the
-    /// next `position()` subtracted it from `start`: undefined behaviour, and an abort under
-    /// the debug precondition checks. Every code ending in a `0x60..=0x7f` byte reaches it.
+    /// A truncated `PUSH` immediate is only excluded from the *padded* buffer, so iterating
+    /// the original bytes must tolerate one. Reached by any code ending in `0x60..=0x7f`.
     #[test]
     fn truncated_trailing_push_immediate_keeps_position_in_the_allocation() {
         // One byte short of PUSH2's immediate, through to 31 short of PUSH32's.
         for push in opcode::PUSH1..=opcode::PUSH32 {
+            // Every shortfall, from one byte short of PUSH2 to 31 short of PUSH32.
             let want = (push - opcode::PUSH1) as usize + 1;
             for have in 0..want {
                 let mut code = vec![opcode::JUMPDEST, push];
@@ -326,7 +314,6 @@ mod tests {
                 assert_eq!(it.next(), Some(opcode::JUMPDEST));
                 assert_eq!(it.position(), 1);
                 assert_eq!(it.next(), Some(push));
-                // Clamped to the end of the original bytes, not past them.
                 assert_eq!(it.position(), code.len(), "{push:#04x}, {have} of {want}");
                 assert_eq!(it.next(), None);
                 assert_eq!(it.position(), code.len());
@@ -335,14 +322,13 @@ mod tests {
         }
     }
 
-    /// The same shape with nothing before it, which is the smallest reproducer there is.
+    /// The smallest reproducer, and the padded buffer's trailing `STOP`s stay unreported.
     #[test]
     fn lone_truncated_push_yields_the_opcode_and_stops() {
         let raw = LegacyRawBytecode(Bytes::from(vec![opcode::PUSH2, 0x01]));
         let bytecode = Bytecode::LegacyAnalyzed(raw.into_analyzed());
         let opcodes: Vec<u8> = bytecode.iter_opcodes().collect();
         assert_eq!(opcodes, vec![opcode::PUSH2]);
-        // And the padded buffer's trailing `STOP`s are not reported as contract opcodes.
         let mut it = BytecodeIterator::new(&bytecode);
         assert_eq!(it.next(), Some(opcode::PUSH2));
         assert_eq!(it.position(), 2);

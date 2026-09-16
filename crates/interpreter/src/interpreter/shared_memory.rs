@@ -1619,17 +1619,10 @@ pub fn resize_memory_written<Memory: MemoryTr>(
     }
 }
 
-/// The `memory_limit` cap, applied where the expansion happens.
-///
-/// It lives in [`grow_memory_word`] and [`grow_memory_word_written`] rather than at their
-/// call sites because it is an invariant of *growing the buffer*, not of `MLOAD` and `MSTORE`
-/// in particular. Restating it per caller is exactly how it went missing: moving the
-/// expansion off `resize_memory_written!` -- where the macro applies the cap for ~20 other
-/// memory opcodes -- onto these helpers dropped it, leaving the two opcodes most able to push
-/// past the cap as the only two not subject to it. A third caller of a `pub` helper would
-/// have dropped it again.
-///
-/// Compiled out entirely without the feature, which is every build rsp ships.
+/// The `memory_limit` cap, applied where the expansion happens rather than at each call site:
+/// it is an invariant of growing the buffer, not of `MLOAD` and `MSTORE`. Restating it per
+/// caller is how it went missing when the expansion moved off `resize_memory_written!`, which
+/// applies it for ~20 other opcodes.
 #[cfg(feature = "memory_limit")]
 #[inline(always)]
 fn check_memory_limit<Memory: MemoryTr>(
@@ -1653,10 +1646,9 @@ fn check_memory_limit<Memory: MemoryTr>(
 /// # Errors
 ///
 /// [`InstructionResult::MemoryLimitOOG`] if the `memory_limit` cap refuses the new length, or
-/// [`InstructionResult::MemoryOOG`] if the frame cannot pay the expansion. The caller halts
-/// with whichever comes back; the distinction is consensus-visible, which is why this is a
-/// `Result` and not a `bool`. The cap is applied here rather than at the call sites -- see
-/// the crate-internal `check_memory_limit` for why that matters.
+/// [`InstructionResult::MemoryOOG`] if the frame cannot pay the expansion. A `Result` rather
+/// than a `bool` because the distinction is consensus-visible and the caller must not have to
+/// pick.
 ///
 /// # Safety
 ///

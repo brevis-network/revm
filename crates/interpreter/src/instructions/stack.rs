@@ -102,13 +102,10 @@ pub fn dup_at<const N: usize, WIRE: InterpreterTypes, H: ?Sized>(
     // The switch dispatch of `Interpreter::run_plain` does not come through here -- `DUP` is
     // tagged `(6, N)` and tests the same two bounds against a pinned register -- so this form
     // is the readable one rather than the one unsigned compare it used to fold into.
-    // The room half is `no_room_to_push`, which is where the reasoning lives: an equality is
-    // a false upper bound (it rejects one value of `sp` and accepts every larger one), and so
-    // is a signed `>=` (it rejects only the positive half, and the biased cursor puts half
-    // the domain in the negative one). The depth half below already refuses every negative
-    // `sp` for `N >= 1`, so this call site was not reachable through that hole -- but the two
-    // checks now spell the bound the same way, which is what stops the next reader copying
-    // the weaker one.
+    // Room, then depth; see `no_room_to_push` for why neither `==` nor a signed `>=` bounds
+    // an arbitrary `sp`. The depth half already refuses every negative `sp` for `N >= 1`, so
+    // this site was never reachable through that hole -- but it now spells the bound the same
+    // way as `push_at!`, which is what stops the next reader copying the weaker one.
     if no_room_to_push(sp) || (sp as isize) <= too_shallow_for(N) {
         return (
             sp,
@@ -184,18 +181,13 @@ mod bound_tests {
     /// cross-crate public API, and the room checks are what stands between an out-of-range
     /// cursor and a write past the 32 KiB stack buffer.
     ///
-    /// Three shapes must be rejected: the full stack (`BYTE_LIMIT - WORD`, the one an
-    /// equality test did catch), anything above it (which an equality test does not), and
-    /// everything from `2^63` up -- which a *signed* `>=` reads as negative and accepts,
-    /// leaving half the domain open. `usize::MAX - 64` is the witness: as an `isize` it is
-    /// `-65`, below any positive threshold, and `push_at` would store at `base + sp + WORD`,
-    /// about 16 EiB past a 32 KiB buffer. The biased empty cursor must still be *accepted*,
-    /// which is what rules out a plain unsigned compare on `sp` itself; see
-    /// [`no_room_to_push`].
+    /// Three shapes must be rejected: the full stack (which an `==` did catch), anything
+    /// above it (which it did not), and everything from `2^63` up -- which a signed `>=`
+    /// reads as negative and accepts. The biased empty cursor must still be *accepted*,
+    /// which rules out a plain unsigned compare on `sp` itself.
     #[test]
     fn room_checks_reject_every_out_of_range_cursor() {
-        // `sp` values that must be refused by a push: full, past full, and the negative-as-
-        // `isize` half. The last group is what the signed comparison let through.
+        // Full, past full, and the negative-as-`isize` half that the signed compare let in.
         let refused = [
             BYTE_LIMIT - WORD,
             BYTE_LIMIT,
@@ -262,13 +254,10 @@ mod bound_tests {
         assert_eq!(interpreter.bytecode.instruction_result(), None);
     }
 
-    /// [`no_room_to_push`] over its whole domain, stated as the property rather than as a
-    /// list of witnesses: a cursor has room exactly when it is a live cursor of a stack that
-    /// is not yet full.
+    /// The property rather than witnesses: a cursor has room exactly when it is a live cursor
+    /// of a stack that is not yet full.
     #[test]
     fn no_room_to_push_accepts_exactly_the_live_non_full_cursors() {
-        // Every legal cursor, which is `byte_len - WORD` for `byte_len` a multiple of `WORD`
-        // in `0..=BYTE_LIMIT`.
         for words in 0..=STACK_LIMIT {
             let sp = (words * WORD).wrapping_sub(WORD);
             assert_eq!(
@@ -277,7 +266,7 @@ mod bound_tests {
                 "words {words}, sp {sp}"
             );
         }
-        // Everything above the full stack, on both sides of the signed/unsigned split.
+        // Above the full stack, on both sides of the signed/unsigned split.
         for sp in [
             BYTE_LIMIT,
             BYTE_LIMIT + WORD,
@@ -291,10 +280,8 @@ mod bound_tests {
         ] {
             assert!(no_room_to_push(sp), "accepted sp {sp}");
         }
-        // The residue the helper's doc names: `sp` in `usize::MAX - 30 ..= usize::MAX` wraps
-        // to a byte length of `1..=31`. Those are accepted, and are in-bounds but misaligned
-        // -- the *alignment* of the cursor is the caller's invariant, not this check's. The
-        // point of pinning it is that it is bounded, not that it is empty.
+        // The residue the helper's doc names: accepted, misaligned, but still in bounds.
+        // Pinned because it is bounded, not because it is empty.
         for sp in [usize::MAX - 30, usize::MAX - 1, usize::MAX] {
             assert!(!no_room_to_push(sp));
             assert!(

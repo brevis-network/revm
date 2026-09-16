@@ -23,8 +23,7 @@ pub struct JournaledAccount<'a, ENTRY: JournalEntryTr> {
 }
 
 primitives::assert_all_fields_written!(
-    /// The check [`JournaledAccount::new`]'s `MaybeUninit` writer traded away. See
-    /// [`assert_all_fields_written`](primitives::assert_all_fields_written).
+    /// The check [`JournaledAccount::new`]'s `MaybeUninit` writer traded away.
     assert_journaled_account_fields_are_all_written[ENTRY: JournalEntryTr](
         JournaledAccount<'_, ENTRY>
     ) = JournaledAccount {

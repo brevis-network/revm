@@ -341,11 +341,8 @@ macro_rules! popn_top_at {
 #[collapse_debuginfo(yes)]
 macro_rules! push_at {
     ($interpreter:expr, $sp:ident, $rem:ident, $x:expr) => {
-        // This macro is the room check of eighteen instructions, so it is the one that has to
-        // be right for an arbitrary `usize`. See `no_room_to_push`: neither an equality nor a
-        // signed `>=` is an upper bound here -- the first rejects one value, the second
-        // rejects only the positive half, and the cursor is biased so half the domain reads
-        // as negative.
+        // The room check of eighteen instructions, and reachable from outside the crate with
+        // an arbitrary `usize`, so the bound has to hold for one. See `no_room_to_push`.
         if $crate::interpreter::no_room_to_push($sp) {
             return (
                 $sp,

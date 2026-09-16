@@ -30,18 +30,10 @@ serde = { workspace = true, features = ["derive", "rc"], optional = true }
 [dev-dependencies]
 serde_json = { workspace = true, features = ["alloc"] }
 
-# `tests/shared_memory_serde.rs` needs `serde`, which is not a default feature. Declaring that
-# as `required-features` rather than as `#![cfg(feature = "serde")]` inside the file is what
-# makes the requirement *visible*: cargo errors out when the target is named explicitly
-# without the feature, instead of compiling zero of its ten tests and reporting success --
-# which is what a plain `cargo test -p revm-interpreter` used to do.
-#
-# A self dev-dependency (`revm-interpreter = { path = ".", features = ["serde"] }`) also fixes
-# that, but by turning `serde` on for *every* test build of this crate: feature unification
-# means the `--no-default-features` CI cell then no longer builds a serde-free
-# `revm-interpreter`, `revm-primitives`, `revm-bytecode`, `revm-state` or
-# `revm-context-interface` for its tests either, so the non-serde configuration stops being
-# tested at all. The `--features serde` CI cell is what runs this suite.
+# `required-features` rather than `#![cfg(feature = "serde")]` in the file: naming this target
+# without the feature is then an error, instead of compiling zero of its ten tests and
+# reporting success. A self dev-dependency fixes that too, but by turning `serde` on for every
+# test build of this crate -- unification then denies the whole tree a serde-free build.
 [[test]]
 name = "shared_memory_serde"
 required-features = ["serde"]

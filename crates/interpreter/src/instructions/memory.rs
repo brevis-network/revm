@@ -29,11 +29,8 @@ macro_rules! mstore_body {
             sync_gas_at!($context.interpreter, $rem);
             // The `set_u256_ptr` below writes all 32 bytes of `offset..offset + 32`
             // unconditionally and before anything can read them, so the grow does not have
-            // to zero that part of the new tail. Same gas, same word count.
-            //
-            // `grow_memory_word_written` applies the `memory_limit` cap itself and reports
-            // which of the two halts it wants, so there is no cap to restate here and no way
-            // for a caller to forget one; see `check_memory_limit`.
+            // to zero that part of the new tail. Same gas, same word count. The helper
+            // applies the `memory_limit` cap itself and reports which halt it wants.
             // SAFETY: the test above is exactly `grow_memory_word_written`'s precondition.
             if let Err(halt) = unsafe {
                 crate::interpreter::grow_memory_word_written(
@@ -105,7 +102,6 @@ pub fn mload_at<WIRE: InterpreterTypes, H: ?Sized>(
     let rem = if offset >= context.interpreter.gas.memory().word_limit() {
         // Charges gas, so the field has to be the truth first; see `sync_gas_at!`.
         sync_gas_at!(context.interpreter, rem);
-        // The `memory_limit` cap lives inside `grow_memory_word`; see `check_memory_limit`.
         // SAFETY: the test above is exactly `grow_memory_word`'s precondition.
         if let Err(halt) = unsafe {
             crate::interpreter::grow_memory_word(
