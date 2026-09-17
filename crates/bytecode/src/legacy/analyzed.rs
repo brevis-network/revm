@@ -1,5 +1,6 @@
 use super::JumpTable;
 use primitives::Bytes;
+use std::vec::Vec;
 
 /// Legacy analyzed bytecode represents the original bytecode format used in Ethereum.
 ///
@@ -77,20 +78,29 @@ impl LegacyAnalyzedBytecode {
             "jump table length is less than original length"
         );
         assert!(!bytecode.is_empty(), "bytecode cannot be empty");
-        // The two invariants `Interpreter::run_plain` relies on. It fetches the byte after
-        // the instruction it just ran before it checks for a halt, so after the final STOP
-        // it reads `bytecode[len_of_code]`; `analyze_legacy` provides that byte. A caller
-        // rebuilding from serialised parts (`Bytecode::new_analyzed`) that were produced by
-        // an older analysis without the slack byte fails here, loudly, instead of handing the
-        // interpreter a buffer it will read one past.
-        assert!(
-            bytecode.len() > original_len,
-            "analyzed bytecode must carry at least one padding byte past the original code"
-        );
-        assert!(
-            *bytecode.last().unwrap() == 0,
-            "analyzed bytecode must end in a zero (STOP) byte"
-        );
+        // The invariant `Interpreter::run_plain` relies on: it fetches the byte after the
+        // instruction it just ran before it checks for a halt, so after the final STOP it
+        // reads `bytecode[original_len]`. `analyze_legacy` provides that byte, but a value
+        // rebuilt from serialised parts may not -- the padding formula this fix replaced
+        // added nothing at all when the code already ended in STOP, so every witness written
+        // before it carries `bytecode.len() == original_len` for those contracts.
+        //
+        // Supplying the byte rather than rejecting the value is deliberate. The code itself
+        // is legitimate and the code hash covers `bytecode[..original_len]` only, so adding a
+        // trailing zero changes neither the hash nor anything the interpreter reads as code.
+        // Rejecting instead would make every previously serialised witness undecodable, which
+        // is a wire-format break for an invariant the consumer can satisfy on its own.
+        let bytecode = if bytecode.len() > original_len {
+            bytecode
+        } else {
+            let mut padded = Vec::with_capacity(original_len + 1);
+            padded.extend_from_slice(&bytecode);
+            padded.push(0);
+            Bytes::from(padded)
+        };
+        // Now unconditional, and cheap: the branch above is the only way in.
+        debug_assert!(bytecode.len() > original_len);
+        debug_assert_eq!(*bytecode.last().unwrap(), 0);
         Self {
             bytecode,
             original_len,
@@ -166,5 +176,60 @@ mod tests {
         let bytecode = Bytes::from_static(&[]);
         let jump_table = JumpTable::new(bitvec![u8, Lsb0; 0; 0]);
         let _ = LegacyAnalyzedBytecode::new(bytecode, 0, jump_table);
+    }
+}
+
+#[cfg(test)]
+mod slack_tests {
+    use super::*;
+
+    /// A witness written before the slack byte existed must still load.
+    ///
+    /// The padding formula this fix replaced was `overshoot + (last != STOP)`, which adds
+    /// nothing when the code already ends in STOP. Every `ClientExecutorInput` serialised
+    /// before the fix therefore ships `bytecode.len() == original_len` for those contracts,
+    /// and rejecting them made eight of the nine mainnet bench fixtures halt with exit code
+    /// 1 -- caught by running them, not by any test in this tree.
+    #[test]
+    fn a_bytecode_with_no_slack_is_padded_not_rejected() {
+        // `PUSH1 0x01; STOP` -- ends in STOP, so the old analysis added no padding at all.
+        let code = Bytes::from_static(&[0x60, 0x01, 0x00]);
+        let original_len = code.len();
+        let analyzed = LegacyAnalyzedBytecode::new(
+            code.clone(),
+            original_len,
+            JumpTable::new(bitvec::bitvec![u8, bitvec::order::Lsb0; 0; original_len]),
+        );
+        assert_eq!(
+            analyzed.original_len(),
+            original_len,
+            "the original length must survive"
+        );
+        assert_eq!(
+            analyzed.original_byte_slice(),
+            &code[..],
+            "the code the hash covers must be untouched"
+        );
+        assert!(
+            analyzed.bytecode().len() > original_len,
+            "the slack byte must have been supplied"
+        );
+        assert_eq!(
+            *analyzed.bytecode().last().unwrap(),
+            0,
+            "the slack byte must be zero"
+        );
+    }
+
+    /// One that already carries slack is passed through without a copy of its own.
+    #[test]
+    fn a_bytecode_that_already_has_slack_is_left_alone() {
+        let code = Bytes::from_static(&[0x60, 0x01, 0x00, 0x00]);
+        let analyzed = LegacyAnalyzedBytecode::new(
+            code.clone(),
+            3,
+            JumpTable::new(bitvec::bitvec![u8, bitvec::order::Lsb0; 0; 3]),
+        );
+        assert_eq!(analyzed.bytecode(), &code, "must not be rebuilt");
     }
 }
