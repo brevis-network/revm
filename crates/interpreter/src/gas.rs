@@ -346,20 +346,38 @@ impl MemoryGas {
     /// assumed): every caller returns at once and `Interpreter::clear` resets `*gas` on
     /// reuse. Letting execution continue past one makes the stale limit consensus-visible.
     ///
-    /// The bound is a comparison against `MAX_WORDS`, not `new_num >> 32`: that shift is by
-    /// the full width of a 32-bit `usize`, a deny-by-default `arithmetic_overflow` error.
+    /// The bound is a comparison against `MAX_WORDS`, not `new_num >> 32`. That shift is by the
+    /// full width of a 32-bit `usize`, and it is **not** caught at compile time -- measured:
+    /// `cargo check --target riscv32imac-unknown-none-elf -p revm-interpreter` accepts it with
+    /// no error and no warning. It is wrong at *runtime* instead, which is worse: release masks
+    /// the shift to `>> 0`, so the guard reads `new_num != 0` and **every** memory expansion
+    /// returns `Some(u64::MAX)` and puts the frame out of gas; debug panics with "attempt to
+    /// shift right with overflow". `MAX_WORDS` is also the tighter bound on that target, where
+    /// it is `2^27 - 1` rather than `2^32 - 1`; see its definition.
     #[inline]
     pub fn record_new_len(&mut self, new_num: usize) -> Option<u64> {
         let words_num = self.words_num();
         if new_num <= words_num {
             return None;
         }
-        // `u64::MAX` rather than the saturating cost (~2^55 gas): every caller feeds this to
-        // the *checked* `record_cost`, so both end the frame out of gas. Not so for
-        // `record_cost_unsafe`, where `remaining - u64::MAX` has a clear sign bit and reports
-        // success, nor for a frame built with `Gas::new`'s `i64::MAX` cap, which can cover
-        // 2^55 -- out of gas is the better of the two there. Returning early is also what
-        // bounds the field, so both `memory_gas` calls lose their saturation.
+        // 2^32 words is 137 GB, and `memory_gas` of it is ~2^55 gas (`w * w` saturates, so
+        // the real figure is `u64::MAX / 512 + 3 * 2^32`). Every caller feeds the result
+        // straight to the *checked* `Gas::record_cost`, so `u64::MAX` is an out-of-gas rather
+        // than a wrap -- note this would not hold for `record_cost_unsafe`, where
+        // `remaining - u64::MAX` has a clear sign bit and reports success.
+        //
+        // What makes the shortcut equivalent to the saturating form is the size of that cost
+        // against a *real* gas limit: ~2^55 is about 1.2e9 times a mainnet block's, so no
+        // transaction can pay it and both forms end the frame out of gas. It is **not** true
+        // that no reachable `remaining` covers it -- `Gas::new` caps the limit at `i64::MAX`,
+        // which is ~250x larger, and `Interpreter::default_ext`/`invalid` are built with
+        // exactly that. Such a frame used to be charged ~2^55 and then attempt a 137 GB
+        // allocation; now it is out of gas, which is the better of the two.
+        //
+        // Returning early is also what bounds the field: `limit` is only ever written below,
+        // so every stored word count is within `MAX_WORDS` and both `memory_gas` calls lose
+        // their saturation. Leave `limit` alone on this path so that bound holds even for the
+        // frame that dies here.
         if new_num > MAX_WORDS {
             return Some(u64::MAX);
         }
