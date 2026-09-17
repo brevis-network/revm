@@ -64,28 +64,45 @@ pub fn analyze_legacy(bytecode: Bytes) -> (JumpTable, Bytes) {
 
     let len = bytecode.len();
     let mut jumps: BitVec<u8> = bitvec![u8, Lsb0; 0; len];
-    // Indices, not pointers: the `PUSH` skip steps up to 32 bytes past the end on a
-    // truncated immediate, which `<*const u8>::add` does not allow. `i` is bounded by
-    // `len + 32`, so it cannot overflow either.
-    let mut i = 0usize;
+    // A pointer induction variable rather than an index. Only the `JUMPDEST` arm needs the
+    // offset, but an index keeps it live for the whole loop, so LLVM re-does `add base, i`
+    // before the load on every step. Walking a pointer moves that arithmetic into the
+    // `JUMPDEST` arm, and the branch structure that comes with it also drops the mask the
+    // `u8` wrap forces and the jump back to a shared increment block. Per step on RV64:
+    // 8/9/13 instructions (plain/PUSH/JUMPDEST) becomes 7/8/12.
+    //
+    // **-19,600,580 retired instructions across rsp's thirteen `perf/bench_data/rv64` blocks,
+    // -0.593 % of the guest.** Those blocks take 19,600,844 steps, counted independently by
+    // re-running this state machine over every witnessed contract, so the saving is one
+    // instruction per step to within 264 -- inside that rig's ~7 K noise floor.
+    //
+    // `wrapping_add`, not `add`: a truncated trailing `PUSH` immediate steps up to 32 bytes
+    // past the end, and `<*const u8>::add` makes that UB where `wrapping_add` defines it. The
+    // dereference stays guarded by `p < end`, so no read leaves the allocation -- which is the
+    // property the index rewrite was protecting, and it is kept here, not traded away.
+    let start = bytecode.as_ptr();
+    let end = start.wrapping_add(len);
+    let mut p = start;
     let mut opcode = 0;
 
-    while i < len {
-        // SAFETY: `i < len` is the loop condition.
-        opcode = unsafe { *bytecode.get_unchecked(i) };
+    while p < end {
+        // SAFETY: `start <= p < end`, so `p` is inside the bytecode.
+        opcode = unsafe { *p };
         if opcode == opcode::JUMPDEST {
+            let i = p.addr() - start.addr();
             // SAFETY: `i < len` and the table has exactly `len` bits.
             unsafe { jumps.set_unchecked(i, true) }
-            i += 1;
+            p = p.wrapping_add(1);
         } else {
             let push_offset = opcode.wrapping_sub(opcode::PUSH1);
             if push_offset < 32 {
-                i += push_offset as usize + 2;
+                p = p.wrapping_add(push_offset as usize + 2);
             } else {
-                i += 1;
+                p = p.wrapping_add(1);
             }
         }
     }
+    let i = p.addr() - start.addr();
 
     // Padding is always at least `GUARD_BYTES`, so there is no "input is already fine" arm.
     // What can still be saved is the copy, not the allocation.
