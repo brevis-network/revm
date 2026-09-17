@@ -347,13 +347,32 @@ impl MemoryGas {
     /// reuse. Letting execution continue past one makes the stale limit consensus-visible.
     ///
     /// The bound is a comparison against `MAX_WORDS`, not `new_num >> 32`. That shift is by the
-    /// full width of a 32-bit `usize`, and it is **not** caught at compile time -- measured:
-    /// `cargo check --target riscv32imac-unknown-none-elf -p revm-interpreter` accepts it with
-    /// no error and no warning. It is wrong at *runtime* instead, which is worse: release masks
-    /// the shift to `>> 0`, so the guard reads `new_num != 0` and **every** memory expansion
-    /// returns `Some(u64::MAX)` and puts the frame out of gas; debug panics with "attempt to
-    /// shift right with overflow". `MAX_WORDS` is also the tighter bound on that target, where
-    /// it is `2^27 - 1` rather than `2^32 - 1`; see its definition.
+    /// full width of a 32-bit `usize`, and rustc refuses it: `arithmetic_overflow` is
+    /// deny-by-default, so a 32-bit build of the base branch's form does not compile at all.
+    ///
+    /// How that is checked matters, because an earlier note here concluded the opposite from
+    /// `cargo check` -- which stops at metadata and never runs the MIR pass that emits the
+    /// lint. Measured on `pico-v98-31-0-2`, which still carries the shift:
+    ///
+    /// ```text
+    /// $ cargo check --target riscv32imac-unknown-none-elf -p revm-interpreter --no-default-features
+    ///     Finished `dev` profile ...                                    # exit 0, silent
+    ///
+    /// $ cargo build --target riscv32imac-unknown-none-elf -p revm-interpreter --no-default-features
+    /// error: this arithmetic operation will overflow
+    ///    --> crates/interpreter/src/gas.rs:307:12
+    ///     |  if new_num >> 32 != 0 {
+    ///     |     ^^^^^^^^^^^^^ attempt to shift right by `32_i32`, which would overflow
+    ///     = note: `#[deny(arithmetic_overflow)]` on by default                # exit 101
+    /// ```
+    ///
+    /// So the failure is at build time. The runtime story that note gave instead -- release
+    /// masking the shift to `>> 0` so every expansion goes out of gas -- is **unreachable**,
+    /// because nothing links. `cargo check` is not a substitute for `cargo build` when the
+    /// claim is about a lint.
+    ///
+    /// `MAX_WORDS` is also the tighter bound on that target, where it is `2^27 - 1` rather
+    /// than `2^32 - 1`; see its definition.
     #[inline]
     pub fn record_new_len(&mut self, new_num: usize) -> Option<u64> {
         let words_num = self.words_num();
