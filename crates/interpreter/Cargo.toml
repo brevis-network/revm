@@ -30,6 +30,14 @@ serde = { workspace = true, features = ["derive", "rc"], optional = true }
 [dev-dependencies]
 serde_json = { workspace = true, features = ["alloc"] }
 
+# `required-features` rather than `#![cfg(feature = "serde")]` in the file: naming this target
+# without the feature is then an error, instead of compiling zero of its ten tests and
+# reporting success. A self dev-dependency fixes that too, but by turning `serde` on for every
+# test build of this crate -- unification then denies the whole tree a serde-free build.
+[[test]]
+name = "shared_memory_serde"
+required-features = ["serde"]
+
 [features]
 default = ["std"]
 std = [

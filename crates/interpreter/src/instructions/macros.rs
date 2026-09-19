@@ -154,7 +154,8 @@ macro_rules! resize_memory {
 ///
 /// Charges exactly the same gas - the memory-expansion cost is consensus and is computed
 /// from the new word count, which is unchanged - and only skips zeroing bytes the
-/// instruction is about to write anyway. See [`MemoryTr::resize_written`].
+/// instruction is about to write anyway. See
+/// [`MemoryTr::resize_written`](crate::interpreter_types::MemoryTr::resize_written).
 #[macro_export]
 #[collapse_debuginfo(yes)]
 macro_rules! resize_memory_written {
@@ -257,6 +258,11 @@ macro_rules! sync_gas_at {
 /// by hand for that reason. A non-exceptional halt added after a `gas!` would make the refund
 /// consensus-visible, so this is the opposite of a free safety net.
 ///
+/// This macro is the only place that publishes-and-halts, so this paragraph is the whole
+/// contract for it. `as_usize_or_fail_ret_at!` expands to it rather than repeating it, and so
+/// does every other threaded halt: `popn_at!`, `popn_top_at!`, `push_at!`,
+/// `require_non_staticcall_at!` and `check_at!`.
+///
 /// That number is regime-dependent, which is worth knowing before trusting it again: while
 /// `JUMP`/`JUMPI` were threaded too (see the note on `rem` in `Interpreter::run_plain`) the
 /// publish was worth *-1.3 M*, because these cold blocks are tail-merged across the ~150 arms
@@ -273,7 +279,8 @@ macro_rules! poison_at {
 
 /// The threaded form of [`popn`].
 ///
-/// `$sp` is the loop-local stack cursor (see [`StackTr::sp`](crate::interpreter_types::StackTr::sp))
+/// `$sp` is the loop-local stack cursor (see
+/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp))
 /// and is updated in place; the enclosing function returns it, so the underflow exit returns
 /// the cursor **unchanged** -- the operands are still on the stack, which is what the
 /// non-threaded form leaves behind too.
@@ -314,6 +321,19 @@ macro_rules! popn_at {
 }
 
 /// The threaded form of [`popn_top`]. See [`popn_at`].
+///
+/// # Bound
+///
+/// Lower only, and deliberately: a pop needs depth, not room. `too_shallow_for` no longer
+/// *widens* that -- it saturates to `isize::MAX` above `STACK_LIMIT`, so the wrap that once
+/// made `usize::MAX` an accepted argument is closed -- but an `sp` above `BYTE_LIMIT` is
+/// still not independently rejected here, as it is for the push path by `no_room_to_push`.
+///
+/// That residue is the safe cross-crate `*_at` surface, not opcode dispatch: B12 closed the
+/// opcode side by execution -- 29 entry points x every legal `sp` x 11 specs x static and
+/// non-static x 5 gas limits, **3,269,750 calls, 0 violations**. Left open knowingly rather
+/// than overlooked; closing it means an upper bound on every pop, which is the cost the
+/// threaded cursor exists to avoid.
 #[macro_export]
 #[collapse_debuginfo(yes)]
 macro_rules! popn_top_at {
@@ -329,12 +349,14 @@ macro_rules! popn_top_at {
     };
 }
 
-/// The threaded form of [`push`]. See [`popn_at`].
+/// The threaded form of [`push`](crate::push). See [`popn_at`].
 #[macro_export]
 #[collapse_debuginfo(yes)]
 macro_rules! push_at {
     ($interpreter:expr, $sp:ident, $rem:ident, $x:expr) => {
-        if $sp == $crate::interpreter::BYTE_LIMIT - $crate::interpreter::WORD {
+        // Reachable from outside the crate with an arbitrary `usize`, so the bound has to
+        // hold for one. See `no_room_to_push`.
+        if $crate::interpreter::no_room_to_push($sp) {
             return (
                 $sp,
                 $crate::poison_at!($interpreter, $rem, $interpreter.halt_overflow()),
@@ -489,6 +511,11 @@ macro_rules! as_usize_or_fail {
 /// can only be used where the field is already the truth. A body that keeps the counter in
 /// its register until it knows it has gas to charge -- `MLOAD`/`MSTORE`, whose hot path
 /// charges nothing -- publishes here instead, on the cold edge only. See `sync_gas_at!`.
+///
+/// Carries `poison_at!`'s precondition for the same reason: the publish writes the register
+/// back over the field, refunding any charge made through the field since `sync_gas_at!`.
+/// Both callers convert before they charge. The `u64::MAX` is discarded here -- `$ret` is
+/// the caller's exit -- so only the publish-and-halt is shared.
 #[macro_export]
 #[collapse_debuginfo(yes)]
 macro_rules! as_usize_or_fail_ret_at {
@@ -496,8 +523,11 @@ macro_rules! as_usize_or_fail_ret_at {
         match $v.as_limbs() {
             x => {
                 if (x[0] > usize::MAX as u64) | (x[1] != 0) | (x[2] != 0) | (x[3] != 0) {
-                    $crate::sync_gas_at!($interpreter, $rem);
-                    $interpreter.halt($crate::InstructionResult::InvalidOperandOOG);
+                    $crate::poison_at!(
+                        $interpreter,
+                        $rem,
+                        $interpreter.halt($crate::InstructionResult::InvalidOperandOOG)
+                    );
                     return $ret;
                 }
                 x[0] as usize

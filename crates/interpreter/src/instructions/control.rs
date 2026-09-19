@@ -118,7 +118,7 @@ fn jump_inner<const FUSE_JUMPDEST: bool, const PRECHARGED: bool, WIRE: Interpret
     jump_to::<FUSE_JUMPDEST, PRECHARGED, _>(interpreter, target, ip, jctx)
 }
 
-/// [`jump_inner`] once the destination is already a `usize`.
+/// `jump_inner` once the destination is already a `usize`.
 ///
 /// Split out for the fused `PUSH2; JUMP`/`PUSH2; JUMPI` arms, whose destination comes
 /// straight from the two immediate bytes and so is known to fit in a `usize` -- the four
@@ -139,9 +139,10 @@ pub fn jump_to<const FUSE_JUMPDEST: bool, const PRECHARGED: bool, WIRE: Interpre
     // spending `gas::JUMPDEST`. So charge that gas here and land one byte past it: the
     // dispatch loop never spends a fetch/table-lookup/indirect-call round on it.
     //
-    // Safety of `target + 1`: `analyze_legacy` pads the bytecode so that the last opcode
-    // is a STOP, which for a trailing JUMPDEST means at least one padding byte, so
-    // `target + 1` is still inside the padded bytes.
+    // Safety of `target + 1`: `LegacyAnalyzedBytecode::new` pins
+    // `jump_table.len() == original_len < bytecode.len()`, so an accepted target satisfies
+    // `target + 1 < bytecode.len()`. Structural, so it survives a table that disagrees with
+    // the bytes it describes -- which matters, the table arriving through a deserializer.
     //
     // Gas equivalence: the only way the fused charge differs from charging it one dispatch
     // later is when it is the charge that runs out of gas, and out-of-gas is an exceptional
@@ -158,11 +159,10 @@ pub fn jump_to<const FUSE_JUMPDEST: bool, const PRECHARGED: bool, WIRE: Interpre
             interpreter.halt_oog();
             return ip;
         }
-        // SAFETY: `is_valid_jump` ensures that `dest` is in bounds, and the analysis pads
-        // the bytecode so that one byte past a trailing JUMPDEST still exists.
+        // SAFETY: `target + 1` is in bounds; see the note above.
         interpreter.bytecode.absolute_ip_with(jctx, target + 1)
     } else {
-        // SAFETY: `is_valid_jump` ensures that `dest` is in bounds.
+        // SAFETY: `target < original_len`; see the note above.
         interpreter.bytecode.absolute_ip_with(jctx, target)
     }
 }

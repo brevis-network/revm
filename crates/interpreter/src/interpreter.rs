@@ -23,7 +23,7 @@ pub use shared_memory::{
     grow_memory_word, grow_memory_word_written, num_words, resize_memory, resize_memory_written,
     SharedMemory,
 };
-pub use stack::{too_shallow_for, Stack, BYTE_LIMIT, STACK_LIMIT, WORD};
+pub use stack::{no_room_to_push, too_shallow_for, Stack, BYTE_LIMIT, STACK_LIMIT, WORD};
 
 // imports
 use crate::{
@@ -35,13 +35,10 @@ use primitives::{hardfork::SpecId, Bytes};
 
 /// Main interpreter structure that contains all components defined in [`InterpreterTypes`].
 ///
-/// `repr(C)` with [`Interpreter::stack`] **last**, on purpose. The EVM stack keeps its
-/// 1024 words inline (see `Stack`), which is 32 KiB; laid out anywhere but at the end it
-/// would push the other fields past the 12-bit displacement a RISC-V load or store can
-/// encode, and every access to the gas counter or the instruction pointer would grow an
-/// address computation. Last, the fields the dispatch loop touches stay within a few
-/// hundred bytes of the base and the stack words are reached as `base + byte_len` with the
-/// field offset folded into the displacement.
+/// `repr(C)` with [`Interpreter::stack`] **last among the fields the dispatch loop touches**,
+/// on purpose: the stack's 1024 inline words are 32 KiB, and anywhere but the end they push
+/// the other fields past the 12-bit displacement a RISC-V load or store can encode. Only the
+/// cold `gas_stash: u64` follows it, which the `const _` size assertion pins.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(C)]
@@ -62,7 +59,8 @@ pub struct Interpreter<WIRE: InterpreterTypes = EthInterpreter> {
     pub extend: WIRE::Extend,
     /// EVM stack for computation.
     ///
-    /// Last field; see the note on the struct.
+    /// Last of the hot fields -- only the cold `gas_stash` follows it. See the note on the
+    /// struct.
     pub stack: WIRE::Stack,
     /// Backup of `gas.remaining` while the gas counter is poisoned by
     /// [`Interpreter::set_action`], or `u64::MAX` when it is not poisoned.
@@ -421,7 +419,8 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
     /// # Instruction table
     ///
     /// `instruction_table` is **ignored**: the arms are generated from
-    /// [`for_each_builtin_instruction`], i.e. from the same list that builds
+    /// [`for_each_builtin_instruction`](crate::for_each_builtin_instruction), i.e. from the
+    /// same list that builds
     /// [`instruction_table`](crate::instructions::instruction_table), so a default table
     /// behaves identically. A table customised through
     /// `EthInstructions::insert_instruction` is *not* honoured here; such a caller has to
@@ -669,6 +668,13 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
             // The two tests can only stay split because `byte_limit` is opaque: LLVM folds
             // `sp < a || sp >= b` back into one range compare whenever it knows both
             // constants, which is exactly what `dup_at` gets.
+            //
+            // The `sp != byte_limit` equality is sound *here* and nowhere else: `sp` is the
+            // loop-local cursor, never above `byte_limit`. In the `*_at` entry points it is a
+            // false upper bound and so is a signed `>=`; those use `no_room_to_push`, avoided
+            // here because it would materialise the constant this arm keeps pinned. Both
+            // exits report `StackOverflow` even for a *depth* failure, which is pre-existing
+            // and not consensus-visible.
             ((6, $n:literal), $_f:expr) => {{
                 ip = unsafe { ip.add(1) };
                 if sp != byte_limit && (sp as isize) > too_shallow_for($n) {
@@ -1128,6 +1134,45 @@ fn test_mstore_big_offset_memory_oog() {
     assert_eq!(
         action.instruction_result(),
         Some(InstructionResult::MemoryOOG)
+    );
+}
+
+/// The `MLOAD` half of [`test_mstore_big_offset_memory_limit_oog`]; only `MSTORE` had a test
+/// when both lost the `memory_limit` guard.
+#[test]
+#[cfg(feature = "memory_limit")]
+fn test_mload_big_offset_memory_limit_oog() {
+    use super::*;
+    use crate::{host::DummyHost, instructions::instruction_table};
+    use bytecode::Bytecode;
+    use primitives::Bytes;
+
+    let code = Bytes::from(
+        &[
+            0x61, 0x27, 0x10, // PUSH2 0x2710  (10,000)
+            0x51, // MLOAD
+            0x00, // STOP
+        ][..],
+    );
+    let bytecode = Bytecode::new_raw(code);
+
+    let mut interpreter = Interpreter::<EthInterpreter>::new(
+        SharedMemory::new_with_memory_limit(1000),
+        ExtBytecode::new(bytecode),
+        InputsImpl::default(),
+        false,
+        SpecId::default(),
+        100000,
+    );
+
+    let table = instruction_table::<EthInterpreter, DummyHost>();
+    let mut host = DummyHost;
+    let action = interpreter.run_plain(&table, &mut host);
+
+    assert!(action.is_return());
+    assert_eq!(
+        action.instruction_result(),
+        Some(InstructionResult::MemoryLimitOOG)
     );
 }
 

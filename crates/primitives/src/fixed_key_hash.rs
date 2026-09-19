@@ -59,7 +59,7 @@ impl FixedKeyHasher {
     /// Inline it is forty-odd instructions -- twenty byte loads and the shift/or tree that
     /// reassembles them -- needing a dozen live registers, and every function that hashes
     /// anything inherits that: the caller's prologue saves the callee-saved registers the
-    /// arm would need whether it runs or not. `JournalInner::sload_slot` saved all twelve
+    /// arm would need whether it runs or not. `JournalInner::sload_slot_warm` saved all twelve
     /// and never once took this arm on mainnet block 24006677. Behind a call it costs the
     /// caller one register, and the sites that do take it pay a `jal` for it.
     ///

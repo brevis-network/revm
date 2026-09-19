@@ -41,6 +41,34 @@ pub use alloy_primitives::{
     Bytes, FixedBytes, Log, LogData, TxKind, B256, I128, I256, U128, U256,
 };
 
+/// Declares the exhaustive-initialisation check that a `MaybeUninit` writer trades away: a
+/// constructor writing its fields through `addr_of_mut!` is not checked for completeness, so
+/// adding one compiles clean and leaves it uninitialised.
+///
+/// Generic parameters go in square brackets, ahead of the value type:
+///
+/// ```
+/// # use revm_primitives::assert_all_fields_written;
+/// struct Pair { a: u8, b: u8 }
+/// struct Wrap<'a, T> { inner: &'a mut T }
+/// assert_all_fields_written!(assert_pair_written(Pair) = Pair { a, b });
+/// assert_all_fields_written!(assert_wrap_written['a, T](Wrap<'a, T>) = Wrap { inner });
+/// ```
+#[macro_export]
+macro_rules! assert_all_fields_written {
+    (
+        $(#[$attr:meta])*
+        $name:ident $([$($generics:tt)*])? ($ty:ty) = $path:path { $($field:ident),+ $(,)? }
+    ) => {
+        $(#[$attr])*
+        #[allow(dead_code)] // never called; it exists to be type-checked
+        fn $name $(<$($generics)*>)? (v: $ty) {
+            let $path { $($field),+ } = v;
+            $( let _ = $field; )+
+        }
+    };
+}
+
 /// Copies the 20 bytes of an [`Address`] from `src` to `dst`.
 ///
 /// `Address` is `[u8; 20]` with alignment 1, so LLVM has to assume the worst and lowers even a
@@ -106,6 +134,14 @@ pub unsafe fn copy_address_bytes(dst: *mut u8, src: *const u8) {
 #[repr(C, align(8))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct AlignedAddress(pub Address);
+
+// INV-L. Four accessors across two crates read this as three words at offsets 0, 8 and 16,
+// three of them from the struct base rather than through `addr_of!((*p).0)` -- sound only
+// while the payload starts at offset 0 of a 24-byte, 8-aligned struct. An added field or a
+// `repr` change would move it silently.
+const _: () = assert!(core::mem::align_of::<AlignedAddress>() == 8);
+const _: () = assert!(core::mem::size_of::<AlignedAddress>() == 24);
+const _: () = assert!(core::mem::offset_of!(AlignedAddress, 0) == 0);
 
 impl AlignedAddress {
     /// Copies `src` into an 8-aligned slot.
@@ -233,7 +269,7 @@ const _: () = assert!(core::mem::size_of::<Option<Address>>() == 21);
 /// `Option<Address>` has no niche, so it is a tag byte plus a 20-byte payload, and building
 /// one with `Some(addr)` copies the payload with a `memcpy` libcall for the reason in
 /// [`copy_address_bytes`]. Where the payload sits inside the `Option` is not something this
-/// code may assume, so it asks: [`SOME_ADDRESS_PROBE`] is a `Some`, and the distance from
+/// code may assume, so it asks: `SOME_ADDRESS_PROBE` is a `Some`, and the distance from
 /// its base to the `Address` its `as_ref` yields is the offset.
 ///
 /// The previous spelling asked the same question of the *destination* - store
@@ -302,11 +338,12 @@ pub unsafe fn write_some_b256(dst: *mut Option<B256>, src: *const u8) {
 /// An `Option<Address>` whose payload the compiler knows is 8-aligned.
 ///
 /// [`MaybeB256`]'s story for the 20-byte type. `Option<Address>` is a tag byte plus a
-/// 20-byte align-1 payload, so the payload sits at an odd offset of a 21-byte align-1
-/// object and is never 8-aligned however the enclosing struct is laid out: writing one
-/// takes [`copy_address_bytes`]'s byte path, 20 `lbu`/`sb` pairs, every single time.
-/// `InputsImpl`'s `bytecode_address` did that 20,024 times on mainnet block 24006677, once
-/// per call frame.
+/// 20-byte align-1 payload at offset 1 of a 21-byte align-1 object, so -- as for
+/// [`MaybeB256`], and with the same caveat -- the payload is 8-aligned only when the
+/// `Option`'s own address happens to be 7 mod 8, and writing one takes
+/// [`copy_address_bytes`]'s byte path, 20 `lbu`/`sb` pairs, essentially every time.
+/// `InputsImpl`'s `bytecode_address` did that 20,024 times out of 20,024 on mainnet block
+/// 24006677, once per call frame.
 ///
 /// `#[repr(C)]` plus explicit padding puts the payload at offset 8 of an align-8 struct by
 /// construction, so `copy_address_bytes` sees a destination it can prove and takes its three
@@ -420,12 +457,10 @@ impl MaybeAddress {
 
 /// An `Option<B256>` whose payload the compiler knows is 8-aligned.
 ///
-/// `Option<B256>` is a tag byte plus a 32-byte align-1 payload, so the payload sits at an odd
-/// offset of a 33-byte align-1 object: whatever the enclosing struct's alignment,
-/// `&option.payload` is *never* 8-aligned, and every write of one takes
-/// [`write_some_b256`]'s `memcpy` fallback rather than its four `sd`. Measured on mainnet
-/// block 24006677: `ExtBytecode`'s bytecode hash took the fallback 20,024 times out of
-/// 20,024, once per call frame.
+/// `Option<B256>` puts its 32-byte align-1 payload at offset 1, so `&option.payload` is
+/// 8-aligned only when the `Option`'s own address is 7 mod 8 -- not predictably, so writes
+/// take [`write_some_b256`]'s `memcpy` fallback rather than its four `sd`: 20,024 times out
+/// of 20,024 for `ExtBytecode`'s bytecode hash on mainnet block 24006677.
 ///
 /// `#[repr(C)]` plus the explicit padding puts the payload at offset 8 of an align-8 struct
 /// by construction, so no probing and no runtime check are needed -- and the "absent" case
@@ -617,21 +652,24 @@ pub fn address_eq(a: &Address, b: &Address) -> bool {
 /// `map.get(FastAddress::new(&addr))` and nothing else changes.
 ///
 /// `Hash` forwards to `Address`'s, so a `FastAddress` query hashes to exactly the bucket an
-/// `Address` key was stored in; `hash_agrees_with_address` pins that.
+/// `Address` key was stored in; `fast_address_finds_what_address_stored` pins that.
 ///
 /// `TAG` carries no information and is never read. It is there so that each call site can ask
 /// for its own monomorphisation of the lookup: hashbrown's `RawTable::find` is generic over
 /// the query type, and with one query type shared between two call sites LLVM decides the
 /// probe is worth outlining - at which point the call costs more than the `memcmp` it saved.
 /// Measured, on mainnet block 24006677: making `JournalInner::transfer_loaded` share
-/// `sload_slot`'s query type outlined `HashMap::get_inner_mut` and cost +1,351,731 retired
+/// `sload_slot_warm`'s query type outlined `HashMap::get_inner_mut` and cost +1,351,731 retired
 /// instructions, against the ~1.3 M of `memcmp` it removed. Distinct tags keep both copies
 /// inline. Pick a tag per call site and say which in a comment there.
 #[derive(Debug, Eq)]
 #[repr(transparent)]
 pub struct FastAddressAt<const TAG: usize>(Address);
 
-/// [`FastAddressAt`] with the tag `JournalInner::sload_slot` uses.
+/// [`FastAddressAt`] with the tag `resolve_account` uses -- the sole user of tag 0 on the
+/// address side, reached from `JournalInner::sload_slot_warm` on a cache miss.
+///
+/// Note that `sload_slot_cold`, the similarly named function, uses tag **4**.
 pub type FastAddress = FastAddressAt<0>;
 
 impl<const TAG: usize> FastAddressAt<TAG> {
@@ -670,7 +708,7 @@ impl<const TAG: usize> core::borrow::Borrow<FastAddressAt<TAG>> for Address {
 /// The [`FastAddress`] story for the storage maps. A storage lookup ends in comparing the
 /// query with the key in the bucket it landed on, and that comparison is `U256: PartialEq`,
 /// so `[u64; 4]` equality, so - for the reason in [`u256_eq`] - a 32-byte `memcmp` libcall.
-/// `JournalInner::sload_slot` alone makes one per SLOAD and per SSTORE.
+/// `JournalInner::sload_slot_warm` alone makes one per SLOAD and per SSTORE.
 ///
 /// Same mechanism as [`FastAddress`]: a `#[repr(transparent)]` wrapper with its own
 /// `PartialEq`, reached through `Borrow`, so `map.get_mut(&key)` becomes
@@ -755,6 +793,29 @@ pub const ONE_GWEI: u128 = 1_000_000_000;
 mod fast_key_tests {
     use super::*;
     use std::vec;
+
+    /// Digest of `value` under a fixed-seed FNV-1a.
+    ///
+    /// `RandomState` is not reachable under `no_std`, and a fixed seed makes a failure
+    /// reproducible. Only two digests are ever compared, so all that matters is that it is
+    /// field-order sensitive.
+    fn hash_of<T: core::hash::Hash>(value: &T) -> u64 {
+        struct Fnv1a(u64);
+        impl core::hash::Hasher for Fnv1a {
+            fn finish(&self) -> u64 {
+                self.0
+            }
+            fn write(&mut self, bytes: &[u8]) {
+                for &b in bytes {
+                    self.0 ^= u64::from(b);
+                    self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+        }
+        let mut hasher = Fnv1a(0xcbf2_9ce4_8422_2325);
+        core::hash::Hash::hash(value, &mut hasher);
+        core::hash::Hasher::finish(&hasher)
+    }
 
     /// Every pair of start offsets in an 8-byte window - so both the wide arm and the
     /// fallback are exercised - against every position of a single differing byte.
@@ -881,9 +942,17 @@ mod fast_key_tests {
             let k = key(i);
             assert_eq!(map.get(FastU256::new(&k)).copied(), Some(i), "i={i}");
         }
+        // The miss half, asserted rather than assumed: the sibling address sweep's `key`
+        // aliased mod 256 and 0 of its 64 cases reached the miss path. Expected as `None`,
+        // not compared against the plain lookup, which agrees with a broken fast path
+        // whenever both find nothing.
         for i in 256..320u32 {
             let k = key(i);
-            assert_eq!(map.get(FastU256::new(&k)).copied(), map.get(&k).copied());
+            assert!(
+                !map.contains_key(&k),
+                "the miss sweep must query absent keys, i={i}"
+            );
+            assert_eq!(map.get(FastU256::new(&k)).copied(), None, "i={i}");
         }
     }
 
@@ -1032,6 +1101,26 @@ mod fast_key_tests {
             address: base,
         };
         assert_eq!(a, dirty);
+
+        // And `Hash` has to agree: with `PartialEq` hand-written, a derived `Hash` folds
+        // the padding and an absent value's stale payload. These are the two pairs `eq`
+        // calls equal that a field-wise hash would separate.
+        assert_eq!(
+            hash_of(&a),
+            hash_of(&dirty),
+            "dirty padding must not reach the hash"
+        );
+        let stale = MaybeAddress {
+            present: false,
+            _pad: [0; 7],
+            address: base,
+        };
+        assert_eq!(MaybeAddress::NONE, stale);
+        assert_eq!(
+            hash_of(&MaybeAddress::NONE),
+            hash_of(&stale),
+            "an absent value's payload must not reach the hash"
+        );
     }
 
     /// A `FastAddress` query has to hash into the bucket an `Address` key was stored in, and

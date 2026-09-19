@@ -1,4 +1,5 @@
 use super::MemoryTr;
+use crate::InstructionResult;
 use core::{
     cell::{Ref, RefCell, RefMut},
     cmp::min,
@@ -476,10 +477,13 @@ pub struct SharedMemory {
     ///
     /// # Invariant (INV-B)
     ///
-    /// `base == buffer.as_ptr().add(my_checkpoint)` whenever `buffer` is `Some`, and
-    /// `base` is null when it is `None`. Unlike a length, there is no safe fallback value:
-    /// every read of `base` turns straight into a load or a store, so it has to be exactly
-    /// right, and the three things that can break it each have to restore it:
+    /// `base == buffer.borrow().as_ptr().add(my_checkpoint)` whenever `buffer` is `Some`, and
+    /// `base` is null when it is `None`.
+    ///
+    /// Note which `as_ptr`: `Vec::as_ptr`. Spelled `buffer.as_ptr()` it resolves to
+    /// `RefCell::as_ptr` and gives the header address, not the data. Every read of `base`
+    /// becomes a load or a store, so each of the six things that can break it must restore
+    /// it.
     ///
     /// 1. **`my_checkpoint` changes.** Only ever at construction, so every constructor and
     ///    [`new_child_context`](Self::new_child_context) sets `base` from the buffer.
@@ -491,24 +495,17 @@ pub struct SharedMemory {
     ///    through [`free_child_context`](Self::free_child_context), which recomputes
     ///    `base`. Nesting cascades: each frame refreshes its own on the way out.
     /// 4. **The value arrives from the wire.** A pointer cannot be serialised, so `base` is
-    ///    skipped and has to be rebuilt from `buffer` and `my_checkpoint`;
-    ///    [`SharedMemoryDe`] is what `Deserialize` goes through to do that. Deriving
-    ///    `Deserialize` straight onto this struct left `base` null beside a real buffer,
-    ///    i.e. INV-B broken from the moment the value existed.
-    /// 5. **Someone else holding the same `Rc` reallocates the `Vec`.** This one has no
-    ///    restore site, because there is no hook: `LocalContextTr::shared_memory_buffer`
-    ///    is a public trait method handing out `&Rc<RefCell<Vec<u8>>>`, and anything that
-    ///    clones it can `borrow_mut().reserve(..)` behind this struct's back.
-    ///
-    ///    It does not happen in tree, and that was checked rather than assumed: the only
-    ///    two uses of that buffer are `LocalContext::clear`, which is `set_len(0)` and
-    ///    cannot reallocate, and `Handler::first_frame_input`, which clones the `Rc` into
-    ///    [`new_with_buffer`](Self::new_with_buffer) and so computes `base` at that moment.
-    ///    rsp does not touch it at all. A consumer that grows the buffer through that
-    ///    trait method while a `SharedMemory` is live would break INV-B, and the only thing
-    ///    standing there is `check_base` -- which is a panic in a native build and nothing
-    ///    at all in the guest. Closing it properly means not exposing the `Rc`, which is an
-    ///    upstream API change.
+    ///    rebuilt from `buffer` and `my_checkpoint` through [`SharedMemoryDe`]. Deriving
+    ///    `Deserialize` onto this struct left `base` null beside a real buffer.
+    /// 5. **Someone else holding the same `Rc` reallocates the `Vec`.** No restore site and
+    ///    no hook -- `LocalContextTr::shared_memory_buffer` hands out the `Rc`, and
+    ///    `LocalContext.shared_memory_buffer` is `pub`. Checked, not assumed: in tree the
+    ///    only uses are `LocalContext::clear` (`set_len(0)`) and `Handler::first_frame_input`,
+    ///    which computes `base` as it clones. Closing it means not exposing the `Rc`.
+    /// 6. **`Clone`.** A second handle carrying a byte copy of `base`, so growing either
+    ///    through [`resize`](Self::resize) strands the other's pointer, with no restore site
+    ///    and no way for `PartialEq` to tell them apart. In tree the clones are never used
+    ///    beside their source; nothing says so.
     ///
     /// Checked on every access in non-guest builds, which is where the test suite runs;
     /// see the `assert_eq!` in [`get_u256`](Self::get_u256) and friends.
@@ -722,6 +719,10 @@ impl MemoryTr for SharedMemory {
         })
     }
 
+    /// The shared buffer's data pointer, with no borrow taken.
+    ///
+    /// All a checked `Ref` would add is a host-*debug* panic on a conflicting borrow. The
+    /// one caller is `calldataload_at`, which dereferences only where `offset < input_len`.
     #[inline]
     fn global_ptr(&self) -> *const u8 {
         // SAFETY: the guest is single threaded and no other borrow of the shared buffer is
@@ -926,8 +927,20 @@ impl SharedMemory {
     }
 
     /// Returns the length of the current memory range.
+    ///
+    /// # The subtraction is unchecked
+    ///
+    /// `full_len() >= my_checkpoint` holds for the *active* frame chain only:
+    /// [`free_child_context`](Self::free_child_context) shrinks the buffer below any deeper
+    /// frame's checkpoint, so a retained `SharedMemory` for one answers `len()` with a wrapped
+    /// value while `assert_inv_b` still passes, INV-B being about the pointer. Nothing in tree
+    /// retains one -- frames are freed innermost-first.
     #[inline]
     pub fn len(&self) -> usize {
+        debug_assert!(
+            self.full_len() >= self.my_checkpoint,
+            "len() on a SharedMemory whose frame has been freed"
+        );
         self.full_len() - self.my_checkpoint
     }
 
@@ -1206,7 +1219,14 @@ impl SharedMemory {
     ///
     /// # Safety
     ///
-    /// `src` must point at four readable `u64`s and `offset + 32` must be in bounds.
+    /// As [`MemoryTr::set_u256_ptr`], whose contract this inherits -- including the overlap
+    /// clause, which the misaligned arm below is the reason for.
+    ///
+    /// **Nothing enforces the bound in a shipping build**: this function's checks are a
+    /// `debug_assert!` and a `check_base` gated out of the guest. What holds it is the
+    /// caller's gas accounting -- `MLOAD`/`MSTORE` test `offset >= word_limit()` and grow
+    /// through `grow_memory_word*`, and the quadratic curve saturates long before an offset
+    /// nears the buffer's end. A gas argument, not a memory one, but it is the whole of it.
     #[inline(always)]
     pub unsafe fn set_u256_ptr(&mut self, offset: usize, src: *const u64) {
         // SAFETY: see `get_u256` - single-threaded guest, no live borrow, bounds already
@@ -1237,7 +1257,7 @@ impl SharedMemory {
     ///
     /// # Safety
     ///
-    /// `dst` must point at four writable `u64`s and `offset + 32` must be in bounds.
+    /// As [`MemoryTr::get_u256_to`], whose contract this inherits.
     #[inline(always)]
     pub unsafe fn get_u256_to(&self, offset: usize, dst: *mut u64) {
         // SAFETY: as in `get_u256`.
@@ -1552,6 +1572,20 @@ pub fn resize_memory_written<Memory: MemoryTr>(
     }
 }
 
+/// The `memory_limit` cap: an invariant of growing the buffer, not of `MLOAD` and `MSTORE`,
+/// so it lives here rather than at each call site.
+#[cfg(feature = "memory_limit")]
+#[inline(always)]
+fn check_memory_limit<Memory: MemoryTr>(
+    memory: &Memory,
+    offset: usize,
+) -> Result<(), InstructionResult> {
+    if memory.limit_reached(offset, 32) {
+        return Err(InstructionResult::MemoryLimitOOG);
+    }
+    Ok(())
+}
+
 /// The expansion half of a 32-byte `MSTORE` whose caller has *already* found that the word
 /// does not fit, by testing `offset >= gas.memory().word_limit()`.
 ///
@@ -1560,39 +1594,59 @@ pub fn resize_memory_written<Memory: MemoryTr>(
 /// nor re-reads it, and the "does it fit" test is a single `bgeu` against a field instead of
 /// a saturating `num_words` of `offset + 32`.
 ///
+/// # Errors
+///
+/// [`InstructionResult::MemoryLimitOOG`] if the cap refuses the new length, or
+/// [`InstructionResult::MemoryOOG`] if the frame cannot pay. A `Result` and not a `bool`
+/// because the distinction is consensus-visible.
+///
 /// # Safety
 ///
 /// The caller's test is the precondition: `num_words(offset + 32) > words_num` must already
 /// hold, because `resize_memory_cold_written` reaches `record_new_len` through
 /// `unwrap_unchecked`.
 #[inline(always)]
-#[must_use]
 pub unsafe fn grow_memory_word_written<Memory: MemoryTr>(
     gas: &mut crate::Gas,
     memory: &mut Memory,
     offset: usize,
-) -> bool {
+) -> Result<(), InstructionResult> {
+    #[cfg(feature = "memory_limit")]
+    check_memory_limit(memory, offset)?;
     let new_num_words = num_words(offset.saturating_add(32));
     debug_assert!(new_num_words > gas.memory().words_num());
-    resize_memory_cold_written(gas, memory, new_num_words, offset, 32)
+    if resize_memory_cold_written(gas, memory, new_num_words, offset, 32) {
+        Ok(())
+    } else {
+        Err(InstructionResult::MemoryOOG)
+    }
 }
 
 /// [`grow_memory_word_written`] for a caller that only reads the word (`MLOAD`), so the new
 /// tail has to be zeroed in full.
 ///
+/// # Errors
+///
+/// Same as [`grow_memory_word_written`].
+///
 /// # Safety
 ///
 /// Same precondition as [`grow_memory_word_written`].
 #[inline(always)]
-#[must_use]
 pub unsafe fn grow_memory_word<Memory: MemoryTr>(
     gas: &mut crate::Gas,
     memory: &mut Memory,
     offset: usize,
-) -> bool {
+) -> Result<(), InstructionResult> {
+    #[cfg(feature = "memory_limit")]
+    check_memory_limit(memory, offset)?;
     let new_num_words = num_words(offset.saturating_add(32));
     debug_assert!(new_num_words > gas.memory().words_num());
-    resize_memory_cold(gas, memory, new_num_words)
+    if resize_memory_cold(gas, memory, new_num_words) {
+        Ok(())
+    } else {
+        Err(InstructionResult::MemoryOOG)
+    }
 }
 
 /// [`resize_memory_cold`] for [`resize_memory_written`]; inlined for the same reason.
@@ -1655,7 +1709,11 @@ unsafe fn zero_tail(p: *mut u8, n: usize) {
     }
 }
 
-/// Grows the shared buffer past its capacity. See [`zero_tail`] for why this is outlined.
+/// Resizes the shared buffer to `new_len`, zeroing any new tail.
+///
+/// **Also the shrink path**, despite the name: a `new_len` below the current length routes
+/// here too. Still the only place the `Vec` can outgrow its capacity, which is what INV-B
+/// case 2 rests on.
 #[cold]
 #[inline(never)]
 fn grow_zeroed(buf: &mut Vec<u8>, new_len: usize) {
@@ -1834,8 +1892,13 @@ mod tests {
                 assert_eq!(cur.get_u256(i * 32), *want, "step {step}, word {i}");
             }
         }
-        // The walk has to have hit the two interesting events, or it proves nothing.
-        assert!(reallocs > 5, "only {reallocs} reallocations");
+        // The walk has to have hit both events, or it proves nothing. Only one *move* is
+        // needed -- `assert_inv_b` runs on every step -- and the exact count is the
+        // allocator's choice, not a property of the code, so do not tighten this.
+        assert!(
+            reallocs > 0,
+            "the buffer never moved; the walk proves nothing"
+        );
         assert!(nested > 20, "only {nested} child contexts");
     }
 
@@ -1967,5 +2030,167 @@ mod tests {
         assert_eq!(sm1.buffer_ref().len(), 32);
         assert_eq!(sm1.len(), 32);
         assert_eq!(sm1.buffer_ref().get(0..32), Some(&[0_u8; 32] as &[u8]));
+    }
+
+    /// The three-stage mask/swap the RV64 `asm!` blocks implement, written in Rust.
+    ///
+    /// Those blocks are gated on `riscv64` without `zbb`, so every host run takes the
+    /// `x.swap_bytes()` arm instead: corrupting the assembly gives 0 host divergences over
+    /// 59,008 cases, corrupting the fallback 18,196. This pins the algebra both arms satisfy
+    /// and the masks the sequence needs.
+    // `manual_rotate` would collapse stage 3; this exists to be the assembly stage for stage.
+    #[allow(clippy::manual_rotate)]
+    fn bswap64_model(x: u64, m1: u64, m2: u64) -> u64 {
+        let y = ((x >> 8) & m1) | ((x & m1) << 8);
+        let y = ((y >> 16) & m2) | ((y & m2) << 16);
+        (y >> 32) | (y << 32)
+    }
+
+    /// [`bswap64_model`] without its third stage; see [`bswap64_halves_masked`].
+    fn bswap64_halves_model(x: u64, m1: u64, m2: u64) -> u64 {
+        let y = ((x >> 8) & m1) | ((x & m1) << 8);
+        ((y >> 16) & m2) | ((y & m2) << 16)
+    }
+
+    #[test]
+    fn the_rv64_byte_reversal_contract() {
+        let (m1, m2) = bswap_masks();
+        // The masks the sequence needs. The `asm!` uses them as opaque registers, so a wrong
+        // value here is a wrong answer with no other symptom.
+        assert_eq!(m1, 0x00FF_00FF_00FF_00FF);
+        assert_eq!(m2, 0x0000_FFFF_0000_FFFF);
+
+        let mut cases = std::vec![
+            0u64,
+            u64::MAX,
+            1,
+            0x80,
+            0xFF,
+            0x0100,
+            0x0123_4567_89AB_CDEF,
+            0xFEDC_BA98_7654_3210,
+            0x00FF_00FF_00FF_00FF,
+            0xFF00_FF00_FF00_FF00,
+            0x0000_0000_FFFF_FFFF,
+            0xFFFF_FFFF_0000_0000,
+        ];
+        // Every single set bit, and every adjacent pair: a stage that drops or misplaces one
+        // bit position shows up on exactly one of these.
+        for i in 0..64u32 {
+            cases.push(1u64 << i);
+            cases.push(!(1u64 << i));
+            cases.push(0x0123_4567_89AB_CDEFu64.rotate_left(i));
+        }
+        // And a deterministic sweep, so the algebra is not only checked on structured inputs.
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..4096 {
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            cases.push(x.wrapping_mul(0x2545_F491_4F6C_DD1D));
+        }
+
+        for &x in &cases {
+            // 1. The model *is* a byte reversal, which is what makes it an oracle.
+            assert_eq!(bswap64_model(x, m1, m2), x.swap_bytes(), "model {x:#018x}");
+            assert_eq!(
+                bswap64_halves_model(x, m1, m2),
+                x.rotate_left(32).swap_bytes(),
+                "halves model {x:#018x}"
+            );
+            // 2. Whichever arm is compiled in agrees with it -- on a host, the fallback.
+            assert_eq!(
+                bswap64_masked(x, m1, m2),
+                bswap64_model(x, m1, m2),
+                "{x:#018x}"
+            );
+            assert_eq!(
+                bswap64_halves_masked(x, m1, m2),
+                bswap64_halves_model(x, m1, m2),
+                "{x:#018x}"
+            );
+            // 3. The relation `bswap64_halves_masked` exists for: stage 3 is free if the
+            //    caller assembles the two halves the wrong way round.
+            let (lo, hi) = (x as u32 as u64, x >> 32);
+            assert_eq!(
+                bswap64_halves_masked(hi | (lo << 32), m1, m2),
+                bswap64_masked(lo | (hi << 32), m1, m2),
+                "commutation {x:#018x}"
+            );
+            // 4. Both are involutions, which the round trip through memory depends on.
+            assert_eq!(bswap64_masked(bswap64_masked(x, m1, m2), m1, m2), x);
+        }
+    }
+
+    /// The zero ladder of [`store_be_word_aligned`]/[`load_be_word_aligned`], against the
+    /// only oracle that is independent of it: `U256`'s own big-endian conversion.
+    ///
+    /// Both the rung (which limbs are zero) and the arm (`offset % 8`) are chosen by EVM
+    /// code, and four of five arm-specific mutants survived the whole suite -- including
+    /// transposing limbs 1 and 2 in the arm every address takes. So no two limbs below are
+    /// equal and none is symmetric under byte reversal.
+    #[test]
+    fn be_word_ladder_matches_u256() {
+        // One representative per rung, plus the boundaries. Limb `i` gets a distinct
+        // non-palindromic byte pattern so any permutation of the four is visible.
+        const L: [u64; 4] = [
+            0x0102_0304_0506_0708,
+            0x1112_1314_1516_1718,
+            0x2122_2324_2526_2728,
+            0x3132_3334_3536_3738,
+        ];
+        let mut values = std::vec![
+            U256::ZERO,
+            U256::from_limbs([L[0], 0, 0, 0]),          // < 2^64
+            U256::from_limbs([L[0], L[1], 0, 0]),       // < 2^128
+            U256::from_limbs([L[0], L[1], L[2], 0]),    // < 2^192, the address rung
+            U256::from_limbs([L[0], L[1], L[2], L[3]]), // full
+            U256::from_limbs([0, L[1], 0, 0]),
+            U256::from_limbs([0, 0, L[2], 0]),
+            U256::from_limbs([0, 0, 0, L[3]]),
+            U256::from_limbs([0, L[1], L[2], 0]),
+            U256::from_limbs([L[0], 0, 0, L[3]]),
+            U256::MAX,
+        ];
+        // A 20-byte address, the shape the `l3 == 0` rung exists for.
+        values.push(U256::from_be_bytes({
+            let mut b = [0u8; 32];
+            for (i, slot) in b[12..].iter_mut().enumerate() {
+                *slot = 0xA0 + i as u8;
+            }
+            b
+        }));
+
+        // Every alignment class of the destination, not just the 8-aligned one: the
+        // misaligned arms are a second implementation of the same function.
+        for offset in 0..16usize {
+            let mut mem = SharedMemory::new();
+            mem.resize(64);
+            for v in &values {
+                let limbs = *v.as_limbs();
+                // SAFETY: `offset + 32 <= 64`, and `limbs` is a live `[u64; 4]` that does
+                // not overlap the memory buffer.
+                unsafe { mem.set_u256_ptr(offset, limbs.as_ptr()) };
+
+                let expected = v.to_be_bytes::<32>();
+                assert_eq!(
+                    &mem.slice_len(offset, 32)[..],
+                    &expected[..],
+                    "store, offset {offset}, value {v:#x}"
+                );
+
+                let mut back = [0u64; 4];
+                // SAFETY: as above.
+                unsafe { mem.get_u256_to(offset, back.as_mut_ptr()) };
+                assert_eq!(
+                    U256::from_limbs(back),
+                    *v,
+                    "load, offset {offset}, value {v:#x}"
+                );
+
+                // And the untyped reader, which is a third implementation of the load.
+                assert_eq!(mem.get_u256(offset), *v, "get_u256, offset {offset}");
+            }
+        }
     }
 }

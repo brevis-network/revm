@@ -112,7 +112,9 @@ fn g1_add_test_vectors(num_test_vectors: usize, rng: &mut StdRng) -> Vec<Precomp
     let points: Vec<G1Affine> = random_points(num_g1_points, rng);
 
     points
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|chunk| {
             let lhs = chunk[0];
             let rhs = chunk[1];
@@ -129,7 +131,9 @@ fn g2_add_test_vectors(num_test_vectors: usize, rng: &mut StdRng) -> Vec<Precomp
     let points: Vec<G2Affine> = random_points(num_g2_points, rng);
 
     points
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|chunk| {
             let lhs = chunk[0];
             let rhs = chunk[1];

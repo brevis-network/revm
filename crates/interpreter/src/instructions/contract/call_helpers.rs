@@ -15,24 +15,6 @@ use primitives::{
 };
 use state::Bytecode;
 
-/// Gets memory input and output ranges for call instructions.
-#[inline]
-pub fn get_memory_input_and_out_ranges(
-    interpreter: &mut Interpreter<impl InterpreterTypes>,
-) -> Option<(Range<usize>, Range<usize>)> {
-    popn!([in_offset, in_len, out_offset, out_len], interpreter, None);
-
-    let mut in_range = resize_memory(interpreter, in_offset, in_len)?;
-
-    if !in_range.is_empty() {
-        let offset = interpreter.memory.local_memory_offset();
-        in_range = in_range.start.saturating_add(offset)..in_range.end.saturating_add(offset);
-    }
-
-    let ret_range = resize_memory(interpreter, out_offset, out_len)?;
-    Some((in_range, ret_range))
-}
-
 /// Resize memory and return range of memory.
 /// If `len` is 0 dont touch memory and return `usize::MAX` as offset and 0 as length.
 #[inline]
@@ -49,6 +31,12 @@ pub fn resize_memory(
     } else {
         usize::MAX //unrealistic value so we are sure it is not used
     };
+    // `offset + len` is unchecked and the guest has `overflow-checks = false`, so it would
+    // wrap. Unreachable only because `resize_memory!` ran first: on `len != 0` it charged
+    // quadratic gas for `offset + len` words, which no reachable limit covers near
+    // `usize::MAX`; on `len == 0` the addend is zero, so the `usize::MAX` sentinel passes
+    // through. Moving this above the `resize_memory!` breaks it.
+    debug_assert!(offset.checked_add(len).is_some());
     Some(offset..offset + len)
 }
 

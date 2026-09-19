@@ -25,5 +25,5 @@ pub use bitvec;
 pub use bytecode::Bytecode;
 pub use decode_errors::BytecodeDecodeError;
 pub use iter::BytecodeIterator;
-pub use legacy::{JumpTable, LegacyAnalyzedBytecode, LegacyRawBytecode};
+pub use legacy::{JumpTable, LegacyAnalyzedBytecode, LegacyRawBytecode, GUARD_BYTES};
 pub use opcode::OpCode;

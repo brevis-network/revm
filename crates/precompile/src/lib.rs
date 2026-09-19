@@ -294,6 +294,10 @@ impl Precompiles {
     /// Returns complement of `other` in `self`.
     ///
     /// Two entries are considered equal if the precompile addresses are equal.
+    ///
+    /// `#[must_use]` because it takes `&self`: it removes nothing from the receiver, so
+    /// `precompiles.difference(&other);` as a statement is a no-op that looks like a mutation.
+    #[must_use]
     pub fn difference(&self, other: &Self) -> Self {
         let Self { inner, .. } = self;
 

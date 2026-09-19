@@ -15,7 +15,7 @@ pub fn lt<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, 
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn lt_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -38,7 +38,7 @@ pub fn gt<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, 
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn gt_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -62,7 +62,7 @@ pub fn clz<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn clz_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -90,7 +90,7 @@ pub fn slt<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn slt_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -116,7 +116,7 @@ pub fn sgt<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn sgt_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -142,7 +142,7 @@ pub fn eq<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H, 
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn eq_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -176,7 +176,7 @@ pub fn iszero<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_,
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn iszero_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -207,7 +207,7 @@ pub fn bitand<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_,
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn bitand_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -232,7 +232,7 @@ pub fn bitor<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, 
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn bitor_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -258,7 +258,7 @@ pub fn bitxor<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_,
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn bitxor_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -284,7 +284,7 @@ pub fn not<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn not_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -310,7 +310,7 @@ pub fn byte<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn byte_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -357,6 +357,13 @@ fn funnel_right(lo: u64, hi: u64, shift: usize) -> u64 {
 
 /// `x << shift` for `shift < 256`, computed entirely in registers.
 ///
+/// # Precondition
+///
+/// `shift < 256`, and it is **load-bearing**: this is partial and silently wrong out of
+/// domain, because every arm masks the shift down to its low bits -- `u256_shl(x, 256) == x`,
+/// and 320 aliases 64. The `shift < 256` test at both call sites is the only thing holding it
+/// up. (`U256`'s own `Shl` is total: 256 or more gives `ZERO`.)
+///
 /// `U256`'s `Shl` goes through ruint's `overflowing_shl`, which builds the result with
 /// `array::from_fn` over a *dynamic* limb offset. LLVM cannot keep that in registers: on the
 /// guest target the `SHL` arm of the dispatch loop zeroes a four-word frame buffer, spills
@@ -380,6 +387,7 @@ fn funnel_right(lo: u64, hi: u64, shift: usize) -> u64 {
 /// 24006677: `SHL` 59.6 -> 43.4 retired per dispatch, `SHR` 59.9 -> 39.1.
 #[inline(always)]
 fn u256_shl(x: &U256, shift: usize) -> U256 {
+    debug_assert!(shift < 256, "u256_shl is partial: shift must be < 256");
     let l = x.as_limbs();
     let b = (shift & 63) as u32;
     if shift & 128 != 0 {
@@ -405,9 +413,11 @@ fn u256_shl(x: &U256, shift: usize) -> U256 {
     }
 }
 
-/// `x >> shift` for `shift < 256`, computed entirely in registers. See [`u256_shl`].
+/// `x >> shift` for `shift < 256`, computed entirely in registers. Same precondition, for
+/// the same reason. See [`u256_shl`].
 #[inline(always)]
 fn u256_shr(x: &U256, shift: usize) -> U256 {
+    debug_assert!(shift < 256, "u256_shr is partial: shift must be < 256");
     let l = x.as_limbs();
     let b = (shift & 63) as u32;
     if shift & 128 != 0 {
@@ -442,7 +452,7 @@ pub fn shl<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn shl_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -479,7 +489,7 @@ pub fn shr<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn shr_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -516,7 +526,7 @@ pub fn sar<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn sar_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -564,6 +574,58 @@ mod shift_tests {
             for shift in 0..256usize {
                 assert_eq!(u256_shl(&x, shift), x << shift, "shl {x:?} by {shift}");
                 assert_eq!(u256_shr(&x, shift), x >> shift, "shr {x:?} by {shift}");
+            }
+        }
+    }
+
+    /// The guard the helpers' partiality rests on, pinned at the opcode boundary. The values
+    /// below are the ones the helpers get *wrong* -- 256 is the identity, 320 aliases 64 --
+    /// so a lost guard shows up as `x` or `x << 64` where the EVM requires zero.
+    #[test]
+    fn out_of_domain_shifts_are_zero_at_the_opcode() {
+        use crate::{host::DummyHost, InstructionContext, Interpreter};
+        use primitives::hardfork::SpecId;
+
+        let x = U256::from_limbs([0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210, 1, 0xff]);
+        // Every shape that reaches the saturating conversion: exactly 256, an alias of a
+        // legal shift, the 64-bit boundary, and a value with high limbs set.
+        let shifts = [
+            U256::from(256u64),
+            U256::from(257u64),
+            U256::from(320u64),
+            U256::from(u64::MAX),
+            U256::from_limbs([0, 1, 0, 0]),
+            U256::from_limbs([64, 0, 0, 1]),
+            U256::MAX,
+        ];
+        for s in shifts {
+            for (name, op) in [
+                (
+                    "shl",
+                    super::shl::<crate::interpreter::EthInterpreter, DummyHost>
+                        as fn(
+                            InstructionContext<'_, DummyHost, crate::interpreter::EthInterpreter>,
+                        ),
+                ),
+                (
+                    "shr",
+                    super::shr::<crate::interpreter::EthInterpreter, DummyHost>,
+                ),
+            ] {
+                let mut interpreter = Interpreter::default();
+                interpreter.runtime_flag.spec_id = SpecId::CONSTANTINOPLE;
+                assert!(interpreter.stack.push(x));
+                assert!(interpreter.stack.push(s));
+                let mut host = DummyHost;
+                op(InstructionContext {
+                    interpreter: &mut interpreter,
+                    host: &mut host,
+                });
+                assert_eq!(
+                    interpreter.stack.peek(0),
+                    Ok(U256::ZERO),
+                    "{name} by {s:#x} must be zero"
+                );
             }
         }
     }

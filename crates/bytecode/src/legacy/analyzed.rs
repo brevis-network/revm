@@ -27,6 +27,7 @@ use primitives::Bytes;
 /// expense of doing analysis and generate the jump table.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "LegacyAnalyzedBytecodeDe"))]
 pub struct LegacyAnalyzedBytecode {
     /// The potentially padded bytecode.
     bytecode: Bytes,
@@ -36,11 +37,32 @@ pub struct LegacyAnalyzedBytecode {
     jump_table: JumpTable,
 }
 
+/// What a [`LegacyAnalyzedBytecode`] deserialises through, so the constructor's checks reach
+/// wire data: a derived `Deserialize` writes the three independent fields straight in and
+/// skips them. `Bytecode`'s enum derive delegates here, so it is covered too.
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+struct LegacyAnalyzedBytecodeDe {
+    bytecode: Bytes,
+    original_len: usize,
+    jump_table: JumpTable,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<LegacyAnalyzedBytecodeDe> for LegacyAnalyzedBytecode {
+    type Error = &'static str;
+
+    fn try_from(de: LegacyAnalyzedBytecodeDe) -> Result<Self, Self::Error> {
+        Self::try_new(de.bytecode, de.original_len, de.jump_table)
+    }
+}
+
 impl Default for LegacyAnalyzedBytecode {
     #[inline]
     fn default() -> Self {
         Self {
-            bytecode: Bytes::from_static(&[0]),
+            // `STOP` plus `analysis::GUARD_BYTES`; see [`super::analysis::analyze_legacy`].
+            bytecode: Bytes::from_static(&[0; 1 + super::analysis::GUARD_BYTES]),
             original_len: 0,
             jump_table: JumpTable::default(),
         }
@@ -61,26 +83,54 @@ impl LegacyAnalyzedBytecode {
     ///
     /// Prefer instantiating using [`analyze`](Self::analyze) instead.
     ///
+    /// # What the assertions are for
+    ///
+    /// Not debug hygiene: rsp's witness format supplies the three fields independently, so
+    /// these are the only thing between a caller-chosen jump table and the interpreter's
+    /// pointer arithmetic. The first two pin `jump_table.len() == original_len`, bounding
+    /// [`JumpTable::is_valid`](super::JumpTable::is_valid) so that `absolute_ip` and the
+    /// fused `JUMPDEST` arm's `target + 1` stay inside the buffer; the third pins the guard
+    /// byte. They do **not** pin the padding rule -- checking it costs the same scan as
+    /// redoing the analysis, so a caller not using [`analyze`](Self::analyze) owes that.
+    ///
     /// # Panics
     ///
-    /// * If `original_len` is greater than `bytecode.len()`
-    /// * If jump table length is less than `original_len`.
-    /// * If bytecode is empty.
+    /// * If `original_len` is greater than `bytecode.len()`.
+    /// * If the jump table length is not exactly `original_len`.
+    /// * If `bytecode` has no byte past `original_len` (which also rejects an empty
+    ///   `bytecode`).
     pub fn new(bytecode: Bytes, original_len: usize, jump_table: JumpTable) -> Self {
-        assert!(
-            original_len <= bytecode.len(),
-            "original_len is greater than bytecode length"
-        );
-        assert!(
-            original_len <= jump_table.len(),
-            "jump table length is less than original length"
-        );
-        assert!(!bytecode.is_empty(), "bytecode cannot be empty");
-        Self {
+        match Self::try_new(bytecode, original_len, jump_table) {
+            Ok(this) => this,
+            Err(msg) => panic!("{msg}"),
+        }
+    }
+
+    /// [`new`](Self::new), returning the violated invariant instead of panicking. The one
+    /// place the three checks live.
+    ///
+    /// # Errors
+    ///
+    /// On any of the conditions [`new`](Self::new) panics for.
+    pub fn try_new(
+        bytecode: Bytes,
+        original_len: usize,
+        jump_table: JumpTable,
+    ) -> Result<Self, &'static str> {
+        if original_len > jump_table.len() {
+            return Err("jump table length is less than original length");
+        }
+        if jump_table.len() > original_len {
+            return Err("jump table length is greater than original length");
+        }
+        if original_len >= bytecode.len() {
+            return Err("bytecode is not padded past original_len");
+        }
+        Ok(Self {
             bytecode,
             original_len,
             jump_table,
-        }
+        })
     }
 
     /// Returns a reference to the bytecode.
@@ -128,12 +178,16 @@ mod tests {
         );
     }
 
+    /// `original_len` past the end, the table agreeing so the third check is the one under
+    /// test; `test_panic_on_unpadded_bytecode` reaches it only at equality.
     #[test]
-    #[should_panic(expected = "original_len is greater than bytecode length")]
+    #[should_panic(expected = "bytecode is not padded past original_len")]
     fn test_panic_on_large_original_len() {
-        let bytecode = Bytes::from_static(&[opcode::PUSH1, 0x01]);
-        let bytecode = LegacyRawBytecode(bytecode).into_analyzed();
-        let _ = LegacyAnalyzedBytecode::new(bytecode.bytecode, 100, bytecode.jump_table);
+        let analyzed =
+            LegacyRawBytecode(Bytes::from_static(&[opcode::PUSH1, 0x01])).into_analyzed();
+        assert!(analyzed.bytecode.len() < 100);
+        let jump_table = JumpTable::new(bitvec![u8, Lsb0; 0; 100]);
+        let _ = LegacyAnalyzedBytecode::new(analyzed.bytecode, 100, jump_table);
     }
 
     #[test]
@@ -145,11 +199,180 @@ mod tests {
         let _ = LegacyAnalyzedBytecode::new(bytecode.bytecode, bytecode.original_len, jump_table);
     }
 
+    /// A table claiming more jump destinations than the code has bytes: `is_valid` bounds
+    /// `pc` against the bit length alone, so a `true` answer would name an offset past the
+    /// end.
     #[test]
-    #[should_panic(expected = "bytecode cannot be empty")]
+    #[should_panic(expected = "jump table length is greater than original length")]
+    fn test_panic_on_overlong_jump_table() {
+        let bytecode = Bytes::from_static(&[opcode::PUSH1, 0x01]);
+        let analyzed = LegacyRawBytecode(bytecode).into_analyzed();
+        let jump_table = JumpTable::new(bitvec![u8, Lsb0; 1; 4096]);
+        let _ = LegacyAnalyzedBytecode::new(analyzed.bytecode, analyzed.original_len, jump_table);
+    }
+
+    #[test]
+    #[should_panic(expected = "bytecode is not padded past original_len")]
     fn test_panic_on_empty_bytecode() {
         let bytecode = Bytes::from_static(&[]);
         let jump_table = JumpTable::new(bitvec![u8, Lsb0; 0; 0]);
         let _ = LegacyAnalyzedBytecode::new(bytecode, 0, jump_table);
+    }
+
+    /// The whole padded buffer handed over as "original", leaving no byte past the last
+    /// opcode for the dispatch loop's one-past-the-end read.
+    #[test]
+    #[should_panic(expected = "bytecode is not padded past original_len")]
+    fn test_panic_on_unpadded_bytecode() {
+        let raw = Bytes::from_static(&[opcode::STOP]);
+        let jump_table = JumpTable::new(bitvec![u8, Lsb0; 0; 1]);
+        let _ = LegacyAnalyzedBytecode::new(raw, 1, jump_table);
+    }
+
+    /// Every post-condition [`analyze_legacy`] claims, over shapes reaching each arm.
+    #[test]
+    fn analysis_post_conditions_hold() {
+        let cases: &[&[u8]] = &[
+            &[],
+            &[opcode::STOP],
+            &[opcode::JUMPDEST],
+            &[opcode::PUSH1, 0x01, opcode::STOP],
+            &[opcode::PUSH1],
+            &[opcode::PUSH32],
+            &[
+                opcode::JUMPDEST,
+                opcode::PUSH2,
+                0x00,
+                0x03,
+                opcode::JUMP,
+                opcode::JUMPDEST,
+            ],
+            &[opcode::ADD],
+        ];
+        for case in cases {
+            let analyzed = LegacyAnalyzedBytecode::analyze(Bytes::copy_from_slice(case));
+            assert_eq!(analyzed.original_len(), case.len(), "{case:?}");
+            assert_eq!(analyzed.jump_table().len(), case.len(), "{case:?}");
+            assert!(
+                analyzed.original_len() < analyzed.bytecode().len(),
+                "no guard byte for {case:?}"
+            );
+            // Post-condition 3, the one `new` cannot assert: walk the padded buffer as the
+            // dispatch loop does, stopping at the first `STOP`.
+            let padded = analyzed.bytecode();
+            let mut i = 0usize;
+            let stop_at = loop {
+                assert!(
+                    i < padded.len(),
+                    "walk ran off the end without a STOP: {case:?}"
+                );
+                let op = padded[i];
+                if op == opcode::STOP {
+                    break i;
+                }
+                let push = op.wrapping_sub(opcode::PUSH1);
+                i += if push < 32 { push as usize + 2 } else { 1 };
+            };
+            // The byte the dispatch loop reads one past the halt it just took.
+            assert!(
+                stop_at + 1 < padded.len(),
+                "no guard byte past the terminating STOP: {case:?}"
+            );
+        }
+    }
+
+    /// Every jump destination a well-formed table can name is inside the original code, so
+    /// `target + 1` (the fused `JUMPDEST` arm) is inside the padded buffer.
+    #[test]
+    fn valid_jump_targets_stay_in_the_buffer() {
+        let code = [
+            opcode::JUMPDEST,
+            opcode::PUSH1,
+            opcode::JUMPDEST, // immediate, must not be a destination
+            opcode::JUMPDEST,
+        ];
+        let analyzed = LegacyAnalyzedBytecode::analyze(Bytes::copy_from_slice(&code));
+        assert!(analyzed.jump_table().is_valid(0));
+        assert!(!analyzed.jump_table().is_valid(2));
+        assert!(analyzed.jump_table().is_valid(3));
+        for pc in 0..analyzed.jump_table().len() + 64 {
+            if analyzed.jump_table().is_valid(pc) {
+                assert!(pc < analyzed.original_len());
+                assert!(pc + 1 < analyzed.bytecode().len());
+            }
+        }
+    }
+}
+
+/// The wire format: the path the constructor's checks exist for, and the one they missed.
+#[cfg(all(test, feature = "serde"))]
+mod serde_tests {
+    use super::*;
+    use crate::{opcode, Bytecode, LegacyRawBytecode};
+    use bitvec::{bitvec, order::Lsb0};
+
+    fn wire(bytecode: &str, original_len: usize, table: &JumpTable) -> serde_json::Value {
+        serde_json::json!({
+            "bytecode": bytecode,
+            "original_len": original_len,
+            "jump_table": serde_json::to_value(table).unwrap(),
+        })
+    }
+
+    /// A one-byte buffer with a 4096-bit table: the derived `Deserialize` accepted it, and
+    /// `is_valid(4000)` then answered `true`.
+    #[test]
+    fn an_overlong_jump_table_is_refused_on_the_wire() {
+        let table = JumpTable::new(bitvec![u8, Lsb0; 1; 4096]);
+        let json = wire("0x00", 1, &table);
+        let err = serde_json::from_value::<LegacyAnalyzedBytecode>(json.clone())
+            .expect_err("deserialised a 4096-bit table over a 1-byte buffer");
+        assert!(
+            err.to_string().contains("jump table length is greater"),
+            "unexpected error: {err}"
+        );
+        // Through the enum too, which is how a witness names it.
+        assert!(
+            serde_json::from_value::<Bytecode>(serde_json::json!({ "LegacyAnalyzed": json }))
+                .is_err()
+        );
+    }
+
+    /// The other two checks, over the wire.
+    #[test]
+    fn the_other_constructor_checks_apply_on_the_wire() {
+        // Table shorter than `original_len`.
+        let short = JumpTable::new(bitvec![u8, Lsb0; 0; 1]);
+        assert!(
+            serde_json::from_value::<LegacyAnalyzedBytecode>(wire("0x0000", 2, &short)).is_err()
+        );
+        // No guard byte: `original_len` covers the whole buffer.
+        let exact = JumpTable::new(bitvec![u8, Lsb0; 0; 2]);
+        assert!(
+            serde_json::from_value::<LegacyAnalyzedBytecode>(wire("0x0000", 2, &exact)).is_err()
+        );
+        // `original_len` past the end of the buffer, table agreeing.
+        let long = JumpTable::new(bitvec![u8, Lsb0; 0; 100]);
+        assert!(
+            serde_json::from_value::<LegacyAnalyzedBytecode>(wire("0x0000", 100, &long)).is_err()
+        );
+    }
+
+    /// The honest path must be unaffected: everything `analyze` produces round-trips.
+    #[test]
+    fn analysed_bytecode_still_round_trips() {
+        let cases: &[&[u8]] = &[
+            &[],
+            &[opcode::STOP],
+            &[opcode::JUMPDEST, opcode::PUSH1, 0x01, opcode::STOP],
+            &[opcode::PUSH32],
+            &[opcode::JUMPDEST; 64],
+        ];
+        for case in cases {
+            let analyzed = LegacyRawBytecode(Bytes::copy_from_slice(case)).into_analyzed();
+            let json = serde_json::to_string(&analyzed).unwrap();
+            let back: LegacyAnalyzedBytecode = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, analyzed, "{case:?}");
+        }
     }
 }

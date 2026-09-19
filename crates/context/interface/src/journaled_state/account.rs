@@ -22,6 +22,17 @@ pub struct JournaledAccount<'a, ENTRY: JournalEntryTr> {
     journal_entries: &'a mut Vec<ENTRY>,
 }
 
+primitives::assert_all_fields_written!(
+    /// The check [`JournaledAccount::new`]'s `MaybeUninit` writer traded away.
+    assert_journaled_account_fields_are_all_written[ENTRY: JournalEntryTr](
+        JournaledAccount<'_, ENTRY>
+    ) = JournaledAccount {
+        address,
+        account,
+        journal_entries,
+    }
+);
+
 impl<'a, ENTRY: JournalEntryTr> JournaledAccount<'a, ENTRY> {
     /// Consumes the journaled account and returns the mutable account.
     #[inline]
