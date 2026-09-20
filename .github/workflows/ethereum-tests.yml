@@ -6,9 +6,9 @@ concurrency:
 
 on:
   push:
-    branches: [main, "release/**"]
+    branches: [main, "release/**", "pico-**"]
   pull_request:
-    branches: [main, "release/**"]
+    branches: [main, "release/**", "pico-**"]
 
 jobs:
   test:
