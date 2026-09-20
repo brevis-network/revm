@@ -13,16 +13,26 @@ The project is used by major Ethereum infrastructure including Reth, Foundry, Ha
 ## Build and Development Commands
 
 ### Essential Commands
+
 ```bash
 # Build the project
 cargo build
 cargo build --release
 
-# Run all tests
-cargo nextest run --workspace
+# Run all tests. `--features serde` is not optional: `tests/shared_memory_serde.rs` is a
+# `required-features = ["serde"]` target, so without it cargo skips the target entirely.
+cargo nextest run --workspace --features serde
+cargo nextest run --workspace                       # the default feature set
+cargo nextest run --workspace --no-default-features # the no_std-shaped surface
 
-# Lint and format
-cargo clippy --workspace --all-targets --all-features
+# `memory_limit` gates the two MLOAD/MSTORE `MemoryLimitOOG` regression tests; run this
+# before touching memory expansion.
+cargo nextest run -p revm-interpreter --features serde,memory_limit
+
+# Lint and format. `ci.yml` says `--all-features`, which does not build here: it selects
+# `revm-precompile`'s `bn` backend, which does not compile against the pinned `substrate-bn`
+# (`cannot add AffineG1 to AffineG1`). Use `--features serde` locally.
+cargo clippy --workspace --all-targets --features serde
 cargo fmt --all
 
 # Check no_std compatibility

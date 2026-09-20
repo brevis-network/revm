@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Undefined behaviour** in `BytecodeIterator::position`. `BytecodeIterator` walks the
+  original (unpadded) bytes, where a truncated `PUSH` immediate is allowed -- the analysis
+  only rules one out in the padded buffer. `skip_immediate` fell back to an empty slice
+  there, whose pointer belongs to no allocation, and `position` subtracted it from the start
+  pointer. Any code ending in a `0x60..=0x7f` byte reached it. It now clamps to the end of
+  the remaining bytes.
+- `LegacyAnalyzedBytecode` validates on deserialization. The three fields are independent on
+  the wire, and a derived `Deserialize` wrote them straight into the struct, skipping the
+  constructor's checks -- which are what bound the jump table that `revm-interpreter`'s
+  pointer arithmetic trusts. A malformed value is now a `serde` error. **Behaviour change for
+  deserializing callers:** input that was previously accepted and unsound is now rejected.
+
+### Added
+
+- `LegacyAnalyzedBytecode::try_new`, the fallible form of `new`. The two share one definition
+  of the invariants, and `Deserialize` goes through it.
+- `GUARD_BYTES`: the analysis always leaves at least one readable byte past the terminating
+  `STOP`, which is what the dispatch loop's one-past-the-end opcode read needs.
+
+### Changed
+
+- `analyze_legacy` grows the caller's buffer in place when it uniquely owns a growable one,
+  rather than always allocating and copying. The mandatory guard byte removed the old
+  "no padding needed, hand the input back" arm.
+
 ## [7.1.1](https://github.com/bluealloy/revm/compare/revm-bytecode-v7.1.0...revm-bytecode-v7.1.1) - 2025-11-07
 
 ### Other

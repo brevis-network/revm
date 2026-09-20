@@ -4,62 +4,133 @@ use bitvec::{bitvec, order::Lsb0, vec::BitVec};
 use primitives::Bytes;
 use std::vec::Vec;
 
+/// The bytecode returned by [`analyze_legacy`] always has **at least one readable byte past
+/// the terminating `STOP`**.
+///
+/// `Interpreter::run_plain` reads the opcode *before* any arm tests the poison that ends the
+/// loop, so executing the trailing `STOP` leaves the pointer one past it and the next
+/// iteration dereferences that -- reached by any contract whose code runs to the end. The
+/// alternative is a bounds test on every dispatch. The cost is that the buffer is always
+/// longer than the input, so there is no zero-copy arm.
+pub const GUARD_BYTES: usize = 1;
+
 /// Analyzes the bytecode for use in [`LegacyAnalyzedBytecode`](crate::LegacyAnalyzedBytecode).
 ///
 /// See [`LegacyAnalyzedBytecode`](crate::LegacyAnalyzedBytecode) for more details.
 ///
 /// Prefer using [`LegacyAnalyzedBytecode::analyze`](crate::LegacyAnalyzedBytecode::analyze) instead.
+///
+/// # Post-conditions
+///
+/// Each is relied on elsewhere, and
+/// [`LegacyAnalyzedBytecode::new`](crate::LegacyAnalyzedBytecode::new) restates the first two
+/// as assertions, being reachable from a wire format:
+///
+/// 1. one table bit per byte of the **input**, so a jump destination is always inside the
+///    original code -- which is what bounds the interpreter's `absolute_ip`;
+/// 2. the returned buffer is longer than the input, by [`GUARD_BYTES`] at minimum;
+/// 3. its last opcode is a `STOP` and no `PUSH` immediate is truncated, which is what lets
+///    `PUSH*` skip its bounds check.
+///
+/// # What `new` does *not* restate, and why it cannot
+///
+/// **Post-condition 3 is not restated, and 2 alone does not stand in for it.** The guard byte
+/// is sufficient only when the terminating `STOP` lies *inside* `original_len`: `execute!`
+/// advances `ip` before calling the handler, so after the `STOP` at index *k* the dispatch
+/// loop dereferences *k+1*. Honest output puts the `STOP` at `original_len - 1` and the guard
+/// at `original_len`, so that read is the buffer's last byte.
+///
+/// A caller supplying `bytecode`, `original_len` and `jump_table` separately -- a wire format
+/// -- can instead put the terminating `STOP` in the *padding* and consume the guard. Miri, on
+/// `[JUMPDEST, STOP]` with `original_len = 1`: *"attempting to access 1 byte, but got
+/// alloc+0x2 which is at or beyond the end of the allocation of size 2 bytes"*, at
+/// `interpreter.rs`'s `let opcode = unsafe { *ip };`.
+///
+/// **No constant-time check closes this.** Demanding two bytes of padding rejects honest
+/// output, which has exactly one; raising [`GUARD_BYTES`] does not help either, because the
+/// padding's *contents* belong to the caller too, so the first `STOP` simply moves later. The
+/// property needs the walk -- which is to say, it needs this function. **A wire format must
+/// re-derive through [`analyze_legacy`] rather than restate its results.** That is what
+/// `rsp`'s witness decoder now does: it reads only `code[..original_len]`, the preimage that
+/// `code_hash` binds, and hands it to `Bytecode::new_raw_checked`.
 pub fn analyze_legacy(bytecode: Bytes) -> (JumpTable, Bytes) {
     if bytecode.is_empty() {
-        // A STOP, plus one byte of slack past it: see the note on `padding` below.
+        // `STOP` plus the guard byte: the interpreter reads one past the `STOP` it halts on.
         return (
             JumpTable::default(),
-            Bytes::from_static(&[opcode::STOP, opcode::STOP]),
+            Bytes::from_static(&[opcode::STOP; 1 + GUARD_BYTES]),
         );
     }
 
-    let mut jumps: BitVec<u8> = bitvec![u8, Lsb0; 0; bytecode.len()];
-    let range = bytecode.as_ptr_range();
-    let start = range.start;
-    let mut iterator = start;
-    let end = range.end;
+    let len = bytecode.len();
+    let mut jumps: BitVec<u8> = bitvec![u8, Lsb0; 0; len];
+    // A pointer induction variable rather than an index. Only the `JUMPDEST` arm needs the
+    // offset, but an index keeps it live for the whole loop, so LLVM re-does `add base, i`
+    // before the load on every step. Walking a pointer moves that arithmetic into the
+    // `JUMPDEST` arm, and the branch structure that comes with it also drops the mask the
+    // `u8` wrap forces and the jump back to a shared increment block. Per step on RV64:
+    // 8/9/13 instructions (plain/PUSH/JUMPDEST) becomes 7/8/12.
+    //
+    // **-19,600,580 retired instructions across rsp's thirteen `perf/bench_data/rv64` blocks,
+    // -0.593 % of the guest.** Those blocks take 19,600,844 steps, counted independently by
+    // re-running this state machine over every witnessed contract, so the saving is one
+    // instruction per step to within 264 -- inside that rig's ~7 K noise floor.
+    //
+    // `wrapping_add`, not `add`: a truncated trailing `PUSH` immediate steps up to 32 bytes
+    // past the end, and `<*const u8>::add` makes that UB where `wrapping_add` defines it. The
+    // dereference stays guarded by `p < end`, so no read leaves the allocation -- which is the
+    // property the index rewrite was protecting, and it is kept here, not traded away.
+    let start = bytecode.as_ptr();
+    let end = start.wrapping_add(len);
+    let mut p = start;
     let mut opcode = 0;
 
-    while iterator < end {
-        opcode = unsafe { *iterator };
+    while p < end {
+        // SAFETY: `start <= p < end`, so `p` is inside the bytecode.
+        opcode = unsafe { *p };
         if opcode == opcode::JUMPDEST {
-            // SAFETY: Jumps are max length of the code
-            unsafe { jumps.set_unchecked(iterator.offset_from_unsigned(start), true) }
-            iterator = unsafe { iterator.add(1) };
+            let i = p.addr() - start.addr();
+            // SAFETY: `i < len` and the table has exactly `len` bits.
+            unsafe { jumps.set_unchecked(i, true) }
+            p = p.wrapping_add(1);
         } else {
             let push_offset = opcode.wrapping_sub(opcode::PUSH1);
             if push_offset < 32 {
-                // SAFETY: Iterator access range is checked in the while loop
-                iterator = unsafe { iterator.add(push_offset as usize + 2) };
+                p = p.wrapping_add(push_offset as usize + 2);
             } else {
-                // SAFETY: Iterator access range is checked in the while loop
-                iterator = unsafe { iterator.add(1) };
+                p = p.wrapping_add(1);
             }
         }
     }
+    let i = p.addr() - start.addr();
 
-    // Three things the padding has to provide:
-    //  1. any PUSH immediate that runs past the end (`iterator - end` bytes);
-    //  2. a terminating STOP if the last opcode is not one already;
-    //  3. **one byte past the final STOP**. `Interpreter::run_plain` fetches the next opcode
-    //     *before* the gas check that notices a halt, so after the final STOP it reads
-    //     `bytecode[len]`. Without this byte that is a one-past-the-end dereference, which
-    //     Miri reports as UB (see `crates/interpreter/tests/miri_post_stop.rs`). The byte is
-    //     never executed: the poisoned gas counter ends the loop before dispatch.
-    // Because of (3) the padding is never zero, so the original `Bytes` is never returned
-    // as-is -- it may be a sub-slice with nothing addressable past its end.
-    let padding = (iterator as usize) - (end as usize) + (opcode != opcode::STOP) as usize + 1;
-    let mut padded = Vec::with_capacity(bytecode.len() + padding);
-    padded.extend_from_slice(&bytecode);
-    padded.resize(padded.len() + padding, 0);
-    let bytecode = Bytes::from(padded);
+    // Padding is always at least `GUARD_BYTES`, so there is no "input is already fine" arm.
+    // What can still be saved is the copy, not the allocation.
+    let total = len + padding_len(i, len, opcode);
+    let bytecode = match bytecode.0.try_into_mut() {
+        // Sole owner of a growable allocation: a one-byte extension is an in-place `realloc`,
+        // so the code itself is never memcpied.
+        Ok(mut buf) => {
+            buf.resize(total, 0);
+            Bytes::from(buf.freeze())
+        }
+        // Shared, static, or otherwise not ours to grow.
+        Err(shared) => {
+            let mut padded = Vec::with_capacity(total);
+            padded.extend_from_slice(&shared);
+            padded.resize(total, 0);
+            Bytes::from(padded)
+        }
+    };
 
     (JumpTable::new(jumps), bytecode)
+}
+
+/// How many bytes [`analyze_legacy`] appends: enough to complete a truncated trailing `PUSH`
+/// immediate, a `STOP` if the code does not already end in one, and [`GUARD_BYTES`].
+#[inline]
+const fn padding_len(scan_end: usize, len: usize, last_opcode: u8) -> usize {
+    scan_end - len + (last_opcode != opcode::STOP) as usize + GUARD_BYTES
 }
 
 #[cfg(test)]
@@ -67,7 +138,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_bytecode_ends_with_stop_gets_one_slack_byte() {
+    fn test_bytecode_ends_with_stop_no_padding_needed() {
         let bytecode = vec![
             opcode::PUSH1,
             0x01,
@@ -77,35 +148,35 @@ mod tests {
             opcode::STOP,
         ];
         let (_, padded_bytecode) = analyze_legacy(bytecode.clone().into());
-        assert_eq!(padded_bytecode.len(), bytecode.len() + 1);
+        assert_eq!(padded_bytecode.len(), bytecode.len() + GUARD_BYTES);
     }
 
     #[test]
     fn test_bytecode_ends_without_stop_requires_padding() {
         let bytecode = vec![opcode::PUSH1, 0x01, opcode::PUSH1, 0x02, opcode::ADD];
         let (_, padded_bytecode) = analyze_legacy(bytecode.clone().into());
-        assert_eq!(padded_bytecode.len(), bytecode.len() + 2);
+        assert_eq!(padded_bytecode.len(), bytecode.len() + 1 + GUARD_BYTES);
     }
 
     #[test]
-    fn test_bytecode_ends_with_push16_requires_18_bytes_padding() {
+    fn test_bytecode_ends_with_push16_requires_17_bytes_padding() {
         let bytecode = vec![opcode::PUSH1, 0x01, opcode::PUSH16];
         let (_, padded_bytecode) = analyze_legacy(bytecode.clone().into());
-        assert_eq!(padded_bytecode.len(), bytecode.len() + 18);
+        assert_eq!(padded_bytecode.len(), bytecode.len() + 17 + GUARD_BYTES);
     }
 
     #[test]
-    fn test_bytecode_ends_with_push2_requires_3_bytes_padding() {
+    fn test_bytecode_ends_with_push2_requires_2_bytes_padding() {
         let bytecode = vec![opcode::PUSH1, 0x01, opcode::PUSH2, 0x02];
         let (_, padded_bytecode) = analyze_legacy(bytecode.clone().into());
-        assert_eq!(padded_bytecode.len(), bytecode.len() + 3);
+        assert_eq!(padded_bytecode.len(), bytecode.len() + 2 + GUARD_BYTES);
     }
 
     #[test]
     fn test_empty_bytecode_requires_stop() {
         let bytecode = vec![];
         let (_, padded_bytecode) = analyze_legacy(bytecode.clone().into());
-        assert_eq!(padded_bytecode.len(), 2); // STOP + one slack byte
+        assert_eq!(padded_bytecode.len(), 1 + GUARD_BYTES); // STOP plus the guard byte
     }
 
     #[test]
@@ -140,7 +211,7 @@ mod tests {
     fn test_bytecode_with_max_push32() {
         let bytecode = vec![opcode::PUSH32];
         let (_, padded_bytecode) = analyze_legacy(bytecode.clone().into());
-        assert_eq!(padded_bytecode.len(), bytecode.len() + 34); // PUSH32 + 32 bytes + STOP + slack
+        assert_eq!(padded_bytecode.len(), bytecode.len() + 33 + GUARD_BYTES); // PUSH32 + 32 bytes + STOP
     }
 
     #[test]
@@ -166,10 +237,107 @@ mod tests {
             opcode::STOP,
         ];
         let (jump_table, padded_bytecode) = analyze_legacy(bytecode.clone().into());
-        assert_eq!(padded_bytecode.len(), bytecode.len() + 1);
+        assert_eq!(padded_bytecode.len(), bytecode.len() + GUARD_BYTES);
         assert!(!jump_table.is_valid(0)); // PUSH1
         assert!(!jump_table.is_valid(2)); // PUSH2
         assert!(!jump_table.is_valid(5)); // PUSH4
+    }
+
+    /// Both ownership arms are on the consensus path, so they must agree byte for byte.
+    #[test]
+    fn both_padding_arms_produce_the_same_buffer() {
+        let cases: &[&[u8]] = &[
+            &[opcode::STOP],
+            &[opcode::PUSH1, 0x01, opcode::STOP],
+            &[opcode::PUSH1, 0x01, opcode::ADD],
+            &[opcode::PUSH32],
+            &[opcode::JUMPDEST, opcode::PUSH2, 0x00, 0x03],
+        ];
+        for case in cases {
+            // Reuse arm, with stale bytes past the end so a missing zero fill would show.
+            let mut owned = Vec::with_capacity(case.len() + 64);
+            owned.extend_from_slice(case);
+            owned.resize(case.len() + 64, 0xff);
+            owned.truncate(case.len());
+            let (t_reuse, b_reuse) = analyze_legacy(Bytes::from(owned));
+
+            // A second live handle: `try_into_mut` refuses, so this takes the copy arm.
+            let shared = Bytes::copy_from_slice(case);
+            let _keep_alive = shared.clone();
+            let (t_copy, b_copy) = analyze_legacy(shared);
+
+            // A slice of a larger unique allocation: the result is the slice, nothing more.
+            let mut backing = std::vec![0xaa_u8; 8];
+            backing.extend_from_slice(case);
+            backing.extend_from_slice(&[0xbb; 8]);
+            let sliced = Bytes::from(backing).slice(8..8 + case.len());
+            let (_, b_slice) = analyze_legacy(sliced);
+
+            assert_eq!(b_reuse, b_copy, "{case:?}");
+            assert_eq!(b_slice, b_copy, "sliced input diverged for {case:?}");
+            assert_eq!(t_reuse.len(), t_copy.len(), "{case:?}");
+            assert_eq!(&b_reuse[..case.len()], *case, "{case:?}");
+            assert!(
+                b_reuse[case.len()..].iter().all(|&b| b == 0),
+                "padding not zeroed for {case:?}: {b_reuse:?}"
+            );
+        }
+    }
+
+    /// The same agreement over pseudo-random code. Deterministic, so a failure reproduces;
+    /// this crate has no `rand` dependency.
+    #[test]
+    fn both_padding_arms_agree_on_random_code() {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..512 {
+            let len = (next() % 48) as usize;
+            let code: Vec<u8> = (0..len).map(|_| (next() & 0xff) as u8).collect();
+
+            let (_, unique) = analyze_legacy(Bytes::from(code.clone()));
+            let shared_in = Bytes::copy_from_slice(&code);
+            let _keep_alive = shared_in.clone();
+            let (_, shared) = analyze_legacy(shared_in);
+
+            assert_eq!(unique, shared, "{code:?}");
+            assert_eq!(&unique[..len], &code[..], "{code:?}");
+            assert!(unique.len() > len, "no guard byte for {code:?}");
+            assert_eq!(unique[unique.len() - 1], 0, "{code:?}");
+        }
+    }
+
+    /// The guard byte is sound only together with post-condition 3, and this is why: the
+    /// padding grows to hold the terminating `STOP` *as well as* the guard, so the read one
+    /// past that `STOP` is always inside the buffer.
+    ///
+    /// Restating the post-conditions instead of re-deriving them loses this. A wire format
+    /// that supplies `bytecode`/`original_len`/`jump_table` separately can pass a buffer with
+    /// exactly `GUARD_BYTES` of padding whose `STOP` is the padding -- Miri then reports an
+    /// access "at or beyond the end of the allocation" in the dispatch loop. See the note on
+    /// [`analyze_legacy`].
+    #[test]
+    fn padding_holds_the_terminating_stop_as_well_as_the_guard() {
+        // Ends in STOP: the STOP is inside the input, so GUARD_BYTES alone is enough.
+        let ends_in_stop: Bytes = vec![opcode::JUMPDEST, opcode::STOP].into();
+        let (_, out) = analyze_legacy(ends_in_stop.clone());
+        assert_eq!(out.len(), ends_in_stop.len() + GUARD_BYTES);
+
+        // Does not end in STOP: one byte for the STOP, one for the guard.
+        let no_stop: Bytes = vec![opcode::JUMPDEST].into();
+        let (_, out) = analyze_legacy(no_stop.clone());
+        assert_eq!(out.len(), no_stop.len() + 1 + GUARD_BYTES);
+        assert_eq!(out[no_stop.len()], opcode::STOP);
+
+        // A truncated PUSH immediate is padded out too, then terminated, then guarded.
+        let truncated: Bytes = vec![opcode::PUSH32].into();
+        let (_, out) = analyze_legacy(truncated);
+        assert_eq!(out.len(), 1 + 32 + 1 + GUARD_BYTES);
+        assert_eq!(*out.last().unwrap(), 0);
     }
 
     #[test]

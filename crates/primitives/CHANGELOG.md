@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `assert_all_fields_written!`, which declares the exhaustive-initialisation check that a
+  `MaybeUninit` field-by-field constructor trades away. Replaces three hand-copied copies of
+  the same pattern across `revm-interpreter`, `revm-context-interface` and `revm-context`.
+
 ## [21.0.2](https://github.com/bluealloy/revm/compare/revm-primitives-v21.0.1...revm-primitives-v21.0.2) - 2025-11-07
 
 ### Other

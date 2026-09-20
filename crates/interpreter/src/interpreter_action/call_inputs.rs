@@ -15,6 +15,17 @@ pub enum CallInput {
     ///
     /// Use it with caution, CallInput shared buffer can be overridden if context from child call is returned so
     /// recommendation is to fetch buffer at first Inspector call and clone it from [`context_interface::LocalContextTr::shared_memory_buffer_slice`] function.
+    ///
+    /// # Two properties this variant does **not** carry
+    ///
+    /// 1. **In-bounds.** Nothing here bounds the range by the buffer; it is in bounds because
+    ///    `prepare_call_inputs` builds it out of `resize_memory`, and `calldataload_at` reads
+    ///    through a raw pointer on that premise. Any other producer owes it.
+    /// 2. **Identity of the buffer.** Which `Rc` the range refers to is not part of the
+    ///    value, and serde's `rc` feature does **not** deduplicate `Rc`s, so a round trip
+    ///    resolves the range against a buffer disjoint from `LocalContext`'s: **silently
+    ///    empty calldata**, which INV-B (pointer validity, not identity) cannot detect.
+    ///    Library surface only.
     SharedBuffer(Range<usize>),
     /// Bytes of the call data.
     Bytes(Bytes),

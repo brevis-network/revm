@@ -16,15 +16,13 @@ impl<'a> BytecodeIterator<'a> {
     /// Creates a new iterator from a bytecode reference.
     #[inline]
     pub fn new(bytecode: &'a Bytecode) -> Self {
+        // The *original* bytes, not the padded buffer. The analysis appends `STOP`s to make
+        // the last instruction complete and to leave the dispatch loop a byte to read past
+        // its halt (see `analyze_legacy`); those are an execution detail and were never
+        // opcodes the contract contains. Iterating the padded buffer reported them, so the
+        // opcode stream of a contract not ending in `STOP` carried trailing phantom `STOP`s.
         let bytes = match bytecode {
-            // `analyze_legacy` pads exactly one slack byte past the final STOP for the
-            // interpreter's speculative fetch (see the note on `padding` there). It is not
-            // part of the code, so the iterator stops before it -- which keeps the observable
-            // opcode sequence identical to what it was before the slack byte existed.
-            Bytecode::LegacyAnalyzed(_) => {
-                let all = &bytecode.bytecode()[..];
-                &all[..all.len() - 1]
-            }
+            Bytecode::LegacyAnalyzed(analyzed) => analyzed.original_byte_slice(),
             Bytecode::Eip7702(_) => &[],
         };
         Self {
@@ -63,14 +61,12 @@ impl<'a> BytecodeIterator<'a> {
             .map(|info| info.immediate_size() as usize)
             .unwrap_or_default();
 
-        // Advance the iterator by the immediate size
+        // Clamp, not `unwrap_or_default()`: the original bytes may end in a truncated
+        // immediate, and an empty default slice is a dangling pointer that `position()`
+        // would subtract from `start` -- UB.
         if immediate_size > 0 {
-            self.bytes = self
-                .bytes
-                .as_slice()
-                .get(immediate_size..)
-                .unwrap_or_default()
-                .iter();
+            let rest = self.bytes.as_slice();
+            self.bytes = rest[immediate_size.min(rest.len())..].iter();
         }
     }
 
@@ -298,5 +294,44 @@ mod tests {
 
         let opcodes: Vec<u8> = bytecode.iter_opcodes().collect();
         assert_eq!(opcodes, vec![opcode::STOP]);
+    }
+
+    /// Only the *padded* buffer excludes a truncated `PUSH` immediate, so iterating the
+    /// original bytes must tolerate one. Any code ending in `0x60..=0x7f` reaches this.
+    #[test]
+    fn truncated_trailing_push_immediate_keeps_position_in_the_allocation() {
+        // One byte short of PUSH2's immediate, through to 31 short of PUSH32's.
+        for push in opcode::PUSH1..=opcode::PUSH32 {
+            // Every shortfall, from one byte short of PUSH2 to 31 short of PUSH32.
+            let want = (push - opcode::PUSH1) as usize + 1;
+            for have in 0..want {
+                let mut code = vec![opcode::JUMPDEST, push];
+                code.extend(std::iter::repeat_n(0xff, have));
+                let raw = LegacyRawBytecode(Bytes::from(code.clone()));
+                let bytecode = Bytecode::LegacyAnalyzed(raw.into_analyzed());
+
+                let mut it = BytecodeIterator::new(&bytecode);
+                assert_eq!(it.next(), Some(opcode::JUMPDEST));
+                assert_eq!(it.position(), 1);
+                assert_eq!(it.next(), Some(push));
+                assert_eq!(it.position(), code.len(), "{push:#04x}, {have} of {want}");
+                assert_eq!(it.next(), None);
+                assert_eq!(it.position(), code.len());
+                assert!(it.as_slice().is_empty());
+            }
+        }
+    }
+
+    /// The smallest such code; the padded buffer's trailing `STOP`s stay unreported.
+    #[test]
+    fn lone_truncated_push_yields_the_opcode_and_stops() {
+        let raw = LegacyRawBytecode(Bytes::from(vec![opcode::PUSH2, 0x01]));
+        let bytecode = Bytecode::LegacyAnalyzed(raw.into_analyzed());
+        let opcodes: Vec<u8> = bytecode.iter_opcodes().collect();
+        assert_eq!(opcodes, vec![opcode::PUSH2]);
+        let mut it = BytecodeIterator::new(&bytecode);
+        assert_eq!(it.next(), Some(opcode::PUSH2));
+        assert_eq!(it.position(), 2);
+        assert_eq!(it.next(), None);
     }
 }

@@ -29,7 +29,7 @@ pub fn keccak256<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn keccak256_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -75,7 +75,7 @@ pub fn address<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn address_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -101,7 +101,7 @@ pub fn caller<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_,
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn caller_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -127,7 +127,7 @@ pub fn codesize<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn codesize_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -180,7 +180,7 @@ pub fn calldataload<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionConte
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn calldataload_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -195,7 +195,6 @@ pub fn calldataload_at<WIRE: InterpreterTypes, H: ?Sized>(
     // `usize`, so testing the high limbs directly against zero does the same job for two
     // instructions less.
     let ol = *offset_ptr.as_limbs();
-    let offset = ol[0] as usize;
     // Assemble straight into the stack slot, one limb at a time. Building a `U256` first
     // keeps all four limbs live to the end, which cost this instruction a prologue that
     // saved ten callee-saved registers on every `CALLDATALOAD`.
@@ -227,7 +226,11 @@ pub fn calldataload_at<WIRE: InterpreterTypes, H: ?Sized>(
     // reversals, ~77 more. When the whole 32 bytes are inside the calldata - the case for
     // essentially every `CALLDATALOAD` a compiler emits - the limbs can be assembled
     // straight from the bytes with 8 `lbu` + 7 `slli` + 7 `or` each and neither is needed.
-    if (ol[1] | ol[2] | ol[3]) != 0 || offset >= input_len {
+    // Tested on the `u64` limb, not on `ol[0] as usize`: the two agree only where `usize` is
+    // 64 bits, and the difference fails *open* -- on a 32-bit target `ol[0] as usize`
+    // truncates, so `ol[0] = 0x1_0000_0000` would read `calldata[0..32]` where the saturating
+    // form it replaced pushes zero. Nothing in this crate asserts the width.
+    if (ol[1] | ol[2] | ol[3]) != 0 || ol[0] >= input_len as u64 {
         // SAFETY: `dst` is the four limbs of a live stack word.
         unsafe {
             dst.write(0);
@@ -237,8 +240,13 @@ pub fn calldataload_at<WIRE: InterpreterTypes, H: ?Sized>(
         }
         return (sp, rem);
     }
+    let offset = ol[0] as usize;
     let count = 32.min(input_len - offset);
-    // SAFETY: `offset < input_len` and `count <= input_len - offset`.
+    // SAFETY: `offset < input_len` and `count <= input_len - offset`. The premise is that
+    // `base[..input_len]` is readable, which differs per arm: for `CallInput::Bytes` it is
+    // the slice's own length; for `SharedBuffer(range)` it is `range.end <= buffer.len()`, an
+    // invariant of the range `prepare_call_inputs` builds out of `resize_memory` and *not* of
+    // the enum. The `usize::MAX..usize::MAX` sentinel is excluded by its zero length.
     unsafe { be_word_to(base.add(offset), count, dst) }
     (sp, rem)
 }
@@ -354,7 +362,7 @@ pub fn calldatasize<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionConte
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn calldatasize_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -383,7 +391,7 @@ pub fn callvalue<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn callvalue_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -439,7 +447,7 @@ pub fn returndatasize<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionCon
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn returndatasize_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -493,11 +501,11 @@ pub fn gas<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, H,
     run_threaded!(context, gas_at)
 }
 
-/// [`gas`], threading the stack cursor.
+/// [`gas`](fn@gas), threading the stack cursor.
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn gas_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -538,9 +546,10 @@ pub fn memory_resize(
     // called on every one of those dispatches, growing or not. The hint pays for MSTORE
     // because 36.5 % of MSTOREs grow and the skipped fill is a whole word each time.
     //
-    // MCOPY was measured with it too, taking the `dst >= src` half (the only sound one --
-    // when `src` is the max, the bytes grown into are the copy's *source* and must read as
-    // zero): a further +652. Not worth the branch.
+    // MCOPY was measured on the `dst >= src` half too: a further +652, not worth the branch.
+    // And **`dst >= src` is not the sound predicate** anyway -- under overlap, part of the
+    // copy's source lies in memory the grow just created, which must read as zero. The sound
+    // one is `src + len <= max(old_len, dst)`; do not reintroduce the hint on `dst >= src`.
     resize_memory!(interpreter, memory_offset, len, None);
 
     Some(memory_offset)

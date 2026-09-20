@@ -120,7 +120,8 @@ impl EthFrame<EthInterpreter> {
     /// Clear and initialize a frame.
     #[allow(clippy::too_many_arguments)]
     ///
-    /// Neither the interpreter's [`InputsImpl`] nor its [`ExtBytecode`] is a parameter; see
+    /// Neither the interpreter's [`InputsImpl`](interpreter::InputsImpl) nor its
+    /// [`ExtBytecode`] is a parameter; see
     /// [`Interpreter::clear`].
     ///
     /// `#[inline]`: out of line this is ten callee-saved registers saved and restored, 37

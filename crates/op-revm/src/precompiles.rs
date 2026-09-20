@@ -99,17 +99,11 @@ pub fn jovian() -> &'static Precompiles {
     INSTANCE.get_or_init(|| {
         let mut precompiles = isthmus().clone();
 
-        let mut to_remove = Precompiles::default();
-        to_remove.extend([
-            bn254::pair::ISTANBUL,
-            bls12_381::ISTHMUS_G1_MSM,
-            bls12_381::ISTHMUS_G2_MSM,
-            bls12_381::ISTHMUS_PAIRING,
-        ]);
-
-        // Replace the 4 variable-input precompiles with Jovian versions (reduced limits)
-        precompiles.difference(&to_remove);
-
+        // Replace the 4 variable-input precompiles with Jovian versions (reduced limits).
+        //
+        // `extend` is the whole replacement: each Jovian entry sits at the same address as
+        // the Isthmus one it supersedes (`bn254::pair::ADDRESS`, `G1_MSM_ADDRESS`,
+        // `G2_MSM_ADDRESS`, `PAIRING_ADDRESS`) and "other precompiles overwrite existing".
         precompiles.extend([
             bn254_pair::JOVIAN,
             bls12_381::JOVIAN_G1_MSM,

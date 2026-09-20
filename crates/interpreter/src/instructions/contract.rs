@@ -1,8 +1,8 @@
 mod call_helpers;
 
 pub use call_helpers::{
-    get_memory_input_and_out_ranges, load_acc_and_calc_gas, load_account_delegated,
-    load_account_delegated_handle_error, new_account_cost, prepare_call_inputs, resize_memory,
+    load_acc_and_calc_gas, load_account_delegated, load_account_delegated_handle_error,
+    new_account_cost, prepare_call_inputs, resize_memory,
 };
 
 use crate::{

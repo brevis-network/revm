@@ -43,6 +43,18 @@ impl Default for ExtBytecode {
     }
 }
 
+primitives::assert_all_fields_written!(
+    /// The check `write_with_hash` and `write_with_optional_hash` traded away: both
+    /// initialise `ExtBytecode` one field at a time through `addr_of_mut!`.
+    assert_ext_bytecode_fields_are_all_written(ExtBytecode) = ExtBytecode {
+        instruction_pointer,
+        continue_execution,
+        bytecode_hash,
+        action,
+        base,
+    }
+);
+
 impl ExtBytecode {
     /// Create new extended bytecode and set the instruction pointer to the start of the bytecode.
     ///
@@ -290,10 +302,15 @@ impl Jumps for ExtBytecode {
         // reads this once per frame, including for frames that never execute a jump, so
         // panicking here would fire for bytecode the old path never asked about.
         match self.base.legacy_jump_table() {
-            Some(table) => JumpCtx {
-                table_ptr: table.table_ptr(),
-                table_len: table.len(),
-                code_base: self.base.bytes_ref().as_ptr(),
+            // SAFETY: both pointers are into the `Bytecode` this `ExtBytecode` owns, which
+            // outlives the returned context, and `LegacyAnalyzedBytecode::new` asserts
+            // `jump_table.len() == original_len < bytecode.len()`.
+            Some(table) => unsafe {
+                JumpCtx::new(
+                    table.table_ptr(),
+                    table.len(),
+                    self.base.bytes_ref().as_ptr(),
+                )
             },
             None => JumpCtx::EMPTY,
         }
@@ -302,15 +319,18 @@ impl Jumps for ExtBytecode {
     #[inline]
     fn is_valid_legacy_jump_with(&mut self, ctx: JumpCtx, offset: usize) -> bool {
         // Same expression as `JumpTable::is_valid`, off the hoisted copy.
-        offset < ctx.table_len
-            && unsafe { *ctx.table_ptr.add(offset >> 3) & (1 << (offset & 7)) != 0 }
+        // SAFETY: `offset < table_len` and the bitmap is readable for `table_len` bits.
+        offset < ctx.table_len()
+            && unsafe { *ctx.table_ptr().add(offset >> 3) & (1 << (offset & 7)) != 0 }
     }
 
     #[inline]
     fn absolute_ip_with(&self, ctx: JumpCtx, offset: usize) -> *const u8 {
-        // SAFETY: the caller has checked `offset` against the bitmap, whose length is the
-        // unpadded bytecode length, so `code_base + offset` is inside the padded bytes.
-        unsafe { ctx.code_base.add(offset) }
+        // SAFETY: the caller has checked `offset` against the bitmap, whose bit length
+        // `LegacyAnalyzedBytecode::new` pins below the padded length, so `code_base + offset`
+        // and `+ 1` (the fused `JUMPDEST` arm) are inside the padded bytes. Structural, so it
+        // holds for a table that disagrees with the bytes it describes.
+        unsafe { ctx.code_base().add(offset) }
     }
 
     #[inline]
@@ -402,9 +422,9 @@ mod tests {
         let a = ExtBytecode::new(Bytecode::new_raw(Bytes::from(&[0x5b, 0x00][..])));
         let b = ExtBytecode::new(Bytecode::new_raw(Bytes::from(&[0x5b, 0x5b, 0x00][..])));
         assert!(!core::ptr::eq(
-            a.jump_ctx().table_ptr,
-            b.jump_ctx().table_ptr
+            a.jump_ctx().table_ptr(),
+            b.jump_ctx().table_ptr()
         ));
-        assert_ne!(a.jump_ctx().table_len, b.jump_ctx().table_len);
+        assert_ne!(a.jump_ctx().table_len(), b.jump_ctx().table_len());
     }
 }

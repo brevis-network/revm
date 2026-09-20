@@ -31,14 +31,14 @@ macro_rules! mstore_body {
             // unconditionally and before anything can read them, so the grow does not have
             // to zero that part of the new tail. Same gas, same word count.
             // SAFETY: the test above is exactly `grow_memory_word_written`'s precondition.
-            if !unsafe {
+            if let Err(halt) = unsafe {
                 crate::interpreter::grow_memory_word_written(
                     &mut $context.interpreter.gas,
                     &mut $context.interpreter.memory,
                     offset,
                 )
             } {
-                $context.interpreter.halt_memory_oog();
+                $context.interpreter.halt(halt);
                 return $ret;
             }
             $context.interpreter.gas.remaining()
@@ -72,7 +72,7 @@ pub fn mload<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, 
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn mload_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -102,14 +102,14 @@ pub fn mload_at<WIRE: InterpreterTypes, H: ?Sized>(
         // Charges gas, so the field has to be the truth first; see `sync_gas_at!`.
         sync_gas_at!(context.interpreter, rem);
         // SAFETY: the test above is exactly `grow_memory_word`'s precondition.
-        if !unsafe {
+        if let Err(halt) = unsafe {
             crate::interpreter::grow_memory_word(
                 &mut context.interpreter.gas,
                 &mut context.interpreter.memory,
                 offset,
             )
         } {
-            context.interpreter.halt_memory_oog();
+            context.interpreter.halt(halt);
             return (sp, u64::MAX);
         }
         context.interpreter.gas.remaining()
@@ -140,7 +140,7 @@ pub fn mstore<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_,
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn mstore_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -213,7 +213,7 @@ pub fn mstore8<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn mstore8_at<WIRE: InterpreterTypes, H: ?Sized>(
@@ -244,7 +244,7 @@ pub fn msize<WIRE: InterpreterTypes, H: ?Sized>(context: InstructionContext<'_, 
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn msize_at<WIRE: InterpreterTypes, H: ?Sized>(

@@ -1,9 +1,7 @@
 //! Probe: does a deserialised `SharedMemory` satisfy INV-B?
 //!
-//! `serde` is not a default feature of this crate, so gate the file: without this, testing
-//! `revm-interpreter` on its own fails to build. Workspace-wide runs unify the feature on and
-//! never see it.
-#![cfg(feature = "serde")]
+//! `serde` is declared as `required-features` on the `[[test]]` target in `Cargo.toml`, not
+//! as a `#![cfg]` here, so naming this target without it is an error, not a silent pass.
 
 use primitives::U256;
 use revm_interpreter::interpreter::SharedMemory;
@@ -43,8 +41,6 @@ fn descending_into_a_child_is_fine_when_the_buffer_is_untouched() {
 /// allocation. There is no restore site for that, so the guard in `new_child_context` --
 /// the one check that is compiled into the guest as well -- has to catch it.
 ///
-/// What this depends on beyond the guard is the allocator actually moving the block, which
-/// `reserve` is free not to do, so that is asserted rather than assumed.
 #[test]
 #[should_panic(expected = "INV-B broken before a child frame")]
 fn external_growth_is_caught_before_descending_into_a_child() {
@@ -55,15 +51,12 @@ fn external_growth_is_caught_before_descending_into_a_child() {
     let mut m = SharedMemory::new_with_buffer(buf.clone());
     m.resize(32);
 
-    // Grow through the other handle, past the capacity, so the allocation moves and every
-    // cached `base` on it is left dangling.
-    let before = buf.borrow().as_ptr();
-    buf.borrow_mut().reserve(1 << 16);
-    assert_ne!(
-        buf.borrow().as_ptr(),
-        before,
-        "this probe needs the reallocation to move the block; it grew in place instead"
-    );
+    // Move the buffer through the other handle, leaving `m`'s cached `base` dangling. By
+    // swapping the allocation, not by `reserve`, which may realloc in place and then test
+    // nothing: `mem::replace` allocates while the old buffer is still live, so the two
+    // addresses cannot coincide.
+    let old = core::mem::replace(&mut *buf.borrow_mut(), vec![0u8; 1 << 16]);
+    assert_ne!(buf.borrow().as_ptr(), old.as_ptr());
 
     let _ = m.new_child_context();
 }

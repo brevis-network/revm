@@ -147,7 +147,7 @@
         "balance": "0x2386f26fc10000",
         "code": {
           "LegacyAnalyzed": {
-            "bytecode": "0x600080a000",
+            "bytecode": "0x600080a00000",
             "jump_table": {
               "bits": 5,
               "data": [

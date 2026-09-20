@@ -84,14 +84,21 @@ pub trait LegacyBytecode {
 /// bytecode's data pointer. None of them can change while one frame runs -- only the
 /// instruction *pointer* moves -- so `Interpreter::run_plain` reads them once into a local
 /// and hands that local to the two arms that need it.
+///
+/// # Why the fields are private
+///
+/// Every value here is a memory-safety precondition of a *safe* function:
+/// [`Jumps::absolute_ip_with`] turns `code_base + offset` into the instruction pointer, with
+/// `offset` bounded against `table_len` alone, so `pub` fields would let safe code build one
+/// from three arbitrary values. Reading one back stays safe.
 #[derive(Clone, Copy, Debug)]
 pub struct JumpCtx {
     /// Base of the jump-destination bitmap, one bit per byte of the original bytecode.
-    pub table_ptr: *const u8,
+    table_ptr: *const u8,
     /// Number of bits in the bitmap, i.e. the original (unpadded) bytecode length.
-    pub table_len: usize,
+    table_len: usize,
     /// Base of the (padded) bytecode bytes.
-    pub code_base: *const u8,
+    code_base: *const u8,
 }
 
 impl JumpCtx {
@@ -105,6 +112,39 @@ impl JumpCtx {
         table_len: 0,
         code_base: core::ptr::null(),
     };
+
+    /// # Safety
+    ///
+    /// For the whole lifetime of the returned value: `table_ptr` readable for
+    /// `table_len.div_ceil(8)` bytes, `code_base` readable for **strictly more** than
+    /// `table_len` bytes (what `LegacyAnalyzedBytecode`'s constructor asserts), and neither
+    /// allocation moved or freed.
+    #[inline]
+    pub const unsafe fn new(table_ptr: *const u8, table_len: usize, code_base: *const u8) -> Self {
+        Self {
+            table_ptr,
+            table_len,
+            code_base,
+        }
+    }
+
+    /// Base of the jump-destination bitmap.
+    #[inline]
+    pub const fn table_ptr(&self) -> *const u8 {
+        self.table_ptr
+    }
+
+    /// Number of bits in the bitmap, i.e. the original (unpadded) bytecode length.
+    #[inline]
+    pub const fn table_len(&self) -> usize {
+        self.table_len
+    }
+
+    /// Base of the (padded) bytecode bytes.
+    #[inline]
+    pub const fn code_base(&self) -> *const u8 {
+        self.code_base
+    }
 }
 
 /// Trait for Interpreter to be able to jump
@@ -255,14 +295,21 @@ pub trait MemoryTr {
     /// The pointer form exists for register pressure, not convenience. Passing a `U256` by
     /// value keeps all four limbs live from the pop to the last byte store, and on RV64
     /// that pushed the allocator into 13 callee-saved registers, whose save/restore ran on
-    /// every `MSTORE`. Reading a limb through a pointer that may alias the destination
-    /// stops LLVM hoisting the next load above the previous stores, so only one limb is
-    /// live at a time.
+    /// every `MSTORE`.
+    ///
+    /// The register saving comes from not passing the word by value, not from load
+    /// ordering: [`SharedMemory`]'s 8-aligned arm reads all four limbs up front anyway.
     ///
     /// # Safety
     ///
-    /// `src` must point at four readable `u64`s, and `offset + 32` must be within the
-    /// current memory.
+    /// * `src` must point at four readable `u64`s;
+    /// * `offset + 32` must be within the current memory;
+    /// * **`src` must not overlap the 32 bytes at `offset`**: `SharedMemory`'s misaligned
+    ///   arm interleaves reads with writes, so the answer would depend on alignment. The
+    ///   interpreter satisfies this structurally -- stack and memory are separate
+    ///   allocations.
+    ///
+    /// [`SharedMemory`]: crate::interpreter::SharedMemory
     #[inline]
     unsafe fn set_u256_ptr(&mut self, offset: usize, src: *const u64) {
         // SAFETY: the caller guarantees four readable limbs.
@@ -275,8 +322,10 @@ pub trait MemoryTr {
     ///
     /// # Safety
     ///
-    /// `dst` must point at four writable `u64`s, and `offset + 32` must be within the
-    /// current memory.
+    /// * `dst` must point at four writable `u64`s;
+    /// * `offset + 32` must be within the current memory;
+    /// * **`dst` must not overlap the 32 bytes at `offset`**, for the reason given on
+    ///   [`MemoryTr::set_u256_ptr`].
     #[inline]
     unsafe fn get_u256_to(&self, offset: usize, dst: *mut u64) {
         let limbs = *self.get_u256(offset).as_limbs();
@@ -305,9 +354,10 @@ pub trait MemoryTr {
     ///
     /// # Correctness
     ///
-    /// This is not `unsafe` - breaking the promise leaves stale EVM memory, not undefined
-    /// behaviour - but it *is* a contract, and `wr_off + wr_len` has to be within
-    /// `new_size`.
+    /// A contract: `wr_off + wr_len` has to be within `new_size`. Not `unsafe` only because
+    /// the signature cannot express the hazard. Breaking it leaves stale EVM memory where the
+    /// tail was previously written -- consensus-wrong but defined -- and, where the tail is
+    /// capacity the `Vec` never wrote, an **uninitialised read**, demonstrated under Miri.
     #[inline]
     fn resize_written(&mut self, new_size: usize, wr_off: usize, wr_len: usize) -> bool {
         let _ = (wr_off, wr_len);

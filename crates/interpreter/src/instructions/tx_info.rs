@@ -18,7 +18,7 @@ pub fn gasprice<WIRE: InterpreterTypes, H: Host + ?Sized>(
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn gasprice_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
@@ -47,7 +47,7 @@ pub fn origin<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionCont
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn origin_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
@@ -78,7 +78,7 @@ pub fn blob_hash<WIRE: InterpreterTypes, H: Host + ?Sized>(
 ///
 /// The body lives here; the plain form above is this one with the cursor read out
 /// of the stack and written back, which is what the instruction *table* needs. See
-/// [`StackTr::sp`](crate::interpreter_types::StackTr::sp).
+/// [`StackTr::sp`].
 #[inline(always)]
 #[allow(unused_mut)]
 pub fn blob_hash_at<WIRE: InterpreterTypes, H: Host + ?Sized>(
