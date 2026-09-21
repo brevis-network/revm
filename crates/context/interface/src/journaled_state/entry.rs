@@ -424,5 +424,20 @@ impl JournalEntryTr for JournalEntry {
     }
 }
 
-/// The word-wide discriminant above is load-bearing; see the comment on the enum.
-const _: () = assert!(core::mem::size_of::<JournalEntry>() == 96);
+/// The word-wide discriminant above is load-bearing; see the comment on the enum. Pinning the
+/// total size is the cheap way to notice the `repr(u64)` going away, since dropping it changes
+/// no behaviour, fails no test and moves no codegen probe.
+///
+/// Guarded on `align_of::<u64>()` rather than asserted flat, and not on `target_pointer_width`
+/// either: what sets this layout is how `u64` aligns, and the two are not the same question.
+/// i686 aligns `u64` to 4, so `repr(u64)` leaves the discriminant 4-aligned there and the enum
+/// is a different -- equally correct -- size; 96 is simply the wrong number on that target.
+/// The guest is riscv64, where `u64` is 8-aligned, and that is where the 1.80 M was measured.
+///
+/// Checked both ways on both targets: removing `repr(u64)` fails the build on x86_64 and is
+/// ignored on i686, which is the behaviour intended.
+const _: () = {
+    if core::mem::align_of::<u64>() == 8 {
+        assert!(core::mem::size_of::<JournalEntry>() == 96);
+    }
+};
