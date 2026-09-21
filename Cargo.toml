@@ -174,3 +174,14 @@ strip = false
 [profile.ethtests]
 inherits = "test"
 opt-level = 3
+
+# `crates/precompile/src/bn254/substrate.rs` has used `AffineG1 + AffineG1` and
+# `AffineG1 * Fr` since 57b98989 ("modify bn254 point cal", 2026-03-25). Vanilla
+# `substrate-bn` 0.6.0, which `[workspace.dependencies]` above names, provides neither, so
+# `cargo check -p revm-precompile --no-default-features --features bn` -- the `features` job
+# in ci.yml -- fails with two E0369s and has since that commit.
+#
+# The fork below is the one the rsp guest already builds against, so this aligns the two
+# rather than introducing a new dependency.
+[patch.crates-io]
+substrate-bn = { git = "https://github.com/brevis-network/bn", branch = "patch-v1.0.2-rv64" }
