@@ -578,6 +578,130 @@ mod shift_tests {
         }
     }
 
+    /// The word with only bit `i` set, `i` counted from the least significant.
+    ///
+    /// Built out of the limbs rather than by shifting, so that nothing in the two tests
+    /// below is expressed in terms of the operation they are checking.
+    fn one_bit(i: usize) -> U256 {
+        let mut limbs = [0u64; 4];
+        limbs[i / 64] = 1u64 << (i % 64);
+        U256::from_limbs(limbs)
+    }
+
+    /// `x` shifted, computed one bit at a time straight from the definition.
+    ///
+    /// Deliberately the slowest possible implementation, and deliberately not ruint's: the
+    /// test above pins `u256_shl`/`u256_shr` to the operators of a dependency, which is a
+    /// useful cross-check but moves if the dependency ever does. This reference cannot move.
+    fn shift_bit_by_bit(x: &U256, shift: usize, left: bool) -> U256 {
+        let mut out = [0u64; 4];
+        if shift < 256 {
+            let l = x.as_limbs();
+            for i in 0..256usize {
+                if (l[i / 64] >> (i % 64)) & 1 == 0 {
+                    continue;
+                }
+                let to = if left {
+                    i.checked_add(shift).filter(|&j| j < 256)
+                } else {
+                    i.checked_sub(shift)
+                };
+                if let Some(j) = to {
+                    out[j / 64] |= 1u64 << (j % 64);
+                }
+            }
+        }
+        U256::from_limbs(out)
+    }
+
+    /// Every input bit, every shift width, both directions: 131,072 exhaustive probes.
+    ///
+    /// This is a proof rather than a sample, and the reason is a property of the two
+    /// functions: every branch in them -- `shift & 128`, `shift & 64`, and `b == 0` inside
+    /// the funnels -- is taken on the shift amount alone and never on the data. So for a
+    /// fixed width the output bit that each input bit lands on is fixed, and probing one bit
+    /// at a time across all 256 widths pins the entire map. A bit that is dropped,
+    /// duplicated, or moved to the wrong place cannot hide behind another bit, because there
+    /// is no other bit set. A future rewrite that branches on a limb's *value* would cost
+    /// this test that completeness; `multi_bit_patterns` below is the backstop for it.
+    ///
+    /// It also pins the limb order. Were `from_limbs` most-significant-first, `one_bit`
+    /// would build a mirrored value and the expectations here would stop holding, so a wrong
+    /// assumption about the convention fails loudly instead of cancelling itself out.
+    #[test]
+    fn shl_shr_move_every_single_bit_to_its_defined_place() {
+        for i in 0..256usize {
+            let x = one_bit(i);
+            for shift in 0..256usize {
+                let want = if i + shift < 256 {
+                    one_bit(i + shift)
+                } else {
+                    U256::ZERO
+                };
+                assert_eq!(u256_shl(&x, shift), want, "shl: bit {i} by {shift}");
+
+                let want = if i >= shift {
+                    one_bit(i - shift)
+                } else {
+                    U256::ZERO
+                };
+                assert_eq!(u256_shr(&x, shift), want, "shr: bit {i} by {shift}");
+            }
+        }
+    }
+
+    /// Multi-bit patterns against the same definition, in case a rewrite ever makes the
+    /// single-bit argument above stop applying.
+    ///
+    /// Covers the limb and byte boundaries, each pair of adjacent bits straddling one, and a
+    /// spread of deterministic pseudo-random words. Two input bits arriving at one output
+    /// bit is the failure a single-bit probe is blind to, *if* the code ever starts
+    /// branching on data.
+    #[test]
+    fn shl_shr_match_the_definition_on_multi_bit_patterns() {
+        let mut cases = vec![
+            U256::ZERO,
+            U256::MAX,
+            U256::from_limbs([u64::MAX, 0, u64::MAX, 0]),
+            U256::from_limbs([0, u64::MAX, 0, u64::MAX]),
+            U256::from_limbs([0x5555_5555_5555_5555; 4]),
+            U256::from_limbs([0xaaaa_aaaa_aaaa_aaaa; 4]),
+        ];
+        // Adjacent bit pairs straddling every byte boundary, limb boundaries included.
+        for b in (8..256).step_by(8) {
+            let mut limbs = [0u64; 4];
+            limbs[(b - 1) / 64] |= 1u64 << ((b - 1) % 64);
+            limbs[b / 64] |= 1u64 << (b % 64);
+            cases.push(U256::from_limbs(limbs));
+        }
+        // A deterministic spread. xorshift64, so the test carries no dev-dependency.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..24 {
+            cases.push(U256::from_limbs([next(), next(), next(), next()]));
+        }
+
+        for x in cases {
+            for shift in 0..256usize {
+                assert_eq!(
+                    u256_shl(&x, shift),
+                    shift_bit_by_bit(&x, shift, true),
+                    "shl {x:?} by {shift}"
+                );
+                assert_eq!(
+                    u256_shr(&x, shift),
+                    shift_bit_by_bit(&x, shift, false),
+                    "shr {x:?} by {shift}"
+                );
+            }
+        }
+    }
+
     /// The guard the helpers' partiality rests on, pinned at the opcode boundary. The values
     /// below are the ones the helpers get *wrong* -- 256 is the identity, 320 aliases 64 --
     /// so a lost guard shows up as `x` or `x << 64` where the EVM requires zero.

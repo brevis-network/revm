@@ -23,6 +23,16 @@ pub struct InputsImpl {
     pub call_value: U256,
 }
 
+// `u256_from_be_address` picks a load width from the runtime alignment of these two
+// fields, and the whole point of that ladder is that neither of them ever reaches the
+// byte arm: both offsets are multiples of 4. `InputsImpl` is `repr(Rust)`, so that is a
+// property of today's field ordering, not a guarantee -- a new field, or a size change in
+// `CallInput`/`MaybeAddress`, can move them onto an odd offset and drop `ADDRESS` and
+// `CALLER` into the byte arm with no error and no test failure. `MaybeAddress` guards the
+// same kind of assumption one level down the same way.
+const _: () = assert!(core::mem::offset_of!(InputsImpl, target_address).is_multiple_of(4));
+const _: () = assert!(core::mem::offset_of!(InputsImpl, caller_address).is_multiple_of(4));
+
 impl InputsTr for InputsImpl {
     /// `Address` is `[u8; 20]` with alignment 1, so reading this field as a *value* is 20
     /// `lbu` plus the shift/or chain that reassembles them and the stores that put them back

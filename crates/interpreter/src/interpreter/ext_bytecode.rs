@@ -210,6 +210,21 @@ impl ExtBytecode {
 /// every field must be written again before anything observes it.
 #[inline]
 unsafe fn drop_stale(dst: *mut ExtBytecode) {
+    // Destructured rather than reached through `addr_of_mut!` field by field: adding a
+    // field to `ExtBytecode` must not silently leak it here. This binding is the guard --
+    // a new field makes it fail to compile, and the compiler then points at this line.
+    // Nothing below reads the bindings; the pattern exists to be exhaustive.
+    //
+    // SAFETY: `dst` is a live, aligned `ExtBytecode`, so the reference is valid for the
+    // duration of the match; nothing is moved out of it.
+    let ExtBytecode {
+        instruction_pointer: _,
+        continue_execution: _,
+        bytecode_hash: _,
+        action: _,
+        base: _,
+    } = unsafe { &*dst };
+
     unsafe {
         core::ptr::drop_in_place(core::ptr::addr_of_mut!((*dst).base));
         if (*dst).action.is_some() {
@@ -396,5 +411,20 @@ mod tests {
         assert_eq!(ext_bytecode.bytecode_hash.get(), Some(hash));
         assert!(ext_bytecode.bytecode_hash.is_some());
         assert_eq!(ExtBytecode::new(bytecode).bytecode_hash.get(), None);
+    }
+
+    /// The premise of the guard at `Interpreter::run_plain`'s exit: two different bytecodes
+    /// give different jump contexts, so comparing the loop's copy against a re-read is a real
+    /// check and not a tautology. That it does *not* fire on a normal frame is covered by
+    /// every test that runs the dispatch loop.
+    #[test]
+    fn jump_ctx_differs_between_bytecodes() {
+        let a = ExtBytecode::new(Bytecode::new_raw(Bytes::from(&[0x5b, 0x00][..])));
+        let b = ExtBytecode::new(Bytecode::new_raw(Bytes::from(&[0x5b, 0x5b, 0x00][..])));
+        assert!(!core::ptr::eq(
+            a.jump_ctx().table_ptr(),
+            b.jump_ctx().table_ptr()
+        ));
+        assert_ne!(a.jump_ctx().table_len(), b.jump_ctx().table_len());
     }
 }
