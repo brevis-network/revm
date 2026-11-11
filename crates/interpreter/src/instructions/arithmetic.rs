@@ -113,7 +113,7 @@ pub(crate) fn u256_rem_nonzero(n: U256, d: U256) -> U256 {
     if div_small_eligible(nl, dl) {
         U256::from_limbs([div_rem_128_by_32(nl, dl[0]).1, 0, 0, 0])
     } else {
-        n.wrapping_rem(d)
+        rem_large(n, d)
     }
 }
 
@@ -309,7 +309,7 @@ pub fn addmod_at<WIRE: InterpreterTypes, H: ?Sized>(
 ) -> (usize, u64) {
     //gas!(context.interpreter, gas::MID);
     popn_top_at!([op1, op2], op3, context.interpreter, sp, rem);
-    *op3 = op1.add_mod(op2, *op3);
+    *op3 = add_mod(op1, op2, *op3);
     (sp, rem)
 }
 
@@ -334,8 +334,126 @@ pub fn mulmod_at<WIRE: InterpreterTypes, H: ?Sized>(
 ) -> (usize, u64) {
     //gas!(context.interpreter, gas::MID);
     popn_top_at!([op1, op2], op3, context.interpreter, sp, rem);
-    *op3 = op1.mul_mod(op2, *op3);
+    *op3 = mul_mod(op1, op2, *op3);
     (sp, rem)
+}
+
+// ---- 256-bit modular arithmetic on Pico's UINT256_MUL precompile -----------------
+//
+// `ruint` does MULMOD as a 512-bit schoolbook product and a Knuth division, all in RV64
+// instructions: 1 164 retired instructions per call on block 26366961, whose 886 850
+// MULMODs (StarkEx escape proofs, which compute Pedersen hashes in EVM code) are 64 % of
+// its 1.61 G instructions. ADDMOD reduces an operand at or above the modulus with the same
+// division, and that is where 146 410 of the block's 148 014 divisions come from; MOD's
+// general case is that division too. On Pico, `(x * y) % m` is one UINT256_MUL syscall,
+// through pico-sdk's `sys_bigint`, which every Pico guest links, and a reduction is the
+// same call with `y = 1`.
+//
+// Two of the precompile's rules decide how it is called:
+// * a modulus of 0 means 2^256 to it, while the opcodes define a modulus of 0 to give 0,
+//   so that case never reaches it;
+// * its chip proves `x * y = q * m + r` with the quotient `q` in 256 bits, so it can only
+//   prove calls with `x * y < m * 2^256`. That holds whenever one operand is below the
+//   modulus, which covers `a * 1` for every `a`; MULMOD with both operands at or above the
+//   modulus reduces `a` first.
+//
+// DIV, SDIV and SMOD stay on `ruint`: the precompile has no quotient to give DIV, and the
+// signed pair is rare enough that its sign handling is not worth touching (see the note on
+// the division fast path above).
+
+/// `a % n` for a non-zero `n`. An operand below `2n` takes one subtraction; only the rest
+/// pay for a precompile call.
+#[cfg(target_os = "zkvm")]
+#[inline(always)]
+fn reduce(a: U256, n: U256) -> U256 {
+    if a < n {
+        return a;
+    }
+    let t = a.wrapping_sub(n);
+    if t < n {
+        t
+    } else {
+        pico_mul_mod(&a, &U256::ONE, &n)
+    }
+}
+
+/// `(a * b) % n` as MULMOD defines it (0 when `n` is 0), on the UINT256_MUL precompile.
+#[cfg(target_os = "zkvm")]
+#[inline(always)]
+fn mul_mod(a: U256, b: U256, n: U256) -> U256 {
+    if n.is_zero() {
+        return U256::ZERO;
+    }
+    let a = if a >= n && b >= n { reduce(a, n) } else { a };
+    pico_mul_mod(&a, &b, &n)
+}
+
+/// `(a + b) % n` as ADDMOD defines it (0 when `n` is 0): `ruint`'s `add_mod`, with its
+/// operand reduction on the precompile.
+#[cfg(target_os = "zkvm")]
+#[inline(always)]
+fn add_mod(a: U256, b: U256, n: U256) -> U256 {
+    if n.is_zero() {
+        return U256::ZERO;
+    }
+    let (a, b) = (reduce(a, n), reduce(b, n));
+    // Both are below `n`, so the sum is below `2n` and one conditional subtraction ends
+    // it; a carry out of bit 255 means the sum is at least `n`.
+    let (sum, carry) = a.overflowing_add(b);
+    if carry || sum >= n {
+        sum.wrapping_sub(n)
+    } else {
+        sum
+    }
+}
+
+/// `n % d` for a non-zero `d` outside the small-divisor fast path, on the precompile.
+#[cfg(target_os = "zkvm")]
+#[inline(always)]
+fn rem_large(n: U256, d: U256) -> U256 {
+    reduce(n, d)
+}
+
+/// `(a * b) % n` as MULMOD defines it (0 when `n` is 0).
+#[cfg(not(target_os = "zkvm"))]
+#[inline(always)]
+fn mul_mod(a: U256, b: U256, n: U256) -> U256 {
+    a.mul_mod(b, n)
+}
+
+/// `(a + b) % n` as ADDMOD defines it (0 when `n` is 0).
+#[cfg(not(target_os = "zkvm"))]
+#[inline(always)]
+fn add_mod(a: U256, b: U256, n: U256) -> U256 {
+    a.add_mod(b, n)
+}
+
+/// `n % d` for a non-zero `d` outside the small-divisor fast path.
+#[cfg(not(target_os = "zkvm"))]
+#[inline(always)]
+fn rem_large(n: U256, d: U256) -> U256 {
+    n.wrapping_rem(d)
+}
+
+/// One UINT256_MUL call: `(x * y) % m`, for a non-zero `m` and `x * y < m * 2^256`.
+#[cfg(target_os = "zkvm")]
+#[inline(always)]
+fn pico_mul_mod(x: &U256, y: &U256, m: &U256) -> U256 {
+    extern "C" {
+        // pico-sdk, `riscv_ecalls/bigint.rs`.
+        fn sys_bigint(
+            result: *mut [u64; 4],
+            op: u64,
+            x: *const [u64; 4],
+            y: *const [u64; 4],
+            modulus: *const [u64; 4],
+        );
+    }
+    let mut out = [0u64; 4];
+    // SAFETY: each pointer is to four little-endian u64 limbs, eight-byte aligned, which is
+    // all `sys_bigint` requires.
+    unsafe { sys_bigint(&mut out, 0, x.as_limbs(), y.as_limbs(), m.as_limbs()) };
+    U256::from_limbs(out)
 }
 
 /// Implements the EXP instruction - exponentiates two values from stack.
